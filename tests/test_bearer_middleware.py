@@ -37,6 +37,9 @@ def test_inert_without_env(monkeypatch):
 
 def test_whitespace_only_env_is_not_an_api_key(monkeypatch):
     monkeypatch.setenv("OMNIVOICE_API_KEY", "   ")
+    # Server mode so the consumption gate on /v1 lets this bare-server request
+    # through: the test targets the whitespace env var, not the consumer tier.
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")
     c = _client()
     response = c.get("/v1/audio/voices")
     assert response.status_code == 200
@@ -177,6 +180,7 @@ def test_non_ascii_invalid_key_fails_closed_instead_of_raising(key_env):
 def test_shell_paths_served_without_key(key_env):
     c = _client()
     assert c.get("/health").status_code == 200
+    assert c.get("/early-error-capture.js").status_code != 401
 
 
 def test_middleware_is_plain_asgi():

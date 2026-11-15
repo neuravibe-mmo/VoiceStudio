@@ -59,7 +59,7 @@ def test_license_gate_fails_closed_then_allows_engine(monkeypatch, mock_settings
     ok, reason = _backend_cls().is_available()
     assert ok is False
     assert "license not accepted" in reason.lower()
-    assert "Model Catalogue → Engines" in reason
+    assert "Model Catalogue" in reason
 
     mock_settings_store["pockettts"] = True
     assert _backend_cls().is_available() == (True, "ready (CPU-only)")
@@ -108,10 +108,10 @@ def test_ci_verifies_intel_mac_as_the_documented_remote_only_host():
     # command made an unrelated CI hardening change (routing every sync through
     # scripts/uv-sync-retry.sh) look like a broken Intel-Mac contract.
     assert re.search(
-        r"if: matrix\.backend_supported\n        run: .*--extra pockettts", workflow
+        r"if: (steps\.pass\.outputs\.hit != 'true' && )?matrix\.backend_supported\n        run: .*--extra pockettts", workflow
     ), "the pockettts extra must be installed only on backend_supported legs"
     assert re.search(
-        r"if: matrix\.backend_supported\n        run: uv run .*pytest tests/smoke/", workflow
+        r"if: (steps\.pass\.outputs\.hit != 'true' && )?matrix\.backend_supported\n        run: uv run .*pytest tests/smoke/", workflow
     ), "the smoke suite must run only on backend_supported legs"
     assert "HF_HUB_CACHE: ${{ runner.temp }}/pockettts-empty-hf-cache" in workflow
 
@@ -160,9 +160,9 @@ def test_every_locale_discloses_hugging_face_model_access():
     import json
     from pathlib import Path
 
-    locales = Path(__file__).resolve().parents[1] / "frontend/src/i18n/locales"
-    paths = sorted(locales.glob("*.json"))
-    assert len(paths) == 21
+    root = Path(__file__).resolve().parents[1] / "electron/src"
+    paths = sorted((root / "renderer/src/i18n/locales").glob("*.json"))
+    assert "en.json" in {p.name for p in paths}
     for path in paths:
         strings = json.loads(path.read_text("utf-8"))
         footer = strings["license"]["pockettts_footer"]
@@ -187,10 +187,15 @@ def test_gated_weight_failures_are_typed_and_actionable(reason):
     assert "HF_TOKEN" in failure["hint"]
 
 
-def test_generic_gated_model_still_uses_existing_pyannote_class():
+def test_generic_gated_model_is_an_access_problem_not_pyannote():
     from core.failure import classify
 
-    assert classify("gated model license not accepted") == "PYANNOTE_LICENSE_REQUIRED"
+    assert classify("gated model license not accepted") == "HF_AUTH_FAILED"
+    assert classify(
+        "GatedRepoError: 401 Client Error. Cannot access gated repo for url "
+        "https://huggingface.co/sesame/csm-1b/resolve/main/prompts/conversational_a.wav."
+    ) == "HF_AUTH_FAILED"
+    assert classify("pyannote/segmentation-3.0 is gated: 403 forbidden") == "PYANNOTE_LICENSE_REQUIRED"
 
 
 def test_license_gate_fails_closed_when_settings_read_fails(monkeypatch):
@@ -282,3 +287,26 @@ def test_license_api_accepts_pockettts_and_rejects_unknown(settings_mod, mock_se
 def settings_mod():
     import importlib
     return importlib.import_module("api.routers.settings")
+
+
+def test_prefers_the_venv_its_one_click_install_made(monkeypatch, tmp_path, mock_settings_store):
+    """Its own venv when the installer made one; otherwise the app's
+    interpreter, where `uv sync --extra pockettts` installs it."""
+    from pathlib import Path
+
+    from services.sidecar_install import _INSTALL_COMPLETE_MARKER, _venv_python
+
+    mock_settings_store["pockettts"] = True
+    monkeypatch.delenv("OMNIVOICE_POCKETTTS_DIR", raising=False)
+    assert _backend_cls().venv_python() == Path(sys.executable)
+
+    py = _venv_python(tmp_path / ".venv")
+    py.parent.mkdir(parents=True)
+    py.write_text("#!fake\n")
+    (tmp_path / _INSTALL_COMPLETE_MARKER).write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIVOICE_POCKETTTS_DIR", str(tmp_path))
+    assert _backend_cls().venv_python() == py
+    # Available without pocket_tts importable in the app's own environment.
+    monkeypatch.setitem(sys.modules, "pocket_tts", None)
+    if _backend_cls()._platform_error() is None:
+        assert _backend_cls().is_available() == (True, "ready (CPU-only)")

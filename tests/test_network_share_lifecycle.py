@@ -9,11 +9,155 @@ Wrapped in asyncio.run inside a sync test so it does not depend on a
 pytest-asyncio event-loop mode being configured.
 """
 import asyncio
+from types import SimpleNamespace
 import socket
 
 import pytest
 
 from services import network_share as ns
+
+
+@pytest.mark.parametrize('second_operation', ['enable', 'disable'])
+def test_overlapping_lifecycle_calls_leave_no_listener_or_mcp_hosts(monkeypatch, second_operation):
+    from services import network_share as ns
+
+    async def exercise():
+        servers = []
+        serving = []
+
+        class Server:
+            def __init__(self, _config):
+                self.started = False
+                self.should_exit = False
+                servers.append(self)
+
+            async def serve(self):
+                serving.append(asyncio.current_task())
+                self.started = True
+                while not self.should_exit:
+                    await asyncio.sleep(0)
+
+        monkeypatch.setattr(ns, '_runtime', ns._ShareRuntime())
+        monkeypatch.setattr(ns.uvicorn, 'Server', Server)
+        monkeypatch.setattr(ns, '_find_free_port', lambda *_: 3901)
+        monkeypatch.setattr(ns, 'lan_ipv4_addresses', lambda: ['192.168.1.42'])
+        security = SimpleNamespace(allowed_hosts=['localhost:*'], allowed_origins=['http://localhost:*'])
+        app = SimpleNamespace(state=SimpleNamespace(mcp_transport_security=security))
+        try:
+            states = await asyncio.gather(ns.enable(app), getattr(ns, second_operation)(app))
+            assert len(servers) == 1
+            if second_operation == 'enable':
+                assert states[0] is states[1]
+            else:
+                assert not ns.get_state().enabled
+            await ns.disable(app)
+            assert security.allowed_hosts == ['localhost:*']
+            assert security.allowed_origins == ['http://localhost:*']
+            assert all(task.done() for task in serving)
+        finally:
+            for server in servers:
+                server.should_exit = True
+            await asyncio.gather(*serving, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_share_server_does_not_rerun_app_lifespan(monkeypatch):
+    """The share server serves the already-started app, so it must not run the
+    app lifespan a second time: a failing second startup makes uvicorn call
+    sys.exit() inside the share task, which takes the whole backend down."""
+    from services import network_share as ns
+
+    configs = []
+
+    class Server:
+        def __init__(self, config):
+            configs.append(config)
+            self.started = False
+            self._exit = asyncio.Event()
+
+        @property
+        def should_exit(self):
+            return self._exit.is_set()
+
+        @should_exit.setter
+        def should_exit(self, value):
+            if value:
+                self._exit.set()
+
+        async def serve(self):
+            self.started = True
+            await self._exit.wait()
+
+    async def exercise():
+        monkeypatch.setattr(ns, '_runtime', ns._ShareRuntime())
+        monkeypatch.setattr(ns.uvicorn, 'Server', Server)
+        monkeypatch.setattr(ns, '_find_free_port', lambda *_: 3901)
+        monkeypatch.setattr(ns, 'lan_ipv4_addresses', lambda: ['192.168.1.42'])
+        app = SimpleNamespace(state=SimpleNamespace())
+        await ns.enable(app)
+        await ns.disable(app)
+
+    asyncio.run(exercise())
+    assert len(configs) == 1
+    assert configs[0].lifespan == "off"
+
+
+def test_share_startup_failure_does_not_kill_the_event_loop(monkeypatch):
+    """uvicorn calls sys.exit() when it cannot bind or start. Inside the share
+    task that SystemExit would escape run_forever() and stop the main server,
+    so enable() must see an ordinary error and stay Local."""
+    from services import network_share as ns
+
+    class Server:
+        def __init__(self, _config):
+            self.started = False
+            self.should_exit = False
+
+        async def serve(self):
+            raise SystemExit(3)
+
+    async def exercise():
+        monkeypatch.setattr(ns, '_runtime', ns._ShareRuntime())
+        monkeypatch.setattr(ns.uvicorn, 'Server', Server)
+        monkeypatch.setattr(ns, '_find_free_port', lambda *_: 3901)
+        monkeypatch.setattr(ns, 'lan_ipv4_addresses', lambda: ['192.168.1.42'])
+        app = SimpleNamespace(state=SimpleNamespace())
+        with pytest.raises(RuntimeError, match='share listener failed to start'):
+            await ns.enable(app)
+        assert not ns.get_state().enabled
+        assert ns._runtime.task is None and ns._runtime.server is None
+        assert app.state.network_share.enabled is False
+
+    # A SystemExit leaking out of the share task would propagate from here.
+    asyncio.run(exercise())
+
+
+def test_share_port_taken_after_probe_stays_local(monkeypatch):
+    """Real uvicorn: the port is taken between the free-port probe and bind."""
+    from fastapi import FastAPI
+    from services import network_share as ns
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        blocker.bind((ns.SHARE_BIND_HOST, 0))
+    except OSError as e:
+        blocker.close()
+        pytest.skip(f"binding 0.0.0.0 not permitted in this sandbox: {e}")
+    blocker.listen()
+    taken = blocker.getsockname()[1]
+
+    async def exercise():
+        monkeypatch.setattr(ns, '_runtime', ns._ShareRuntime())
+        monkeypatch.setattr(ns, '_find_free_port', lambda *_: taken)
+        with pytest.raises(RuntimeError, match='share listener failed to start'):
+            await ns.enable(FastAPI())
+        assert not ns.get_state().enabled
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        blocker.close()
 
 
 def _can_connect(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:

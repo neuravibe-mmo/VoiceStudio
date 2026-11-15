@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.app_config import DEFAULT_BACKEND_PORT, DEFAULT_WEB_PORT
+
 
 # ── System ────────────────────────────────────────────────────────────────
 
@@ -15,9 +17,16 @@ class SysinfoResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     cpu: float = Field(description="CPU usage percentage (0–100)")
+    cpu_model: str = ""
+    cpu_physical_cores: int = 0
+    cpu_logical_cores: int = 0
+    cpu_frequency_ghz: float = 0.0
     ram: float = Field(description="Used RAM in GiB")
     total_ram: float = Field(description="Total RAM in GiB")
+    gpu_name: str = ""
+    gpu_utilization: float | None = None
     vram: float = Field(0.0, description="Used VRAM in GiB")
+    total_vram: float = Field(0.0, description="Total VRAM in GiB when reported by the runtime")
     gpu_active: bool = Field(False, description="Whether a GPU is actively used")
 
 
@@ -26,6 +35,9 @@ class SystemInfoResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     app_version: str = ""
+    # First 9 characters of the commit this backend was built from (the desktop app
+    # and Docker image set OMNIVOICE_BUILD_COMMIT), "unknown" when it cannot be told.
+    build_commit: str = "unknown"
     # Effective compute-time budgets (seconds) for one synthesis job — the
     # values services/model_manager.py's GPU_JOB_TIMEOUT_S / CPU_JOB_TIMEOUT_S
     # captured at backend import time (#1787). A value just saved via
@@ -70,9 +82,9 @@ class SystemInfoResponse(BaseModel):
     share_port: int | None = None
     lan_addresses: list[str] = []
     pin_required: bool = False
-    backend_port: int = 3900
-    share_port_base: int = 3901
-    ui_port: int = 3901
+    backend_port: int = DEFAULT_BACKEND_PORT
+    share_port_base: int = DEFAULT_WEB_PORT
+    ui_port: int | None = DEFAULT_WEB_PORT
 
 
 class ModelStatusResponse(BaseModel):
@@ -82,7 +94,7 @@ class ModelStatusResponse(BaseModel):
     status: str = Field(description="idle | loading | ready")
     checkpoint: str | None = None
     loaded_at: str | None = None
-    sub_stage: str | None = Field(None, description="Current loading sub-stage: importing | loading_weights | loading_asr | compiling | ready | error")
+    sub_stage: str | None = Field(None, description="Current TTS loading sub-stage: importing | loading_weights | compiling | ready | error")
     detail: str | None = Field(None, description="Human-readable detail of current loading phase")
     error: str | None = Field(None, description="Error message if loading failed")
 

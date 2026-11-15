@@ -140,6 +140,40 @@ def test_list_backends_resilient(registry_sandbox, caplog):
     )
 
 
+def test_unavailable_backend_can_report_installed_runtime_targets(
+    registry_sandbox,
+):
+    class RuntimeKnownButModelMissing(HealthyInProcessBackend):
+        id = "runtime-known"
+        display_name = "Runtime known"
+
+        @classmethod
+        def is_available(cls):
+            return False, "model missing"
+
+        @classmethod
+        def runtime_compute_profile(cls, caps):
+            return {
+                "gpu_compat": ("vulkan", "cpu"),
+                "min_vram_gb": 6.0,
+                "effective_device": "vulkan",
+                "routing_status": "accelerated",
+                "routing_reason": None,
+                "runtime_backend": "vulkan",
+                "runtime_device_index": 1,
+                "runtime_device_name": "Test GPU",
+            }
+
+    registry_sandbox["runtime-known"] = RuntimeKnownButModelMissing
+    entry = next(
+        item for item in list_backends() if item["id"] == "runtime-known"
+    )
+
+    assert entry["available"] is False
+    assert entry["gpu_compat"] == ["vulkan", "cpu"]
+    assert entry["effective_device"] == "vulkan"
+
+
 def test_list_backends_shape(registry_sandbox):
     """Every entry must contain exactly the documented keys — no more, no
     less — EXCEPT mlx-audio, which also carries `curated_models` +
@@ -165,6 +199,17 @@ def test_list_backends_shape(registry_sandbox):
         # Graded-emotion capability (#1208): bool from the class attr; drives
         # the Audiobook expressive panel's emotion gate.
         "supports_emotion",
+        # Speech-to-speech conversion (#3421): Convert's "Keep my delivery".
+        "supports_voice_conversion",
+        # Voice Design capability: False = needs a reference clip, so the
+        # Design workspace and /generate refuse design; None = undeclared.
+        "supports_voice_design",
+        # How the engine reads `instruct`: "tags" (closed OmniVoice list) or "freeform".
+        "instruct_vocabulary",
+        "expression_caps",
+        # Reference-length truth (#2281): seconds of a clone clip the engine
+        # uses and how it picks them; None when not verified in-repo.
+        "max_ref_seconds", "ref_strategy", "preset_voices", "default_voice",
         # True when services.sidecar_install can provision the engine in-app
         # (the Settings Install button keys off this).
         "one_click_install",
@@ -178,6 +223,11 @@ def test_list_backends_shape(registry_sandbox):
         "disk_usage",
         # Sanitized actual-vs-declared provider/device evidence (#1717).
         "execution_evidence",
+        # Public URL of the engine's docs page, or None when it has none
+        # (#1866). The unavailable-engine row uses it for its Learn more link,
+        # so an engine that gains a registry entry without a doc silently
+        # loses that link — tests/test_engine_docs.py guards the mapping.
+        "docs_url",
     }
     mlx_audio_extra = {"curated_models", "active_model_id"}
     for entry in out:
@@ -189,6 +239,7 @@ def test_list_backends_shape(registry_sandbox):
         )
         # #1208: supports_emotion is always a concrete bool (never a descriptor).
         assert isinstance(entry["supports_emotion"], bool)
+        assert isinstance(entry["supports_voice_conversion"], bool)
 
 
 def test_mlx_audio_curated_models_roster(registry_sandbox):
@@ -228,14 +279,23 @@ def test_curated_models_not_present_on_other_backends(registry_sandbox):
 
 def test_isolation_mode_in_process_vs_subprocess(registry_sandbox):
     """SubprocessBackend subclasses get isolation_mode='subprocess'; others 'in-process'."""
+    from core.device_caps import detect_host_caps
     registry_sandbox["fake-sub"] = FakeSubBackend
     registry_sandbox["healthy-inproc"] = HealthyInProcessBackend
     out = {entry["id"]: entry for entry in list_backends()}
 
     assert out["fake-sub"]["isolation_mode"] == "subprocess"
     assert out["healthy-inproc"]["isolation_mode"] == "in-process"
-    # The pre-existing OmniVoice backend is in-process — sanity check.
-    assert out["omnivoice"]["isolation_mode"] == "in-process"
+    # The canonical ``omnivoice`` id is in-process on every host EXCEPT Apple
+    # Silicon, where ``_effective_backend_class`` intentionally routes it to
+    # the killable MPS sidecar (see ``tts_backend.py``'s list_backends
+    # docstring: "On MPS, the canonical omnivoice id already resolves to the
+    # killable OmniVoice sidecar"). Either answer is correct — assert the
+    # one this host actually takes, and document it.
+    expected_omnivoice_mode = (
+        "subprocess" if detect_host_caps().family == "mps" else "in-process"
+    )
+    assert out["omnivoice"]["isolation_mode"] == expected_omnivoice_mode
 
 
 def test_last_error_cleared_after_recovery(registry_sandbox):
@@ -343,7 +403,7 @@ def test_available_hint_extraction_rules():
     f = tts_backend._available_hint
     assert f("ready — upgrade recommended") == "upgrade recommended"
     assert f("ready") is None
-    assert f("ready (server reachable)") is None       # parenthetical ≠ advice
+    assert f("ready (api_v2 server reachable)") is None  # parenthetical ≠ advice
     assert f("ready — ") is None                       # empty advice
     assert f("loaded — from cache") is None            # convention needs "ready"
     assert f(None) is None

@@ -21,18 +21,26 @@ epub/pdf ingest, ACX mastering shipped; the resume UI surface remains a follow-u
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
-import shutil
+import time
 import uuid
 
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from core import voice_leases
+from services.reference_transcript import stored_reference_transcript
+from core.render_trace import call as trace_call, stage as trace_stage
+
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+
+from api.dependencies import consumer_generation, require_consumer_reads_admin_writes
+from pydantic import BaseModel, ConfigDict, Field
 
 from services.audiobook import (
     ExpressiveOptions,
@@ -40,16 +48,21 @@ from services.audiobook import (
     synthesize_chapter,
 )
 from services.longform_render import (
+    CacheLease,
+    LONGFORM_CACHE_SUBDIR,
     LOUDNESS_PRESETS,
     build_concat_list,
     build_ffmetadata,
     build_render_cmd,
     prune_cache_dir,
+    write_lf_text,
 )
 from services import longform_resume  # pure (no torch) — durable resume manifest
+from services.expression import apply_span_emotion
+from services.longform_progress import RenderProgress, chapter_weight
 
 logger = logging.getLogger("omnivoice.audiobook")
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_consumer_reads_admin_writes)])
 
 # A cover filename as produced by /audiobook/cover: 12 hex chars + image ext.
 # An exact-match allowlist is the strongest barrier (and the one CodeQL's
@@ -100,10 +113,17 @@ class ExpressiveMixin(BaseModel):
       takes instead of replaying one recording (default off = today).
     """
 
+    model_config = ConfigDict(allow_inf_nan=False)
+
     # Bounds so a loopback POST (reachable by a browser-tab CSRF) can't pin a
     # GPU-pool worker with an absurd step count or otherwise feed the sampler
     # nonsense. Ranges are generous supersets of the Voice-page controls; unset
     # (None) still means "use the longform default", unchanged. (#1208)
+    # Join settings (ms of silence between lines / paragraphs, edge trimming).
+    # Zero / false keep the legacy hard joins.
+    line_gap_ms: int = Field(default=0, ge=0, le=5000)
+    paragraph_gap_ms: int = Field(default=0, ge=0, le=5000)
+    trim_edges: bool = False
     num_step: int | None = Field(default=None, ge=1, le=512)
     guidance_scale: float | None = Field(default=None, ge=0.0, le=20.0)
     position_temperature: float | None = Field(default=None, ge=0.0, le=100.0)
@@ -129,6 +149,9 @@ def _expressive_opts(req: "ExpressiveMixin") -> ExpressiveOptions:
         emo_text=(req.emo_text or None),
         emo_alpha=req.emo_alpha,
         vary_repeats=bool(req.vary_repeats),
+        line_gap_ms=int(req.line_gap_ms),
+        paragraph_gap_ms=int(req.paragraph_gap_ms),
+        trim_edges=bool(req.trim_edges),
     )
 
 
@@ -138,6 +161,7 @@ class AudiobookPlanRequest(BaseModel):
 
 
 @router.post("/audiobook/plan")
+@consumer_generation
 def audiobook_plan(req: AudiobookPlanRequest) -> dict:
     """Parse a script into a chapter/span plan (pure preview, no synthesis)."""
     plan = parse_audiobook_script(req.text, default_voice=req.default_voice)
@@ -156,6 +180,7 @@ _MAX_CHAPTERS = 10_000
 
 
 @router.post("/audiobook/import")
+@consumer_generation
 async def audiobook_import(file: UploadFile = File(...)) -> dict:
     """Import a ``.txt``/``.md``/``.epub``/``.pdf`` into a chapter-delimited script.
 
@@ -186,7 +211,8 @@ async def audiobook_import(file: UploadFile = File(...)) -> dict:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"couldn't parse PDF: {e}")
     else:
-        script = chapterize_plaintext(data.decode("utf-8", "ignore"))
+        from services.text_upload import decode_text_upload
+        script = chapterize_plaintext(decode_text_upload(data))
     if not script.strip():
         raise HTTPException(status_code=400, detail="no text found in the file")
     plan = parse_audiobook_script(script)
@@ -194,6 +220,7 @@ async def audiobook_import(file: UploadFile = File(...)) -> dict:
 
 
 @router.post("/audiobook/cover")
+@consumer_generation
 async def audiobook_cover(cover: UploadFile = File(...)) -> dict:
     """Upload a cover image; returns a server-side ``path`` to pass back as
     ``cover_path`` in the synth request. Validated here (jpg/png + size cap) and
@@ -243,6 +270,7 @@ def _resolve_voice(profile_id: str | None) -> dict:
         return out
     from core.config import VOICES_DIR
     from core.db import db_conn
+    from core.path_security import contained_join
 
     with db_conn() as conn:
         row = conn.execute("SELECT * FROM voice_profiles WHERE id=?", (profile_id,)).fetchone()
@@ -253,16 +281,16 @@ def _resolve_voice(profile_id: str | None) -> dict:
     except (KeyError, IndexError):
         kind = "clone"
     if row["is_locked"] and row["locked_audio_path"]:
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["locked_audio_path"])
-        out["ref_text"] = row["ref_text"]
+        out["ref_audio"] = contained_join(VOICES_DIR, row["locked_audio_path"])
+        out["ref_text"] = stored_reference_transcript(row)
         out["instruct"] = row["instruct"]
     elif kind == "design":
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
-        out["ref_text"] = row["ref_text"] if out["ref_audio"] else None
+        out["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
+        out["ref_text"] = stored_reference_transcript(row) if out["ref_audio"] else None
         out["instruct"] = row["instruct"]
     else:
-        out["ref_audio"] = os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
-        out["ref_text"] = row["ref_text"]
+        out["ref_audio"] = contained_join(VOICES_DIR, row["ref_audio_path"])
+        out["ref_text"] = stored_reference_transcript(row)
         out["instruct"] = row["instruct"]
     try:
         if row["seed"] is not None:
@@ -270,6 +298,44 @@ def _resolve_voice(profile_id: str | None) -> dict:
     except (KeyError, IndexError):
         pass
     return out
+
+
+def _portable_ref_audio(ref_audio: str | None) -> str | None:
+    """A reference-audio path as the cache keys see it (#2279).
+
+    Inside the voices dir it becomes ``voices:<relative path>`` — the same for
+    any data-dir location or spelling; anything else (engine default, a path a
+    caller passed through) is returned unchanged.
+    """
+    if not ref_audio:
+        return ref_audio
+    from core.config import VOICES_DIR
+
+    try:
+        rel = os.path.relpath(os.path.abspath(ref_audio), os.path.abspath(VOICES_DIR))
+    except ValueError:  # another drive on Windows
+        return ref_audio
+    if rel == os.curdir or rel.startswith(os.pardir) or os.path.isabs(rel):
+        return ref_audio
+    return "voices:" + rel.replace(os.sep, "/")
+
+
+def _voices_dir() -> str:
+    from core.config import VOICES_DIR
+
+    return VOICES_DIR
+
+
+def _legacy_ref_audios(ref_audio: str | None, old_roots: list[str]) -> list[str | None]:
+    """Every absolute spelling a pre-#2279 build could have keyed ``ref_audio``
+    by: the current one, then one per voices root the cache was rendered
+    under before (``remember_voices_root``) — so an entry written before a
+    data-dir move is still found after it. Index-aligned with
+    ``[current, *old_roots]``."""
+    from core.config import VOICES_DIR
+    from services.longform_render import rebase_path
+
+    return [ref_audio, *(rebase_path(ref_audio, VOICES_DIR, r) for r in old_roots)]
 
 
 def _voice_profile_exists(profile_id: str | None) -> bool:
@@ -288,6 +354,53 @@ def _voice_profile_exists(profile_id: str | None) -> bool:
             "SELECT 1 FROM voice_profiles WHERE id=? LIMIT 1", (profile_id,)
         ).fetchone()
     return row is not None
+
+
+def _summary_voice_rows(chapters, default_voice, voice_map) -> list[dict]:
+    """``{"id","name"}`` for each distinct profile used, in order of first use."""
+    from core.db import db_conn
+
+    used = dict.fromkeys(
+        pid
+        for chapter in chapters
+        for span in chapter.spans
+        if (pid := _map_span_voice(span.voice_id, default_voice, voice_map))
+    )
+    if not used:
+        return []
+    placeholders = ", ".join("?" * len(used))
+    query = f"SELECT id, name FROM voice_profiles WHERE id IN ({placeholders})"  # nosec B308 B608 - placeholders only
+    with db_conn() as conn:
+        found = dict(tuple(row)[:2] for row in conn.execute(query, tuple(used)).fetchall())
+    return [{"id": pid, "name": found.get(pid) or ""} for pid in used]
+
+
+def _summary_options(opts, backend_cls) -> dict:
+    """Settings that differ from a default render, using effective engine values."""
+    from services.tts_backend import OmniVoiceBackend
+
+    chosen = opts or ExpressiveOptions()
+    recorded = chosen.to_manifest()
+    if backend_cls is OmniVoiceBackend or getattr(backend_cls, "supports_native_omnivoice_controls", False):
+        recorded.update(_omnivoice_sampling_kwargs(chosen))
+    defaults = ExpressiveOptions().to_manifest()
+    return {k: v for k, v in recorded.items() if k not in defaults or defaults[k] != v}
+
+
+def _render_summary(chapters, default_voice, voice_map, language, fmt, opts) -> dict:
+    """Content-free description of a finished render (voices, engine, settings)."""
+    from services.longform_render import render_summary
+    from services.tts_backend import active_backend_id, get_backend_class
+
+    engine = active_backend_id()
+    return render_summary(
+        chapters,
+        voices=_summary_voice_rows(chapters, default_voice, voice_map),
+        engine_id=engine,
+        language=language,
+        fmt=fmt,
+        options=_summary_options(opts, get_backend_class(engine)),
+    )
 
 
 def _map_span_voice(
@@ -420,8 +533,11 @@ def _omnivoice_sampling_kwargs(opts: ExpressiveOptions) -> dict:
     today exactly: num_step 32, guidance 2.0, and NO temperature/postprocess
     kwargs (the model keeps its own defaults). Emotion is never forwarded —
     the VoiceStudio config rejects unknown kwargs."""
+    from services.performance_profiles import tts_defaults
+
+    defaults = tts_defaults()
     kw = {
-        "num_step": opts.num_step if opts.num_step is not None else LONGFORM_NUM_STEP,
+        "num_step": opts.num_step if opts.num_step is not None else defaults.get("num_step", LONGFORM_NUM_STEP),
         "guidance_scale": (
             opts.guidance_scale if opts.guidance_scale is not None else LONGFORM_GUIDANCE_SCALE
         ),
@@ -432,6 +548,8 @@ def _omnivoice_sampling_kwargs(opts: ExpressiveOptions) -> dict:
         kw["class_temperature"] = opts.class_temperature
     if opts.postprocess_output is not None:
         kw["postprocess_output"] = opts.postprocess_output
+    elif "postprocess_output" in defaults:
+        kw["postprocess_output"] = defaults["postprocess_output"]
     return kw
 
 
@@ -462,11 +580,38 @@ def _generic_extra_kwargs(opts: ExpressiveOptions) -> dict:
     return kw
 
 
+def _emotion_key(span) -> tuple:
+    """``({"emotion": ...},)`` for a span with an ``[emotion:]``, else ``()`` —
+    a cache-key element present only when set, so untagged books keep their keys."""
+    emotion = getattr(span, "emotion", None)
+    return ({"emotion": emotion},) if emotion else ()
+
+
+def _span_key_extras(span) -> tuple:
+    """Chapter-key elements after speed: ``join``, emotion, then an inline
+    ``[[…]]`` override marker, each only when set."""
+    from services.pronunciation import has_inline_override
+
+    join = getattr(span, "join", None)
+    # Chapters with an inline override were rendered with the brackets (and
+    # a dictionary rewriting inside them) before #3561: re-key only those.
+    inline = ({"inline_overrides": 1},) if has_inline_override(span.text) else ()
+    return ((join,) if join else ()) + _emotion_key(span) + inline
+
+
+def _ensure_active_engine_licence() -> None:
+    """403 before the stream opens, rather than one failed row per chapter."""
+    from services.tts_backend import ensure_active_engine_licence
+
+    ensure_active_engine_licence()
+
+
 def _build_synth(
     default_voice: str | None,
     language: str | None = None,
     opts: ExpressiveOptions | None = None,
     voice_map: dict | None = None,
+    lease: "voice_leases.VoiceFileLease | None" = None,
 ) -> dict:
     """Describe how to synthesize for the active TTS engine.
 
@@ -483,6 +628,9 @@ def _build_synth(
 
     ``opts`` (#1208) carries the expressive/quality knobs + cache opt-out. A
     default instance reproduces today's exact synth call and caching.
+
+    ``lease`` (#2535) holds every resolved reference file for the render, so
+    the retired-voice sweep never removes a take this job still reads.
     """
     from services.tts_backend import OmniVoiceBackend, active_backend_id, get_backend_class
 
@@ -500,30 +648,41 @@ def _build_synth(
         key = token_cache[voice_id]
         if key not in cache:
             cache[key] = _resolve_voice(key)
+            voice_leases.hold(lease, cache[key].get("ref_audio"))
         return cache[key]
+
+    from services.tts_backend import ensure_engine_licence, get_engine_instance
 
     engine_id = active_backend_id()
     cls = get_backend_class(engine_id)
+    ensure_engine_licence(cls)
     if cls is OmniVoiceBackend:
         from services.model_manager import get_model
         return {"mode": "omnivoice", "resolve": resolve, "engine_id": engine_id,
                 "get_model": get_model, "language": language, "opts": opts}
 
-    backend = cls()
+    # The process-wide engine instance (#3417), the one /generate and the
+    # OpenAI route reuse. This used to be a fresh `cls()` per CHAPTER (and per
+    # preview): every chapter reloaded the weights from disk — or spawned a new
+    # sidecar for a subprocess engine — and left the previous copy resident,
+    # so a long book on unified memory (Apple Silicon) piled up model copies
+    # and ground into swap with the GPU pegged.
+    backend = get_engine_instance(cls)
     native_proxy = bool(getattr(cls, "supports_native_omnivoice_controls", False))
     extra = (_omnivoice_sampling_kwargs(opts) if native_proxy
              else _generic_extra_kwargs(opts))
     next_nonce = _make_occ_counter(opts)
 
-    def synth(text, voice_id, speed=None):
+    def synth(text, voice_id, speed=None, emotion=None):
         v = resolve(voice_id)
         seed = _seed_segment_rng(_base_seed(opts, v), text, next_nonce())
         call_extra = dict(extra)
         if native_proxy and seed is not None:
             call_extra["seed"] = seed
+        instruct = apply_span_emotion(cls, call_extra, v["instruct"], emotion, opts.emo_alpha)
         return backend.generate(
             text, language=language, ref_audio=v["ref_audio"],
-            ref_text=v["ref_text"], instruct=v["instruct"], duration=None,
+            ref_text=v["ref_text"], instruct=instruct, duration=None,
             speed=float(speed) if speed else 1.0, **call_extra,
         )
     return {"mode": "generic", "resolve": resolve, "engine_id": engine_id,
@@ -535,6 +694,7 @@ async def _prepare_synth(
     language: str | None = None,
     opts: ExpressiveOptions | None = None,
     voice_map: dict | None = None,
+    lease: "voice_leases.VoiceFileLease | None" = None,
 ):
     """Resolve :func:`_build_synth` into ``(synth, sample_rate, resolve,
     engine_id)`` — awaiting the VoiceStudio model load when needed. Shared by the
@@ -542,7 +702,8 @@ async def _prepare_synth(
     chunk so a non-English clone holds its language (#505 B2). ``opts`` (#1208)
     carries the expressive knobs; a default instance reproduces today exactly."""
     opts = opts or ExpressiveOptions()
-    info = _build_synth(default_voice, language=language, opts=opts, voice_map=voice_map)
+    info = _build_synth(default_voice, language=language, opts=opts, voice_map=voice_map,
+                        lease=lease)
     resolve, engine_id = info["resolve"], info["engine_id"]
     if info["mode"] == "omnivoice":
         lang = info["language"]
@@ -554,7 +715,9 @@ async def _prepare_synth(
         sampling = _omnivoice_sampling_kwargs(opts)
         next_nonce = _make_occ_counter(opts)
 
-        def synth(text, voice_id, speed=None):
+        def synth(text, voice_id, speed=None, emotion=None):
+            # OmniVoice takes no emotion (expression_caps "none"): a span's
+            # [emotion:] is already stripped from the text and is ignored here.
             v = resolve(voice_id)
             _seed_segment_rng(_base_seed(opts, v), text, next_nonce())
             # A book is the worst case for the re-encode this avoids: hundreds of
@@ -569,8 +732,173 @@ async def _prepare_synth(
     return info["synth"], info["sample_rate"], resolve, engine_id
 
 
+def _chapter_cache_inputs(chapter, sr, engine_id, resolve, cache_dir, lexicon=None,
+                          language=None, opts=None, voice_map=None, cache_lease=None,
+                          pause_fill=None):
+    """Derive and reserve the same inputs for planning and chapter rendering."""
+    import json
+
+    from services.audiobook import ExpressiveOptions, Span, voice_map_signature
+    from services.longform_render import (
+        SegmentCache,
+        chapter_cache_key,
+        chapter_content_id,
+        remember_voices_root,
+    )
+    from core.config import VOICES_DIR
+    from services.pronunciation import lexicon_signature
+    from services.text_normalization import normalize_for_tts
+    from services.watermark import will_mark
+
+    opts = opts or ExpressiveOptions()
+
+    spans = [Span(voice_id=s.voice_id, text=normalize_for_tts(s.text, language),
+                  pause_ms_after=s.pause_ms_after, speed=getattr(s, "speed", None),
+                  join=getattr(s, "join", None), emotion=getattr(s, "emotion", None))
+             for s in chapter.spans]
+    # `join` and `emotion` join the key tuple only when set, so plain scripts
+    # keep old keys.
+    spans_tuples = [(s.voice_id, s.text, s.pause_ms_after, getattr(s, "speed", None))
+                    + _span_key_extras(s)
+                    for s in spans]
+    # A voice's signature names its reference audio by its path INSIDE the
+    # data dir, not the absolute path (#2279): the same profile must key the
+    # same cache after the data dir is moved, remounted or spelled differently
+    # (Settings → storage relocation, a symlink, an env override). Caches keyed
+    # by the absolute path — every one written before this — are still found
+    # through the legacy signatures below — one per voices root this cache has
+    # been rendered under, so a move right after upgrading still finds them —
+    # and moved to the portable key.
+    old_roots = remember_voices_root(cache_dir, VOICES_DIR)
+    voice_sigs: dict = {}
+    legacy_voice_sigs: list[dict] = [{} for _ in range(1 + len(old_roots))]
+    resolved: dict = {}
+    for s in spans:
+        k = s.voice_id or ""
+        if k not in voice_sigs:
+            v = resolved[k] = resolve(s.voice_id)
+            tail = f"{v.get('ref_text')}|{v.get('instruct')}|{v.get('seed')}"
+            voice_sigs[k] = f"{_portable_ref_audio(v.get('ref_audio'))}|{tail}"
+            for sigs, ref in zip(legacy_voice_sigs,
+                                 _legacy_ref_audios(v.get("ref_audio"), old_roots)):
+                sigs[k] = f"{ref}|{tail}"
+    sig: dict = {}
+    lex_sig = ""
+    if lexicon:
+        # Fold the lexicon into the cache key so editing pronunciations
+        # invalidates cached chapters (reserved key can't collide with a voice id).
+        # Order-aware where entry order changes the output (#2728).
+        lex_sig = lexicon_signature(lexicon)
+        sig["\x00lexicon"] = lex_sig
+    # Fold the #1208 expressive signature into BOTH cache layers so changing any
+    # new knob (sampling, emotion, seed, cache opt-out) re-renders instead of
+    # replaying stale audio (the CRITICAL TRAP). Empty for a default render, so
+    # the derivation stays byte-identical to pre-#1208 and released caches hit.
+    expr_sig = opts.cache_signature()
+    if expr_sig:
+        sig["\x00expressive"] = expr_sig
+    # Fold the #1217 voice map into BOTH cache layers, exactly like the
+    # expressive signature: remapping a [voice:NAME] must re-render, while an
+    # empty/absent map keeps the key byte-identical to pre-#1217 (existing books
+    # never re-render). The resolved voice_sigs above already reflect a mapping
+    # when synthesis actually resolves it, but folding the raw map in makes the
+    # invalidation robust even where resolution is short-circuited/stubbed.
+    vmap_sig = voice_map_signature(voice_map)
+    if vmap_sig:
+        sig["\x00voicemap"] = vmap_sig
+    seg_extra_sig = f"{lex_sig}\x00{expr_sig}" if expr_sig else lex_sig
+    if vmap_sig:
+        seg_extra_sig = f"{seg_extra_sig}\x00{vmap_sig}"
+    # The resolved synthesis language reaches every engine call, and
+    # normalization can leave two languages' text identical, so it must key
+    # BOTH layers or a French render replays the English audio (#2524). Genuine
+    # autodetect (None) adds nothing: its keys stay byte-identical.
+    if language:
+        sig["\x00language"] = language
+        seg_extra_sig = f"{seg_extra_sig}\x00language={language}"
+    # Room tone in the gaps (#3611) changes the chapter's audio. A spoken
+    # segment only changes when its own paragraphs are joined with a gap, so
+    # only those segments are re-keyed. The default (digital silence) adds
+    # nothing to either layer, so existing caches keep hitting. The mode is
+    # resolved once here and the render passes the same value to every join.
+    from services.audio_dsp import pause_fill_mode
+
+    if pause_fill is None:
+        pause_fill = pause_fill_mode()
+    gap_sig, gap_spans = "", None
+    if pause_fill != "silence":
+        sig["\x00pausefill"] = pause_fill
+        paragraph_ms = int((opts or ExpressiveOptions()).join_kwargs().get("paragraph_gap_ms") or 0)
+        if paragraph_ms > 0:
+            from services.chunked_tts import split_paragraphs
+            from services.pronunciation import apply_lexicon_and_overrides
+
+            def gap_spans(span) -> bool:
+                # Same text synthesize_chapter splits: after the lexicon,
+                # which can insert a paragraph break.
+                text = apply_lexicon_and_overrides(span.text, lexicon) if span.text else ""
+                return len(split_paragraphs(text)) > 1
+
+            gap_sig = f"pausefill={pause_fill}"
+    marking = will_mark()
+    if marking:
+        # Provenance-marked chapters cache under their own key (#1169): a
+        # chapter WAV rendered while watermarking was off/unavailable —
+        # including every cache entry written before marking existed — must
+        # never satisfy a request made while it's on. Deliberately one-time
+        # invalidates pre-#1169 chapter caches (the SEGMENT cache underneath
+        # is untouched, so re-rendering is assembly + one embed, not re-TTS);
+        # with marking off the key is byte-identical to the released
+        # derivation, so those caches keep hitting.
+        sig["\x00watermark"] = "1"
+    key = chapter_cache_key(spans_tuples, sample_rate=sr, engine_id=engine_id,
+                            voice_sig={**voice_sigs, **sig})
+    wav_path = os.path.join(cache_dir, f"{key}.wav")
+    legacy_paths = [
+        os.path.join(cache_dir, chapter_cache_key(
+            spans_tuples, sample_rate=sr, engine_id=engine_id,
+            voice_sig={**legacy, **sig}) + ".wav")
+        for legacy in legacy_voice_sigs
+    ]
+
+    # What a miss is explained against (#2279): every input the key folds in,
+    # by name, so the log says WHICH one changed instead of only "cached:
+    # false". Keyed by the chapter's raw script, which no render input moves.
+    content_id = chapter_content_id(
+        [(s.voice_id, s.text, s.pause_ms_after, getattr(s, "speed", None),
+          getattr(s, "join", None)) + _emotion_key(s)
+         for s in chapter.spans])
+    inputs: dict = {
+        "sample rate": sr, "engine": engine_id, "normalized text": spans_tuples,
+        "pronunciation lexicon": lex_sig, "expressive settings": expr_sig,
+        "voice map": vmap_sig, "watermark": marking,
+    }
+    if pause_fill != "silence":
+        inputs["pause fill"] = pause_fill
+    if language:
+        inputs["language"] = language
+    for k, v in resolved.items():
+        label = f"voice {re.sub(r'[^A-Za-z0-9_-]', '', k)[:40] or '(default)'}"
+        inputs[f"{label} reference audio"] = _portable_ref_audio(v.get("ref_audio"))
+        inputs[f"{label} reference text"] = v.get("ref_text")
+        inputs[f"{label} instruct"] = v.get("instruct")
+        inputs[f"{label} seed"] = v.get("seed")
+
+    if cache_lease is not None:
+        for candidate in (wav_path, *legacy_paths):
+            cache_lease.hold(candidate)
+    seg_cache = SegmentCache(cache_dir, sample_rate=sr, engine_id=engine_id,
+                             voice_sig=voice_sigs, extra_sig=seg_extra_sig,
+                             vary_repeats=opts.vary_repeats,
+                             legacy_voice_sigs=legacy_voice_sigs, lease=cache_lease,
+                             gap_sig=gap_sig, gap_spans=gap_spans)
+    seg_cache.reserve(spans)
+    return spans, wav_path, legacy_paths, content_id, inputs, seg_cache
+
+
 def _render_chapter_cached(chapter, synth, sr, engine_id, resolve, cache_dir, lexicon=None,
-                           language=None, opts=None, voice_map=None):
+                           language=None, opts=None, voice_map=None, cache_lease=None,
+                           on_progress=None):
     """Render one chapter, content-addressed so a re-run reuses it (resume).
 
     Returns ``(wav_path, duration_s, was_cached, seg_stats)``. Two cache
@@ -597,83 +925,65 @@ def _render_chapter_cached(chapter, synth, sr, engine_id, resolve, cache_dir, le
     per-project dictionary operates on normalized text and toggling / changing
     normalization output naturally invalidates cached chapters and segments.
 
+    ``on_progress`` (#3417) is handed to ``synthesize_chapter`` on a chapter
+    miss so the render reports every chunk; a chapter-cache hit reports
+    nothing (the caller marks the whole chapter done).
+
     Runs in the GPU-pool executor.
     """
-    import json
     import wave
 
     from services.audio_io import atomic_save_wav
-    from services.audiobook import ExpressiveOptions, Span, voice_map_signature
-    from services.longform_render import SegmentCache, chapter_cache_key
-    from services.pronunciation import normalize_lexicon
-    from services.text_normalization import normalize_for_tts
-    from services.watermark import mark_synthetic, will_mark
+    from services.longform_render import (
+        adopt_cached_file, explain_chapter_miss, has_chapter_inputs,
+        record_chapter_inputs, wav_is_complete,
+    )
+    from services.watermark import mark_synthetic
 
     opts = opts or ExpressiveOptions()
+    from services.audio_dsp import pause_fill_mode
 
-    spans = [Span(voice_id=s.voice_id, text=normalize_for_tts(s.text, language),
-                  pause_ms_after=s.pause_ms_after, speed=getattr(s, "speed", None))
-             for s in chapter.spans]
-    spans_tuples = [(s.voice_id, s.text, s.pause_ms_after, getattr(s, "speed", None))
-                    for s in spans]
-    voice_sigs: dict = {}
-    for s in spans:
-        k = s.voice_id or ""
-        if k not in voice_sigs:
-            v = resolve(s.voice_id)
-            voice_sigs[k] = f"{v.get('ref_audio')}|{v.get('ref_text')}|{v.get('instruct')}|{v.get('seed')}"
-    sig: dict = dict(voice_sigs)
-    lex_sig = ""
-    if lexicon:
-        # Fold the lexicon into the cache key so editing pronunciations
-        # invalidates cached chapters (reserved key can't collide with a voice id).
-        lex_sig = json.dumps(normalize_lexicon(lexicon), sort_keys=True)
-        sig["\x00lexicon"] = lex_sig
-    # Fold the #1208 expressive signature into BOTH cache layers so changing any
-    # new knob (sampling, emotion, seed, cache opt-out) re-renders instead of
-    # replaying stale audio (the CRITICAL TRAP). Empty for a default render, so
-    # the derivation stays byte-identical to pre-#1208 and released caches hit.
-    expr_sig = opts.cache_signature()
-    if expr_sig:
-        sig["\x00expressive"] = expr_sig
-    # Fold the #1217 voice map into BOTH cache layers, exactly like the
-    # expressive signature: remapping a [voice:NAME] must re-render, while an
-    # empty/absent map keeps the key byte-identical to pre-#1217 (existing books
-    # never re-render). The resolved voice_sigs above already reflect a mapping
-    # when synthesis actually resolves it, but folding the raw map in makes the
-    # invalidation robust even where resolution is short-circuited/stubbed.
-    vmap_sig = voice_map_signature(voice_map)
-    if vmap_sig:
-        sig["\x00voicemap"] = vmap_sig
-    seg_extra_sig = f"{lex_sig}\x00{expr_sig}" if expr_sig else lex_sig
-    if vmap_sig:
-        seg_extra_sig = f"{seg_extra_sig}\x00{vmap_sig}"
-    if will_mark():
-        # Provenance-marked chapters cache under their own key (#1169): a
-        # chapter WAV rendered while watermarking was off/unavailable —
-        # including every cache entry written before marking existed — must
-        # never satisfy a request made while it's on. Deliberately one-time
-        # invalidates pre-#1169 chapter caches (the SEGMENT cache underneath
-        # is untouched, so re-rendering is assembly + one embed, not re-TTS);
-        # with marking off the key is byte-identical to the released
-        # derivation, so those caches keep hitting.
-        sig["\x00watermark"] = "1"
-    key = chapter_cache_key(spans_tuples, sample_rate=sr, engine_id=engine_id, voice_sig=sig)
-    wav_path = os.path.join(cache_dir, f"{key}.wav")
-
-    if os.path.exists(wav_path):
+    # One read per chapter render (#3611): the cache keys and every join use it.
+    pause_fill = pause_fill_mode()
+    spans, wav_path, legacy_paths, content_id, inputs, seg_cache = _chapter_cache_inputs(
+        chapter, sr, engine_id, resolve, cache_dir, lexicon,
+        language, opts, voice_map, cache_lease, pause_fill=pause_fill,
+    )
+    for candidate in dict.fromkeys((wav_path, *legacy_paths)):
+        if not os.path.exists(candidate):
+            continue
+        # A header that promises more audio than the file holds is a write a
+        # power-off tore; it opens fine and plays short, so it is a miss.
+        if not wav_is_complete(candidate):
+            continue
         try:
-            with wave.open(wav_path, "rb") as w:
+            with wave.open(candidate, "rb") as w:
                 dur = w.getnframes() / float(w.getframerate() or sr)
-            return wav_path, dur, True, None
         except Exception:
-            pass  # corrupt cache entry — fall through and re-render
+            continue  # corrupt cache entry — try the next, else re-render
+        if candidate != wav_path:
+            candidate = adopt_cached_file(candidate, wav_path)
+        try:
+            os.utime(candidate, None)
+        except OSError:
+            pass
+        if not has_chapter_inputs(cache_dir, content_id):
+            record_chapter_inputs(cache_dir, content_id, inputs)
+        return candidate, dur, True, None
 
-    seg_cache = SegmentCache(cache_dir, sample_rate=sr, engine_id=engine_id,
-                             voice_sig=voice_sigs, extra_sig=seg_extra_sig,
-                             vary_repeats=opts.vary_repeats)
+    changed = explain_chapter_miss(cache_dir, content_id, inputs)
+    if changed:
+        logger.info("Chapter cache miss for %r: changed since its cached render: %s",
+                    str(chapter.title)[:80], ", ".join(changed))
+    elif changed == []:
+        logger.info("Chapter cache miss for %r: inputs unchanged, but the cached "
+                    "audio file is gone (evicted or deleted)", str(chapter.title)[:80])
+
     audio, dur = synthesize_chapter(spans, synth, sr, lexicon=lexicon,
-                                    segment_cache=seg_cache)
+                                    segment_cache=seg_cache, on_progress=on_progress,
+                                    # the fill the cache keys were derived from
+                                    pause_fill=pause_fill,
+                                    **opts.join_kwargs())
     # Invisible provenance mark on the assembled chapter (#1169), tensor stage,
     # before the WAV lands in the cache — this single site covers every
     # longform front door (/audiobook, /longform/render [Stories],
@@ -683,92 +993,61 @@ def _render_chapter_cached(chapter, synth, sr, engine_id, resolve, cache_dir, le
     # intermediate assembly inputs, re-marked here on every chapter render.
     # Already runs in the GPU-pool executor; never raises (degrades to
     # unmarked on failure).
-    audio = mark_synthetic(audio, sr, context="longform.chapter")
-    atomic_save_wav(wav_path, audio, sr)
+    audio = trace_call("watermark", mark_synthetic, audio, sr, context="longform.chapter")
+    # Durable: a power-off right after this chapter must not leave a torn
+    # file under its key (#2279).
+    atomic_save_wav(wav_path, audio, sr, durable=True)
+    record_chapter_inputs(cache_dir, content_id, inputs)
     return wav_path, dur, False, {"total": seg_cache.hits + seg_cache.misses,
                                   "cached": seg_cache.hits}
 
 
-def _remote_chapter_call(chapter, *, engine_id, default_voice, voice_map,
-                         language, lexicon, opts, cache_dir):
-    """Build one opaque remote chapter task without loading a local TTS model."""
-    import hashlib
+async def _run_chapter(chapter, *, default_voice, language, opts, voice_map,
+                       lexicon, cache_dir, lease=None, cache_lease=None,
+                       reserve_cache=None, on_progress=None):
+    """Render one chapter on this machine through the guarded GPU pool.
 
+    ``on_progress`` is called from the GPU thread after every chunk (#3417)."""
     from services import gpu_gateway
-    from services.text_normalization import normalize_for_tts
-    from services.watermark import is_enabled as watermark_enabled
-
-    rows, voices, refs = [], [], []
+    from services.model_manager import await_free_engine, generate_timeout_s
+    from services.tts_backend import get_backend_class
+    # Resolve and pin every take before rendering starts.  The former routing
+    # setup did this even for local jobs; keeping it explicit prevents a
+    # concurrent re-lock/sweep from deleting a take before the local resolver
+    # first reads it.
     for span in chapter.spans:
         profile_id = _map_span_voice(span.voice_id, default_voice, voice_map)
-        voice = _resolve_voice(profile_id)
-        rows.append({
-            "text": normalize_for_tts(span.text, language),
-            "pause_ms_after": span.pause_ms_after,
-            "speed": getattr(span, "speed", None),
-        })
-        refs.append(voice.get("ref_audio"))
-        voices.append({
-            "ref_text": voice.get("ref_text"), "instruct": voice.get("instruct"),
-            "seed": voice.get("seed"),
-        })
-    params = {
-        "spans": rows, "voices": voices, "ref_audio": refs,
-        "language": language, "lexicon": lexicon,
-        "expressive": opts.to_manifest(), "watermark": bool(watermark_enabled()),
-    }
-    signature = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
-    wav_path = os.path.join(cache_dir, f"remote-{signature}.wav")
+        voice_leases.hold(lease, _resolve_voice(profile_id).get("ref_audio"))
 
-    def decode(result):
-        import soundfile as sf
-        if not os.path.exists(wav_path):
-            partial = f"{wav_path}.part"
-            shutil.copyfile(result.path, partial)
-            os.replace(partial, wav_path)
-        info = sf.info(wav_path)
-        return wav_path, float(info.duration), False, None
-
-    return gpu_gateway.RemoteCall(
-        engine=engine_id, operation="audiobook", params=params,
-        idempotency_key=f"audiobook:{signature}", decode=decode,
-    ), wav_path
-
-
-async def _run_chapter(chapter, *, operation="audiobook", decision, job, default_voice, language, opts,
-                       voice_map, lexicon, cache_dir):
-    """Run one chapter through the gateway; local preparation stays lazy."""
-    from services import gpu_gateway
-    from services.tts_backend import active_backend_id
-
-    engine_id = active_backend_id()
-    remote, remote_cache = _remote_chapter_call(
-        chapter, engine_id=engine_id, default_voice=default_voice,
-        voice_map=voice_map, language=language, lexicon=lexicon,
-        opts=opts, cache_dir=cache_dir,
+    synth, sr, resolve, engine_id = await _prepare_synth(
+        default_voice, language=language, opts=opts, voice_map=voice_map,
+        lease=lease,
     )
-    if decision.remote and os.path.exists(remote_cache):
-        import soundfile as sf
-        info = sf.info(remote_cache)
-        return remote_cache, float(info.duration), True, None
-
-    async def prepare_local():
-        synth, sr, resolve, local_engine = await _prepare_synth(
-            default_voice, language=language, opts=opts, voice_map=voice_map
-        )
-        return gpu_gateway.LocalCall(
-            fn=lambda: _render_chapter_cached(
-                chapter, synth, sr, local_engine, resolve, cache_dir, lexicon,
-                language, opts, voice_map,
-            ),
-            what="Audiobook chapter",
-        )
-
-    return await gpu_gateway.run(
-        operation, local=gpu_gateway.LocalCall(prepare=prepare_local),
-        remote=remote, decision=decision, job=job,
+    if reserve_cache is not None:
+        await asyncio.to_thread(reserve_cache, sr, engine_id, resolve)
+    try:
+        engine_class = get_backend_class(engine_id)
+    except ValueError:
+        engine_class = None
+    spoken_text = "\n".join(span.text for span in chapter.spans)
+    budget = generate_timeout_s(spoken_text, engine=engine_class)
+    # A busy engine (a native stream holds it) must not fail the chapter and let
+    # the book assemble without it: wait for it inside the chapter's budget, off
+    # the GPU worker. Each retry resumes from the segments already persisted, so
+    # past the budget the busy error fails this chapter with its real reason.
+    return await await_free_engine(
+        lambda: gpu_gateway.run(
+            local=gpu_gateway.LocalCall(
+                fn=lambda: _render_chapter_cached(
+                    chapter, synth, sr, engine_id, resolve, cache_dir, lexicon,
+                    language, opts, voice_map, cache_lease, on_progress=on_progress,
+                ),
+                what="Audiobook chapter",
+                timeout=budget,
+            )
+        ),
+        budget_s=budget, what="Audiobook engine",
     )
-
 
 class AudiobookPreviewRequest(ExpressiveMixin):
     text: str
@@ -782,6 +1061,7 @@ class AudiobookPreviewRequest(ExpressiveMixin):
 
 
 @router.post("/audiobook/preview")
+@consumer_generation
 async def audiobook_preview(req: AudiobookPreviewRequest) -> dict:
     """Render a single chapter so the user can audition it before the full run.
 
@@ -789,8 +1069,7 @@ async def audiobook_preview(req: AudiobookPreviewRequest) -> dict:
     cache (the later full render reuses it) and a re-preview is instant.
     """
     from core.config import OUTPUTS_DIR
-    from services import gpu_gateway
-
+    _ensure_active_engine_licence()
     plan = parse_audiobook_script(req.text, default_voice=req.default_voice)
     if not plan.chapters:
         raise HTTPException(status_code=400, detail="no chapters parsed from the script")
@@ -799,16 +1078,16 @@ async def audiobook_preview(req: AudiobookPreviewRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"chapter_index out of range (0..{n - 1})")
 
     chapter = plan.chapters[req.chapter_index]
-    cache_dir = os.path.join(OUTPUTS_DIR, "longform_cache")  # shared with _render_longform_sse
+    cache_dir = os.path.join(OUTPUTS_DIR, LONGFORM_CACHE_SUBDIR)  # shared with _render_longform_sse
     os.makedirs(cache_dir, exist_ok=True)
     resolved_lang = _resolve_default_language(req.language, req.default_voice)
     opts = _expressive_opts(req)
-    decision = gpu_gateway.decide("audiobook")
-    wav_path, dur, was_cached, _seg_stats = await _run_chapter(
-        chapter, decision=decision, job=None, default_voice=req.default_voice,
-        language=resolved_lang, opts=opts, voice_map=req.voice_map,
-        lexicon=req.lexicon, cache_dir=cache_dir,
-    )
+    with voice_leases.VoiceFileLease() as lease:
+        wav_path, dur, was_cached, _seg_stats = await _run_chapter(
+            chapter, default_voice=req.default_voice,
+            language=resolved_lang, opts=opts, voice_map=req.voice_map,
+            lexicon=req.lexicon, cache_dir=cache_dir, lease=lease,
+        )
     return {
         "output": os.path.relpath(wav_path, OUTPUTS_DIR),  # served via /audio
         "duration_s": round(dur, 2),
@@ -834,6 +1113,7 @@ async def _render_longform_sse(
     job_id: str | None = None,
     resume: bool = False,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    on_completed: Callable[[], None] | None = None,
 ):
     """Shared chapterized-render SSE generator for Audiobook *and* Stories.
 
@@ -846,8 +1126,6 @@ async def _render_longform_sse(
     from core.config import OUTPUTS_DIR
     from core.failure import build_failure, build_failure_event
     from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
-    from services import gpu_gateway
-
     opts = opts or ExpressiveOptions()
 
     # Resume reuses the original job_id (continuing the same job row + cached
@@ -867,8 +1145,8 @@ async def _render_longform_sse(
 
     # Persist a durable resume manifest (plan + params) so an interrupted render
     # can be resumed later even without the original script. Best-effort.
+    title = (metadata or {}).get("title") or (plan.chapters[0].title if plan.chapters else "")
     try:
-        title = (metadata or {}).get("title") or (plan.chapters[0].title if plan.chapters else "")
         longform_resume.write_manifest(longform_resume.build_manifest(
             job_id=job_id, job_type=job_type, title=title,
             plan_chapters=[
@@ -891,19 +1169,32 @@ async def _render_longform_sse(
     except Exception:  # resume durability is an enhancement; never block the render
         logger.debug("[%s] resume manifest write skipped", job_id, exc_info=True)
 
-    def _emit(payload: dict) -> str:
-        if job_store is not None:
+    def _retire_failed(store, jid: str, reason: str) -> None:
+        """A pre-render refusal ends the job; it must not stay `running`."""
+        if store is not None:
             try:
-                job_store.append_event(job_id, json.dumps(payload))
+                store.retire_if_active(jid, "failed", reason)
+            except Exception:
+                pass  # best-effort job history
+
+    def _emit(payload: dict, *, persist: bool = True, completed_chapter: int | None = None) -> str:
+        # `progress` events (#3417) are live-only: one per chunk would flood
+        # job history, and a reader of it needs only the chapter outcomes.
+        if persist and job_store is not None:
+            try:
+                job_store.append_event(job_id, json.dumps(payload),
+                                       completed_chapter=completed_chapter)
             except Exception:
                 pass  # best-effort job history; never block the stream
         return f"data: {json.dumps(payload)}\n\n"
 
     if not plan.chapters:
+        _retire_failed(job_store, job_id, "nothing to render (no chapters)")
         yield _emit({"type": "error", "error": "nothing to render (no chapters)"})
         return
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
+        _retire_failed(job_store, job_id, "ffmpeg not available; the output needs it")
         yield _emit({"type": "error", "error": "ffmpeg not available; the output needs it"})
         return
 
@@ -911,6 +1202,7 @@ async def _render_longform_sse(
     # the basename + realpath barrier so CodeQL sees a clean path).
     work = longform_resume.work_dir(job_type, job_id)
     if work is None:
+        _retire_failed(job_store, job_id, "invalid job id")
         yield _emit({"type": "error", "error": "invalid job id"})
         return
     os.makedirs(work, exist_ok=True)
@@ -918,14 +1210,38 @@ async def _render_longform_sse(
     # failure or interruption) reuses what already rendered — only the
     # missing/changed chapters synthesize again (resume). Shared across both
     # front doors: an identical chapter renders once.
-    cache_dir = os.path.join(OUTPUTS_DIR, "longform_cache")
+    cache_dir = os.path.join(OUTPUTS_DIR, LONGFORM_CACHE_SUBDIR)
     os.makedirs(cache_dir, exist_ok=True)
-    prune_cache_dir(cache_dir)  # bound disk before this job adds its chapters
+    # Every reference take this render resolves stays held until it ends, so a
+    # re-lock mid-book never lets the retired-voice sweep delete it (#2535).
+    voice_lease = voice_leases.VoiceFileLease()
+    cache_lease = CacheLease()
+    startup_lease = CacheLease()
     try:
+        # Exact keys need the engine's sample rate, which can require an async
+        # model load. Protect existing inputs before the first yield/await,
+        # then narrow to this plan as soon as preparation succeeds.
+        startup_lease.hold_existing(cache_dir)
         resolved_lang = _resolve_default_language(language, default_voice)
-        operation = "audiobook" if job_type == "audiobook" else "longform"
-        decision = gpu_gateway.decide(operation)
-        chapter_run = gpu_gateway.JobRun(operation)
+        reserved_plan = False
+
+        def reserve_cache(sr, engine_id, resolve):
+            nonlocal reserved_plan
+            if reserved_plan:
+                return
+            for chapter in plan.chapters:
+                try:
+                    _chapter_cache_inputs(
+                        chapter, sr, engine_id, resolve, cache_dir, lexicon,
+                        resolved_lang, opts, voice_map, cache_lease,
+                    )
+                except Exception:
+                    # A bad voice/chapter must still fail in its own chapter
+                    # boundary, without preventing the rest of the book.
+                    logger.debug("[%s] chapter cache reservation skipped", job_id,
+                                 exc_info=True)
+            reserved_plan = True
+            startup_lease.release()
 
         total = len(plan.chapters)
         chapter_files: list[str] = []
@@ -936,6 +1252,36 @@ async def _render_longform_sse(
         # instead of restating the symptom (#1321).
         last_chapter_exc: Exception | None = None
         interrupted = False
+        # Per-chunk progress + rolling ETA (#3417). The GPU thread reports each
+        # finished chunk through `progress_q`; the loop below forwards them as
+        # live `progress` events while the chapter is still rendering.
+        tracker = RenderProgress([chapter_weight(c) for c in plan.chapters])
+        loop = asyncio.get_running_loop()
+        progress_q: asyncio.Queue = asyncio.Queue()
+
+        def _progress_sink(index: int):
+            def on_progress(done, chapter_total, *, audio_s=0.0, cached=False):
+                stamp = time.monotonic()
+                try:
+                    loop.call_soon_threadsafe(progress_q.put_nowait,
+                                              (index, done, chapter_total, audio_s, cached, stamp))
+                except RuntimeError:  # loop already closed: nobody is listening
+                    pass
+            return on_progress
+
+        def _drain(first=None) -> bool:
+            items = [first] if first is not None else []
+            while not progress_q.empty():
+                items.append(progress_q.get_nowait())
+            for index, done, chapter_total, audio_s, cached, stamp in items:
+                tracker.chunk(index, done, chapter_total, audio_s=audio_s,
+                              cached=cached, now=stamp)
+            return bool(items)
+
+        def _progress_event(index: int) -> str:
+            return _emit({"type": "progress", "index": index, "total": total,
+                          **tracker.snapshot()}, persist=False)
+
         yield _emit({"type": "started", "job_id": job_id, "chapters": total})
 
         for i, chapter in enumerate(plan.chapters):
@@ -958,13 +1304,28 @@ async def _render_longform_sse(
                 if gone:
                     interrupted = True
                     break
+            tracker.start_chapter(i)
+            task = asyncio.ensure_future(_run_chapter(
+                chapter, default_voice=default_voice, language=resolved_lang,
+                opts=opts, voice_map=voice_map, lexicon=lexicon,
+                cache_dir=cache_dir, lease=voice_lease, cache_lease=cache_lease,
+                reserve_cache=reserve_cache, on_progress=_progress_sink(i),
+            ))
             try:
-                wav_path, dur, was_cached, seg_stats = await _run_chapter(
-                    chapter, operation=operation, decision=decision, job=chapter_run,
-                    default_voice=default_voice, language=resolved_lang,
-                    opts=opts, voice_map=voice_map, lexicon=lexicon,
-                    cache_dir=cache_dir,
-                )
+                while not task.done():
+                    getter = asyncio.ensure_future(progress_q.get())
+                    try:
+                        await asyncio.wait({task, getter},
+                                           return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        if not getter.done():
+                            getter.cancel()
+                    first = getter.result() if getter.done() and not getter.cancelled() else None
+                    if _drain(first):
+                        yield _progress_event(i)
+                if _drain():  # reports that landed with the chapter's result
+                    yield _progress_event(i)
+                wav_path, dur, was_cached, seg_stats = task.result()
             except Exception as e:  # isolate a bad chapter — keep going
                 logger.warning("[%s] chapter %d (%s) failed to render",
                                job_id, i, chapter.title, exc_info=True)
@@ -987,24 +1348,50 @@ async def _render_longform_sse(
                              # The terminal error below carries one.
                              **build_failure(e, stage="audiobook_chapter",
                                              include_diagnostic=False)})
+                tracker.finish_chapter(i)
+                yield _progress_event(i)
+                if isinstance(e, TimeoutError) and hasattr(e, "retry_after"):
+                    # The engine stayed busy past the chapter's wait budget (a
+                    # GpuPoolBusyError). Skipping the chapter would mux a book
+                    # with a hole in it: fail the job instead. The manifest and
+                    # the chapters already cached stay, so a retry resumes.
+                    ev = build_failure_event(e, stage="audiobook_render")
+                    ev["reason"] = (f"the speech engine stayed busy; chapter {i + 1} "
+                                    f"was not rendered, so no book was assembled — "
+                                    f"{ev['reason']}")
+                    ev["error"] = ev["reason"]
+                    if job_store is not None:
+                        try:
+                            job_store.mark_failed(job_id, ev["reason"])
+                        except Exception:
+                            pass  # best-effort job history
+                    yield _emit(ev)
+                    return
                 continue
+            finally:
+                if not task.done():
+                    # The stream was cancelled/closed mid-chapter: stop waiting
+                    # on the render (the pool guard abandons it between chunks)
+                    # and never leave its outcome unretrieved.
+                    task.cancel()
+                    task.add_done_callback(
+                        lambda t: t.cancelled() or t.exception())
             chapter_files.append(wav_path)
-            chapters_meta.append((chapter.title, int(round(dur * 1000))))
+            chapter_ms = round(dur * 1000)
+            chapters_meta.append((chapter.title, int(chapter_ms)))
             cached_n += 1 if was_cached else 0
             ev = {"type": "chapter", "index": i, "total": total,
                   "title": chapter.title, "duration_s": round(dur, 2),
-                  "cached": was_cached}
+                  # One value feeds both the stream and the M4B offset table.
+                  "duration_ms": int(chapter_ms), "cached": was_cached}
             if seg_stats is not None:
                 # Additive fields (old clients ignore them): segment-level
                 # reuse inside a re-rendered chapter.
                 ev["segments"] = seg_stats["total"]
                 ev["cached_segments"] = seg_stats["cached"]
-            yield _emit(ev)
-
-        route_notice = chapter_run.notice()
-        if route_notice is not None:
-            yield _emit({"type": "routing_notice", "status": route_notice[0],
-                         "reason": route_notice[1]})
+            yield _emit(ev, completed_chapter=i)
+            tracker.finish_chapter(i)
+            yield _progress_event(i)
 
         if interrupted:
             logger.info("[%s] client disconnected — stopped after %d/%d chapters",
@@ -1058,11 +1445,9 @@ async def _render_longform_sse(
 
         yield _emit({"type": "assembling"})
         meta_path = os.path.join(work, "chapters.ffmeta")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            f.write(build_ffmetadata(chapters_meta, global_meta=metadata))
+        write_lf_text(meta_path, build_ffmetadata(chapters_meta, global_meta=metadata))
         concat_path = os.path.join(work, "concat.txt")
-        with open(concat_path, "w", encoding="utf-8") as f:
-            f.write(build_concat_list(chapter_files))
+        write_lf_text(concat_path, build_concat_list(chapter_files))
         ext = "mp3" if (fmt or "").lower() == "mp3" else "m4b"
         out_name = f"{job_type}_{job_id}.{ext}"
         out_path = os.path.join(OUTPUTS_DIR, out_name)
@@ -1079,14 +1464,27 @@ async def _render_longform_sse(
             from services.loudness import measure_loudness
             measured = await measure_loudness(ffmpeg, concat_path, norm, job_id=job_id)
 
-        await run_ffmpeg(
-            build_render_cmd(
+        with trace_stage("mux"):
+            cmd = build_render_cmd(
                 ffmpeg, concat_path, meta_path, out_path,
                 fmt=ext, bitrate=bitrate, cover_path=_safe_cover_path(cover_path),
                 loudness=loudness, measured=measured,
-            ),
-            job_id=job_id,
-        )
+            )
+            try:
+                rc, _, _ = await run_ffmpeg(cmd, job_id=job_id)
+                if rc != 0:
+                    raise RuntimeError(f"ffmpeg assembly failed (exit code {rc})")
+            except BaseException:
+                # Also runs on cancellation: failed encodes can leave sizeable
+                # files that the output library would mistake for finished work.
+                try:
+                    os.remove(out_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning("[%s] incomplete output cleanup failed", job_id,
+                                   exc_info=True)
+                raise
 
         if job_store is not None:
             try:
@@ -1096,10 +1494,33 @@ async def _render_longform_sse(
         # The render finished — drop the resume manifest so this job is no longer
         # offered for resume.
         longform_resume.clear_manifest(job_type, job_id)
+        # A partial output still needs the original plan for failed chapters.
+        if on_completed is not None and not failed:
+            try:
+                on_completed()
+            except Exception:
+                logger.debug("[%s] previous resume checkpoint cleanup skipped", job_id, exc_info=True)
         total_s = sum(d for _, d in chapters_meta) / 1000.0
         done = {"type": "done", "output": out_name,
                 "chapters": len(chapter_files), "duration_s": round(total_s, 2),
                 "cached_chapters": cached_n, "failed_chapters": failed}
+        if title:
+            done["title"] = str(title)[:200]
+        try:
+            completed_chapters = [
+                chapter for index, chapter in enumerate(plan.chapters)
+                if index not in failed
+            ]
+            done["summary"] = _render_summary(
+                completed_chapters,
+                default_voice,
+                voice_map,
+                resolved_lang,
+                fmt,
+                opts,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("[%s] render summary could not be built", job_id, exc_info=True)
         # Loudness verdict only when a preset was requested — off/None paths keep
         # the exact legacy `done` shape (additive, old clients unaffected).
         if norm in LOUDNESS_PRESETS:
@@ -1110,6 +1531,18 @@ async def _render_longform_sse(
                 "measured_i": measured.input_i if measured else None,
             }
         yield _emit(done)
+    except (asyncio.CancelledError, GeneratorExit):
+        # The response was cancelled (transport dropped mid-render) or its
+        # iterator was closed. Neither is an `Exception`, so the handler below
+        # never saw them and the job stayed `running` for history/job consumers
+        # (#2536). Retire it as cancelled — a no-op once it is already
+        # done/failed — keep the resume manifest, and let the cancel propagate.
+        if job_store is not None:
+            try:
+                job_store.retire_if_active(job_id, "cancelled")
+            except Exception:
+                pass  # best-effort job history
+        raise
     except Exception as e:  # surface, don't 500 the stream
         logger.exception("[%s] longform render failed", job_id)
         if job_store is not None:
@@ -1119,13 +1552,24 @@ async def _render_longform_sse(
                 pass  # best-effort job history
         # Generic message only — don't leak the stack/exception text to the client.
         yield _emit({"type": "error", "error": "render failed (see backend log)"})
+    finally:
+        voice_lease.release()
+        try:
+            prune_cache_dir(cache_dir)
+        finally:
+            startup_lease.release()
+            cache_lease.release()
 
 
 async def _public_longform_stream(plan, **render_kwargs):
     """Keep generator diagnostics local if setup fails before its own guard."""
     try:
-        async for event in _render_longform_sse(plan, **render_kwargs):
-            yield event
+        # aclosing: closing this stream must finalize the renderer now, not
+        # whenever the garbage collector gets to it, so its job is retired
+        # before the response is considered finished (#2536).
+        async with contextlib.aclosing(_render_longform_sse(plan, **render_kwargs)) as events:
+            async for event in events:
+                yield event
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1140,14 +1584,28 @@ async def _public_longform_stream(plan, **render_kwargs):
         yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
 
 
+def _longform_response(stream) -> StreamingResponse:
+    """SSE response for a longform render, kept alive through silent chapters
+    so reverse proxies do not cut it (Cloudflare 524, nginx read timeouts)."""
+    from core.stream_keepalive import NO_BUFFER_HEADERS, SSE_KEEPALIVE, with_keepalive
+
+    return StreamingResponse(
+        with_keepalive(stream, SSE_KEEPALIVE),
+        media_type="text/event-stream",
+        headers=NO_BUFFER_HEADERS,
+    )
+
+
 @router.post("/audiobook")
+@consumer_generation
 async def audiobook_synthesize(req: AudiobookRequest, request: Request = None):
     """Synthesize a chapterized audiobook from a script, streaming SSE progress."""
+    _ensure_active_engine_licence()
     plan = parse_audiobook_script(req.text, default_voice=req.default_voice)
     # `request` is injected by FastAPI on the HTTP path (the default only applies
     # to a direct in-process call, e.g. a unit test); its disconnect poll is what
     # lets Stop cancel the render mid-book (#1216).
-    return StreamingResponse(
+    return _longform_response(
         _public_longform_stream(
             plan, default_voice=req.default_voice, language=req.language,
             fmt=req.format, bitrate=req.bitrate,
@@ -1156,17 +1614,20 @@ async def audiobook_synthesize(req: AudiobookRequest, request: Request = None):
             job_type="audiobook",
             is_disconnected=request.is_disconnected if request is not None else None,
         ),
-        media_type="text/event-stream",
     )
 
 
 # ── Shared longform render: Stories (and any future front door) post a plan ──
 
 class LongformSpan(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     voice_id: str | None = None
     text: str
     pause_ms_after: int = 0
     speed: float | None = None
+    join: Literal["continue", "paragraph"] | None = None
+    # Per-span ``[emotion:]`` direction (#3422); the parser caps it at 200.
+    emotion: str | None = Field(default=None, max_length=200)
 
 
 class LongformChapter(BaseModel):
@@ -1189,12 +1650,14 @@ class LongformRenderRequest(ExpressiveMixin):
 
 
 @router.post("/longform/render")
+@consumer_generation
 async def longform_render(req: LongformRenderRequest, request: Request = None):
     """Render a pre-built chapter/span plan (the Stories Editor's compiled
     cast+lines) through the shared chapterized renderer — same resume, loudness,
     cover, metadata, and output formats as the Audiobook job."""
     from services.audiobook import AudiobookPlan, Chapter, Span
 
+    _ensure_active_engine_licence()
     if len(req.chapters) > _MAX_CHAPTERS:
         raise HTTPException(status_code=422, detail=f"too many chapters (max {_MAX_CHAPTERS})")
 
@@ -1203,12 +1666,13 @@ async def longform_render(req: LongformRenderRequest, request: Request = None):
         # Keep a span if it has text to speak OR a pause to render (pause-only
         # spans carry inter-line silence with empty text).
         spans = [Span(voice_id=s.voice_id, text=(s.text or "").strip(),
-                      pause_ms_after=max(0, int(s.pause_ms_after)), speed=s.speed)
+                      pause_ms_after=max(0, int(s.pause_ms_after)), speed=s.speed,
+                      join=s.join, emotion=(s.emotion or "").strip() or None)
                  for s in c.spans if ((s.text and s.text.strip()) or s.pause_ms_after > 0)]
         if spans:
             chapters.append(Chapter(title=c.title or f"Chapter {i + 1}", spans=spans))
     plan = AudiobookPlan(chapters=chapters)
-    return StreamingResponse(
+    return _longform_response(
         _public_longform_stream(
             plan, default_voice=req.default_voice, language=req.language,
             fmt=req.format, bitrate=req.bitrate,
@@ -1217,7 +1681,6 @@ async def longform_render(req: LongformRenderRequest, request: Request = None):
             job_type="story",
             is_disconnected=request.is_disconnected if request is not None else None,
         ),
-        media_type="text/event-stream",
     )
 
 
@@ -1225,18 +1688,12 @@ async def longform_render(req: LongformRenderRequest, request: Request = None):
 
 
 def _chapters_done(job_id: str) -> int:
-    """Count chapters that finished rendering, from the job's persisted events.
+    """Count chapters that finished rendering — the job's durable record, not
+    its capped event tail, so a long book does not stop at 500 (#3562).
     Best-effort (0 if unavailable) — used only to show resume progress."""
     try:
         from core import job_store
-        n = 0
-        for ev in job_store.events_since(job_id, 0, limit=100_000):
-            try:
-                if json.loads(ev["payload"]).get("type") == "chapter":
-                    n += 1
-            except (ValueError, KeyError, TypeError):
-                continue
-        return n
+        return len(job_store.completed_chapters(job_id))
     except Exception:
         return 0
 
@@ -1266,11 +1723,12 @@ def list_resumable_jobs() -> dict:
 
 
 @router.post("/audiobook/resume/{job_id}")
+@consumer_generation
 async def resume_longform(job_id: str, request: Request = None):
     """Resume an interrupted longform render from its persisted manifest. The
     already-rendered chapters are content-addressed in the shared cache, so they
     return instantly — only the unrendered chapters synthesize again. Streams the
-    same SSE event shape as the original render, under the original job_id."""
+    same SSE event shape as the original render, under a fresh job_id."""
     from services.audiobook import AudiobookPlan, Chapter, Span
 
     # Find the requested job among the trusted filesystem scan (every path there
@@ -1293,15 +1751,17 @@ async def resume_longform(job_id: str, request: Request = None):
     ]
     plan = AudiobookPlan(chapters=chapters)
     p = manifest.get("params", {})
-    # Retire the interrupted job's manifest (trusted scan path) so it stops
-    # showing as resumable once we've kicked off the fresh-id resume.
-    longform_resume.discard_manifest_file(entry["manifest_path"])
+    # The response generator is lazy and checkpoint sync is best-effort. Keep
+    # the original plan until rendering succeeds, even when a new checkpoint
+    # was published: that write cannot confirm durability on every filesystem.
+    def retire_checkpoint():
+        longform_resume.discard_manifest_file(entry["manifest_path"])
     # Resume under a FRESH job id (job_id=None → a server uuid in the renderer).
     # The chapter cache is content-addressed (keyed by chapter content, not the
     # job id), so the already-rendered chapters still hit instantly — only the
     # unrendered ones synthesize. Using a fresh id means the request's job_id
     # never names a work dir / output file (defence-in-depth path-injection).
-    return StreamingResponse(
+    return _longform_response(
         _public_longform_stream(
             plan, default_voice=p.get("default_voice"), language=p.get("language"),
             fmt=p.get("fmt", "m4b"), bitrate=p.get("bitrate", "128k"),
@@ -1310,7 +1770,7 @@ async def resume_longform(job_id: str, request: Request = None):
             opts=ExpressiveOptions.from_manifest(p.get("expressive")),
             voice_map=p.get("voice_map"),
             job_type=entry["job_type"],
+            on_completed=retire_checkpoint,
             is_disconnected=request.is_disconnected if request is not None else None,
         ),
-        media_type="text/event-stream",
     )

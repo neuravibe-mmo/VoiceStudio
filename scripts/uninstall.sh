@@ -15,9 +15,14 @@
 #   OMNIVOICE_DATA_DIR, OMNIVOICE_CACHE_DIR, HF_HOME, HF_HUB_CACHE
 # Export the ones you set for VoiceStudio before running, and it targets those.
 #
-# It NEVER deletes the app binary itself (that's a per-platform step — see
-# docs/install/uninstall.md), and it never touches anything outside the paths
-# it lists. Mirrors backend/core/config.py + frontend/src-tauri/src/setup.rs.
+# Covers the Electron desktop app (its VoiceStudio app folder: managed Python
+# runtime, window state, logs, updater cache) and the folders a final Tauri
+# install left behind (com.debpalash.omnivoice-studio).
+#
+# Without --app it never deletes the app binary itself (that's a per-platform
+# step — see docs/install/uninstall.md), and it never touches anything outside
+# the paths it lists. Mirrors backend/core/config.py and
+# electron/src/main/backend.ts.
 set -euo pipefail
 
 APPLY=0
@@ -35,28 +40,46 @@ for arg in "$@"; do
   esac
 done
 
-IDENTIFIER="com.debpalash.omnivoice-studio"
+# Final Tauri installs used this identifier for their config + Python env.
+LEGACY_IDENTIFIER="com.debpalash.omnivoice-studio"
+# Electron app folder (app.getPath('userData'); electron/src/main/app-identity.ts)
+# and electron-updater's download cache (package name + "-updater").
+ELECTRON_APP_NAME="VoiceStudio"
+ELECTRON_UPDATER_CACHE="voicestudio-electron-updater"
 OS="$(uname -s)"
 
 # ── Resolve platform default paths (mirrors the app) ────────────────────────
 data_default=""
-config_default=""
+electron_user_data=""
+legacy_config=()
 logs_extra=()
 models_default=""
 case "$OS" in
   Darwin)
     data_default="$HOME/Library/Application Support/OmniVoice"
-    config_default="$HOME/Library/Application Support/$IDENTIFIER"
-    logs_extra=("$HOME/Library/Logs/OmniVoice" "$HOME/Library/Logs/$IDENTIFIER")
+    electron_user_data="$HOME/Library/Application Support/$ELECTRON_APP_NAME"
+    legacy_config=("$HOME/Library/Application Support/$LEGACY_IDENTIFIER")
+    logs_extra=(
+      "$HOME/Library/Logs/$ELECTRON_APP_NAME"
+      "$HOME/Library/Caches/$ELECTRON_UPDATER_CACHE"
+      "$HOME/Library/Logs/OmniVoice"
+      "$HOME/Library/Logs/$LEGACY_IDENTIFIER"
+    )
     models_default="$HOME/.cache/huggingface"
     ;;
   Linux)
     data_default="$HOME/.omnivoice"
-    config_default="${XDG_DATA_HOME:-$HOME/.local/share}/$IDENTIFIER"
-    # The BACKEND writes its own logs outside the app-data dir — see
-    # backend_log_path() in src-tauri/src/backend.rs. Missing this left a stray
-    # log dir behind on every Linux uninstall.
-    logs_extra=("${XDG_STATE_HOME:-$HOME/.local/state}/VoiceStudio")
+    # Electron keeps its logs inside the app folder on Linux.
+    electron_user_data="${XDG_CONFIG_HOME:-$HOME/.config}/$ELECTRON_APP_NAME"
+    legacy_config=(
+      "${XDG_DATA_HOME:-$HOME/.local/share}/$LEGACY_IDENTIFIER"
+      "${XDG_CONFIG_HOME:-$HOME/.config}/$LEGACY_IDENTIFIER"
+    )
+    # Final Tauri installs wrote backend logs outside the app-data dir.
+    logs_extra=(
+      "${XDG_CACHE_HOME:-$HOME/.cache}/$ELECTRON_UPDATER_CACHE"
+      "${XDG_STATE_HOME:-$HOME/.local/state}/VoiceStudio"
+    )
     models_default="$HOME/.cache/huggingface"
     ;;
   *)
@@ -73,11 +96,39 @@ MODELS_DIR="${OMNIVOICE_CACHE_DIR:-${HF_HOME:-${HF_HUB_CACHE:-$models_default}}}
 # silently redirected a fresh reinstall's model cache to the old location.
 USER_ENV_DIR="$HOME/.config/omnivoice"
 
+# A custom runtime location the Electron app created (and therefore owns) is
+# recorded in runtime-location.json. Only an owned, absolute folder named
+# VoiceStudio that holds the app's project is removed — the same rule the
+# in-app uninstall applies; a reused Tauri environment is recorded unowned and
+# kept. The file must be exactly the object the app writes
+# ({"root": "...", "owned": true}); anything else is ignored, so a damaged or
+# hand-edited file can never point the deletion at another folder.
+electron_owned_runtime() {
+  local file="$electron_user_data/runtime-location.json" content root
+  [ -f "$file" ] || return 0
+  content=$(tr -d '\r\n' < "$file")
+  root=$(printf '%s' "$content" | sed -n 's/^[[:space:]]*{[[:space:]]*"root"[[:space:]]*:[[:space:]]*"\([^"\\]*\)"[[:space:]]*,[[:space:]]*"owned"[[:space:]]*:[[:space:]]*true[[:space:]]*}[[:space:]]*$/\1/p')
+  case "$root" in /*) ;; *) return 0 ;; esac
+  [ "$root" = "$electron_user_data/runtime" ] && return 0
+  [ "$(basename "$root" | tr '[:upper:]' '[:lower:]')" = "voicestudio" ] || return 0
+  [ -d "$root/project" ] || return 0
+  printf '%s\n' "$root"
+}
+ELECTRON_RUNTIME="$(electron_owned_runtime)"
+
 # ── Collect existing targets ────────────────────────────────────────────────
 app_targets=()
 
 # ── Optional: the prebuilt app installed by `curl … | sh` (default mode) ────
 if [ "$REMOVE_APP" -eq 1 ]; then
+  command_path="$HOME/.local/bin/voicestudio"
+  if [ -L "$command_path" ]; then
+    command_target="$(readlink "$command_path")"
+    case "$command_target" in
+      "$HOME/.local/bin/VoiceStudio"|"/Applications/VoiceStudio.app/Contents/Resources/cli/voicestudio"|"$HOME/Applications/VoiceStudio.app/Contents/Resources/cli/voicestudio")
+        app_targets+=("$command_path") ;;
+    esac
+  fi
   case "$OS" in
     Darwin)
       for app_dir in "/Applications/VoiceStudio.app" "$HOME/Applications/VoiceStudio.app"; do
@@ -91,7 +142,9 @@ if [ "$REMOVE_APP" -eq 1 ]; then
 fi
 
 [ -e "$DATA_DIR" ] && app_targets+=("$DATA_DIR")
-[ -e "$config_default" ] && app_targets+=("$config_default")
+[ -e "$electron_user_data" ] && app_targets+=("$electron_user_data")
+[ -n "$ELECTRON_RUNTIME" ] && [ -e "$ELECTRON_RUNTIME" ] && app_targets+=("$ELECTRON_RUNTIME")
+for d in "${legacy_config[@]}"; do [ -e "$d" ] && app_targets+=("$d"); done
 [ -e "$USER_ENV_DIR" ] && app_targets+=("$USER_ENV_DIR")
 for d in "${logs_extra[@]:-}"; do [ -n "$d" ] && [ -e "$d" ] && app_targets+=("$d"); done
 
@@ -129,29 +182,72 @@ fi
 # If — and only if — the user opted in to anonymous analytics, send a single
 # best-effort `app_uninstalled` event before the data (and the consent record
 # it lives in) goes away. The backend writes analytics_info.json next to
-# prefs.json ONLY while analytics is enabled (explicit consent + a build that
-# ships a token) and deletes it on opt-out, so the file's presence is itself
-# consent-gated; the prefs.json check is belt and braces. Content-free: the
-# event carries the app version, the OS name, and the random per-install id —
-# nothing else. Never blocks or fails the uninstall (2s timeout, silent
-# failure). Not opted in ⇒ nothing is sent and nothing is printed.
+# prefs.json ONLY while analytics is enabled and deletes it on opt-out, so the
+# file's presence is itself consent-gated; the prefs.json check is belt and
+# braces. Content-free: the app version, the OS name and the random per-install
+# profile. Never blocks the uninstall (2s timeout, silent failure). Not opted
+# in ⇒ nothing is sent and nothing is printed.
 send_uninstall_ping() {
-  local info="$DATA_DIR/analytics_info.json" prefs="$DATA_DIR/prefs.json"
+  local info="$DATA_DIR/analytics_info.json"
+  local prefs="$DATA_DIR/prefs.json"
   [ -f "$info" ] && [ -f "$prefs" ] || return 0
   grep -q '"analytics_enabled"[[:space:]]*:[[:space:]]*true' "$prefs" 2>/dev/null || return 0
   command -v curl >/dev/null 2>&1 || return 0
-  local token host distinct_id app_version platform
-  token=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -n1)
-  host=$(sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -n1)
-  distinct_id=$(sed -n 's/.*"distinct_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -n1)
-  app_version=$(sed -n 's/.*"app_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -n1)
-  platform=$(sed -n 's/.*"platform"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -n1)
-  [ -n "$token" ] && [ -n "$host" ] && [ -n "$distinct_id" ] || return 0
+  # Prefer a system Python; otherwise the app's own runtime interpreter, so an
+  # opted-in user without python3 on PATH is not silently skipped.
+  local py
+  py=$(command -v python3 2>/dev/null || true)
+  if [ -z "$py" ]; then
+    local candidate="${ELECTRON_RUNTIME:-$electron_user_data/runtime}/project/.venv/bin/python"
+    [ -x "$candidate" ] && py=$candidate
+  fi
+  [ -n "$py" ] || return 0
+  local prepared host agent origin body
+  prepared=$("$py" - "$info" 2>/dev/null <<'PYTHON'
+import json, os, re, sys, time, uuid
+from urllib.parse import urlsplit
+try:
+    if os.environ.get("OMNIVOICE_ANALYTICS_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        raise ValueError()
+    if "SUPERMETRY_SITE_ID" in os.environ and not os.environ["SUPERMETRY_SITE_ID"].strip():
+        raise ValueError()
+    with open(sys.argv[1], encoding="utf-8") as f:
+        info = json.load(f)
+    host, url = info["host"].rstrip("/"), info["appUrl"].rstrip("/")
+    for value in (host, url):
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or any(ord(c) < 33 for c in value)):
+            raise ValueError()
+    if (urlsplit(host).path or not info.get("site") or info.get("policy") != "opt-in"
+            or not re.fullmatch(r"install_[a-f0-9]{32}", info.get("profile_id", ""))):
+        raise ValueError()
+    agent = info["user_agent"]
+    if not agent.startswith("Mozilla/5.0 (") or any(ord(c) < 32 for c in agent):
+        raise ValueError()
+    props = {k: info[k] for k in ("app_version", "platform") if isinstance(info.get(k), str) and len(info[k]) <= 64}
+    event = {"v": 1, "id": uuid.uuid4().hex, "ts": int(time.time() * 1000),
+             "site": info["site"], "name": "app_uninstalled", "url": url + "/uninstall",
+             "profile_id": info["profile_id"], "props": props}
+    parsed = urlsplit(url)
+    print(host)
+    print(agent)
+    print(parsed.scheme + "://" + parsed.netloc)
+    print(json.dumps(event, separators=(",", ":"), allow_nan=False))
+except Exception:
+    sys.exit(1)
+PYTHON
+  ) || return 0
+  host=$(printf '%s\n' "$prepared" | sed -n '1p')
+  agent=$(printf '%s\n' "$prepared" | sed -n '2p')
+  origin=$(printf '%s\n' "$prepared" | sed -n '3p')
+  body=$(printf '%s\n' "$prepared" | sed -n '4p')
+  [ -n "$host" ] && [ -n "$body" ] || return 0
   echo "Sending anonymous uninstall ping (you opted in to analytics)."
-  curl -m 2 -s -o /dev/null -X POST "$host/capture/" \
-    -H 'Content-Type: application/json' \
-    -d "{\"api_key\":\"$token\",\"event\":\"app_uninstalled\",\"distinct_id\":\"$distinct_id\",\"properties\":{\"app_version\":\"$app_version\",\"platform\":\"$platform\"}}" \
-    || true
+  curl -m 2 -s -o /dev/null -X POST "$host/api/public/v1/events" \
+    -H 'Content-Type: application/json' -H "Origin: $origin" -A "$agent" \
+    -d "$body" || true
 }
 send_uninstall_ping
 

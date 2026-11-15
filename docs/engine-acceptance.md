@@ -19,6 +19,7 @@ Every engine in the tree owns at least one job. A job has exactly one holder.
 | Fastest CPU render / lowest latency | *open — see #1306* |
 | Best Chinese/Japanese expressiveness | `cosyvoice`, `indextts2` |
 | CPU-realtime English, tiny footprint | `kittentts`, `supertonic3` |
+| Bilingual reference-free voice design and direction | `audiocpp` |
 | Best transcription accuracy | `whisperx`, `faster-whisper` |
 | Fastest Apple-Silicon transcription | `parakeet-mlx`, `mlx-whisper` |
 | Crash isolation for transcription | `faster-whisper-isolated` |
@@ -34,9 +35,17 @@ which is a property of the bar, not a judgement of the contributor.
 1. **A job, named.** Which row above it takes or adds, and why the incumbent
    does not cover it. Latency, language, hardware envelope or quality tier —
    something a user would choose it *for*.
-2. **Licence clean for commercial use.** Model weights *and* code. No
-   research-only weights, no ambiguous provenance. This is the one that most
-   often ends a proposal, so check it first.
+2. **Documented rights for each component.** Record the code, model weights,
+   tokenizer and other required assets separately, including their licence,
+   source/revision, commercial permission and required credits. Unknown or
+   conflicting terms do not count as commercial approval. A restricted engine
+   may be accepted for the free app only with explicit owner approval and a
+   first-use acceptance step that discloses its terms. Pro must reject
+   non-commercial or uncleared assets on the backend unless the necessary
+   rights are obtained. The application licence does not grant model or output
+   rights. Existing integrations also need this audit; the controls remain
+   tracked in #2587. The previously approved `audiocpp` / Breeze-TTS-2 exception
+   remains restricted and stewarded by `@debpalash`.
 3. **Every platform, or explicitly opt-in.** macOS (Apple Silicon and Intel),
    Windows, Linux. A CPU path is required — an engine that only runs on one
    accelerator is fine, but it must degrade rather than break, and a

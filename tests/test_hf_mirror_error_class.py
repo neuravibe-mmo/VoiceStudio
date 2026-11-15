@@ -130,24 +130,9 @@ def test_journal_classifies_mirror_download_as_network_error(mirror_env):
 
 
 @pytest.fixture
-def model_manager(monkeypatch):
-    for mod_name in ("core.config", "services.model_manager"):
-        if getattr(sys.modules.get(mod_name), "__file__", None) is None:
-            sys.modules.pop(mod_name, None)
-
-    import services.model_manager as mm
-
-    monkeypatch.setattr(mm, "_torch", None)
-    monkeypatch.setattr(mm, "_OmniVoice", None)
-    monkeypatch.setattr(mm, "model", None)
-    monkeypatch.setenv("OMNIVOICE_MODEL", "test/checkpoint")
-    monkeypatch.delenv("OMNIVOICE_PRELOAD_TTS_ASR", raising=False)
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
-    monkeypatch.setattr(mm, "_lazy_torch", lambda: SimpleNamespace(float16="float16"))
-    monkeypatch.setattr(mm, "get_best_device", lambda: "cpu")
-    monkeypatch.setattr(mm, "_last_repair_error", "")
-    return mm
+def model_manager(offline_model_manager, monkeypatch):
+    monkeypatch.setattr(offline_model_manager, "_last_repair_error", "")
+    return offline_model_manager
 
 
 _TRUNCATED = OSError(
@@ -199,7 +184,7 @@ def test_repair_failure_message_names_cause_and_mirror(model_manager, monkeypatc
         model_manager._load_model_sync()
     msg = str(exc_info.value)
     assert "incomplete" in msg  # the existing actionable class is preserved
-    assert "Model Catalogue → Models" in msg
+    assert "the engine's Weights list in Model Catalogue" in msg
     assert "hf-mirror.com" in msg  # NEW: the cause is named
     # …and the surfaced text now carries enough signal for the shared mirror
     # hint to fire on the 500-detail surface (main.py appends it).

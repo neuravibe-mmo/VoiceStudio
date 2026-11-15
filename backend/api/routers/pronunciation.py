@@ -16,8 +16,16 @@ Endpoints (admin-gated; loopback or authenticated server mode):
     GET    /pronunciation/export       → all entries as JSON (round-trips import)
     POST   /pronunciation/import       → bulk add entries from JSON
 
-Scope: ``language='*'`` is global (applies to every request); a 2-letter code
-(``'en'``, ``'de'``) applies only when the request language matches.
+Voice scope (#3873): an entry may carry a ``profile_id`` (a saved voice). It then
+applies only when that voice generates, over the language/global entries
+(global -> language -> voice -> voice + language, most specific wins). Without
+``profile_id`` the list/export/import endpoints work on the language dictionary
+only, so existing clients see no change; with it they work on that voice's own
+dictionary. Deleting a voice deletes its entries.
+
+Scope: ``language='*'`` is global (applies to every request); a language id
+(``'en'``, ``'kbt'``; picker names like ``'Spanish'`` are saved as their id)
+applies only when the request language resolves to the same id.
 """
 from __future__ import annotations
 
@@ -27,12 +35,18 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.dependencies import require_admin
 from core.db import db_conn
-from services.pronunciation import apply_pronunciation, entries_for_language
+from services.pronunciation import (
+    apply_pronunciation,
+    entries_for_language,
+    inert_entries_for_language,
+    language_scope_key,
+    load_entries_from_db,
+)
 
 logger = logging.getLogger("omnivoice.pronunciation")
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -84,13 +98,24 @@ def _validate_type_replacement(etype: str, replacement: str) -> None:
 
 
 def _norm_language(language: Optional[str]) -> str:
-    """Normalize a scope to '*' (global) or a lowercase 2-letter code."""
-    if not language:
-        return _ALL_LANG
-    s = str(language).strip()
-    if not s or s == _ALL_LANG or s.lower() == "auto":
-        return _ALL_LANG
-    return s.lower()[:2]
+    """Normalize a scope to '*' (global) or a language id (``language_scope_key``):
+    picker names resolve to their id, regional tags to the base id."""
+    return language_scope_key(language) or _ALL_LANG
+
+
+_COLS = "id, term, replacement, type, language, enabled, created_at, profile_id"
+
+
+def _check_profile(profile_id: Optional[str]) -> str:
+    """``""`` (every voice) or an existing voice's id; 404 for an unknown voice."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return ""
+    with db_conn() as conn:
+        found = conn.execute("SELECT 1 FROM voice_profiles WHERE id = ?", (pid,)).fetchone()
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such voice.")
+    return pid
 
 
 def _row_to_dict(r) -> dict:
@@ -110,6 +135,8 @@ class PronEntry(BaseModel):
     type: str = "respelling"
     language: str = _ALL_LANG
     enabled: bool = True
+    # "" = every voice (the language dictionary); else a saved voice's id.
+    profile_id: str = ""
 
 
 class PronEntryUpdate(BaseModel):
@@ -123,24 +150,26 @@ class PronEntryUpdate(BaseModel):
 class PronTestRequest(BaseModel):
     text: str
     language: Optional[str] = None
+    profile_id: Optional[str] = None  # include this voice's entries, as synthesis does
 
 
 class PronImportRequest(BaseModel):
     entries: List[PronEntry]
-    replace: bool = False  # True → clear existing rows first
+    replace: bool = False  # True → clear existing rows first (this scope only)
+    # Where the rows land, and what ``replace`` clears: "" = the language
+    # dictionary, else one voice's. A row's own ``profile_id`` is ignored.
+    profile_id: str = ""
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 
 
 @router.get("/pronunciation")
-def list_entries():
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, term, replacement, type, language, enabled, created_at "
-            "FROM pronunciation_entries ORDER BY created_at ASC, id ASC"
-        ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+def list_entries(profile_id: Optional[str] = Query(None)):
+    """The language dictionary, or one voice's own entries with ``profile_id``."""
+    pid = (profile_id or "").strip()
+    return [_row_to_dict(r) for r in load_entries_from_db()
+            if (r.get("profile_id") or "") == pid]
 
 
 @router.post("/pronunciation")
@@ -155,18 +184,18 @@ def create_entry(entry: PronEntry):
             detail=f"Unknown entry type {entry.type!r}. Use one of: {', '.join(_VALID_TYPES)}.",
         )
     _validate_type_replacement(etype, entry.replacement)
+    pid = _check_profile(entry.profile_id)
     eid = str(uuid.uuid4())[:12]
     now = time.time()
     lang = _norm_language(entry.language)
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO pronunciation_entries (id, term, replacement, type, language, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (eid, term, entry.replacement, etype, lang, 1 if entry.enabled else 0, now),
+            "INSERT INTO pronunciation_entries (id, term, replacement, type, language, enabled, created_at, profile_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (eid, term, entry.replacement, etype, lang, 1 if entry.enabled else 0, now, pid),
         )
         row = conn.execute(
-            "SELECT id, term, replacement, type, language, enabled, created_at "
-            "FROM pronunciation_entries WHERE id = ?", (eid,)
+            f"SELECT {_COLS} FROM pronunciation_entries WHERE id = ?", (eid,)  # nosec B608 - constant
         ).fetchone()
     return _row_to_dict(row)
 
@@ -175,8 +204,7 @@ def create_entry(entry: PronEntry):
 def update_entry(entry_id: str, patch: PronEntryUpdate):
     with db_conn() as conn:
         existing = conn.execute(
-            "SELECT id, term, replacement, type, language, enabled, created_at "
-            "FROM pronunciation_entries WHERE id = ?", (entry_id,)
+            f"SELECT {_COLS} FROM pronunciation_entries WHERE id = ?", (entry_id,)  # nosec B608 - constant
         ).fetchone()
         if existing is None:
             raise HTTPException(status_code=404, detail="No such pronunciation entry.")
@@ -220,8 +248,7 @@ def update_entry(entry_id: str, patch: PronEntryUpdate):
             params,
         )
         row = conn.execute(
-            "SELECT id, term, replacement, type, language, enabled, created_at "
-            "FROM pronunciation_entries WHERE id = ?", (entry_id,)
+            f"SELECT {_COLS} FROM pronunciation_entries WHERE id = ?", (entry_id,)  # nosec B608 - constant
         ).fetchone()
     return _row_to_dict(row)
 
@@ -243,29 +270,34 @@ def test_substitution(req: PronTestRequest):
     Applies the same dictionary + inline ``[[…]]`` resolution the synth path
     runs, so the user sees exactly what the engine will be handed.
     """
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, term, replacement, type, language, enabled, created_at "
-            "FROM pronunciation_entries"
-        ).fetchall()
-    substituted = apply_pronunciation(req.text, rows, req.language)
-    applied = entries_for_language(rows, req.language)
+    # Same rows in the same order as synthesis, so duplicate terms resolve alike.
+    rows = load_entries_from_db()
+    pid = _check_profile(req.profile_id)
+    substituted = apply_pronunciation(req.text, rows, req.language, profile_id=pid)
+    applied = entries_for_language(rows, req.language, pid)
+    # IPA/CMU rows are validated and stored but not applied yet, so a term that
+    # DOES match can still change nothing. Reporting them separately keeps the
+    # dry run honest — otherwise it says "no entries match", which is wrong and
+    # sends the user to re-type an entry that was already correct (#1949).
+    inert = inert_entries_for_language(rows, req.language, pid)
     return {
         "input": req.text,
         "substituted": substituted,
         "changed": substituted != req.text,
         "applied_terms": sorted(applied.keys(), key=len, reverse=True),
+        # Present but not honoured: [{term, type}, …]. Empty on the happy path.
+        "inert_entries": inert,
     }
 
 
 @router.get("/pronunciation/export")
-def export_entries():
-    """Every entry as a JSON-serializable list (round-trips ``/import``)."""
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT term, replacement, type, language, enabled "
-            "FROM pronunciation_entries ORDER BY created_at ASC, id ASC"
-        ).fetchall()
+def export_entries(profile_id: Optional[str] = Query(None)):
+    """The language dictionary (or one voice's, with ``profile_id``) as a
+    JSON-serializable list (round-trips ``/import`` with the same scope)."""
+    # Entry order is precedence order; importing rows back in this order
+    # reproduces it.
+    pid = (profile_id or "").strip()
+    rows = [r for r in load_entries_from_db() if (r.get("profile_id") or "") == pid]
     return {"entries": [
         {"term": r["term"], "replacement": r["replacement"], "type": r["type"],
          "language": r["language"], "enabled": bool(r["enabled"])}
@@ -281,6 +313,7 @@ def import_entries(req: PronImportRequest):
     whole import (400) so the table is never left half-applied.
     """
     now = time.time()
+    pid = _check_profile(req.profile_id)
     cleaned = []
     for e in req.entries:
         term = e.term.strip()
@@ -294,13 +327,15 @@ def import_entries(req: PronImportRequest):
             )
         _validate_type_replacement(etype, e.replacement)
         cleaned.append((str(uuid.uuid4())[:12], term, e.replacement, etype,
-                        _norm_language(e.language), 1 if e.enabled else 0, now))
+                        _norm_language(e.language), 1 if e.enabled else 0, now, pid))
     with db_conn() as conn:
         if req.replace:
-            conn.execute("DELETE FROM pronunciation_entries")
+            # Only this scope: replacing the language dictionary must not wipe
+            # the voices' own dictionaries, and vice versa.
+            conn.execute("DELETE FROM pronunciation_entries WHERE profile_id = ?", (pid,))
         conn.executemany(
-            "INSERT INTO pronunciation_entries (id, term, replacement, type, language, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO pronunciation_entries (id, term, replacement, type, language, enabled, created_at, profile_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             cleaned,
         )
     return {"imported": len(cleaned), "replaced": req.replace}

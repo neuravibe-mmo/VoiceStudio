@@ -16,7 +16,7 @@ What it produces:
   * backend/assets/samples/demo_voice.wav             (clone reference)
   * backend/assets/samples/demo_clone_output.wav      (clone pre-rendered)
   * backend/assets/samples/voice_design/demo_voice_design_<slug>.wav (7)
-  * Updated manifest with rendered_by="omnivoice@<git_sha>"
+  * Existing dubbing manifest marked for separate licence review
 
   * backend/assets/samples/dictation/*.wav (3 replay scripts)
 
@@ -41,7 +41,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,7 +71,7 @@ CLONE_VOICE_INSTRUCT = "female, young adult, low pitch, american accent"
 CLONE_RENDER_STEPS = 48
 
 # Dictation replay scripts. `text` MUST match SCRIPTS in
-# frontend/src/components/DictationDemo.jsx verbatim — the card shows that
+# electron/src/shared/utils/dictationScripts.js verbatim — the card shows that
 # string as "what you would say" and then shows what the recogniser heard, so
 # any drift between the two reads as a transcription error.
 DICTATION_SCRIPTS = [
@@ -103,16 +102,6 @@ DICTATION_SCRIPTS = [
 ]
 
 
-def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=REPO_ROOT, text=True,
-        ).strip()
-    except Exception:
-        return "unknown"
-
-
 def watermark_file(path: Path, sample_rate: int, *, context: str) -> None:
     """Stamp the provenance watermark into an already-written WAV (#1169).
 
@@ -128,11 +117,11 @@ def watermark_file(path: Path, sample_rate: int, *, context: str) -> None:
     its way to disk.
     """
     import torch
-    import torchaudio
 
+    from services.audio_io import _safe_torchaudio_save, load_audio
     from services.watermark import mark_synthetic
 
-    waveform, rate = torchaudio.load(str(path))
+    waveform, rate = load_audio(str(path))
     marked = mark_synthetic(waveform, rate, context=context, force=True)
     if marked is waveform and os.environ.get("OMNIVOICE_DEMO_ALLOW_UNMARKED") == "1":
         print(f"  ! {path.name} is NOT watermarked (OMNIVOICE_DEMO_ALLOW_UNMARKED=1)")
@@ -150,18 +139,14 @@ def watermark_file(path: Path, sample_rate: int, *, context: str) -> None:
             "Set OMNIVOICE_DEMO_ALLOW_UNMARKED=1 only for a local listen — never "
             "for a render you intend to commit."
         )
-    torchaudio.save(
-        str(path),
-        marked.to(torch.float32),
-        rate,
-        encoding="PCM_S", bits_per_sample=16,
-    )
+    _safe_torchaudio_save(str(path), marked.to(torch.float32), rate, bits_per_sample=16)
 
 
 def _save_wav(audio_tensor, sample_rate: int, out_path: Path):
     """Save a torch tensor (C, T) or (T,) to a 16-bit PCM WAV."""
     import torch
-    import torchaudio
+
+    from services.audio_io import _safe_torchaudio_save
 
     if audio_tensor.dim() == 1:
         audio_tensor = audio_tensor.unsqueeze(0)
@@ -178,12 +163,7 @@ def _save_wav(audio_tensor, sample_rate: int, out_path: Path):
     peak = audio_tensor.abs().max().item()
     if peak > 0:
         audio_tensor = audio_tensor / peak * 0.97
-    torchaudio.save(
-        str(out_path),
-        audio_tensor.to(torch.float32),
-        sample_rate,
-        encoding="PCM_S", bits_per_sample=16,
-    )
+    _safe_torchaudio_save(str(out_path), audio_tensor.to(torch.float32), sample_rate, bits_per_sample=16)
     _normalize_loudness(out_path, sample_rate)
     watermark_file(out_path, sample_rate, context=f"demo:{out_path.stem}")
 
@@ -335,15 +315,17 @@ def render_dictation(model, args):
 
 
 def update_manifest(args):
-    """Update the existing manifest with rendered_by + rendered_at."""
+    """Mark existing demo terms unreviewed without claiming a new dub render."""
     print("\n── Manifest ─────────────────────────────────────────")
     mpath = SAMPLES_DIR / "demo" / "dubbing" / "manifest.json"
     if not mpath.exists():
         print(f"  ! manifest not found at {mpath} — run scripts/build_dub_demo.sh first")
         return
     data = json.loads(mpath.read_text())
-    data["rendered_by"] = f"omnivoice@{_git_sha()}"
-    data["rendered_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # This script does not render the dubbing files described by this manifest.
+    # Preserve their recorded renderer and timestamp instead of relabelling them.
+    data["license"] = "NOASSERTION"
+    data["license_review_required"] = True
     mpath.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     print(f"  ✓ {mpath.name}")
 

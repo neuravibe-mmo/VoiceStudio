@@ -1,30 +1,39 @@
-"""FDL-09: the segmented (multi-connection) downloader is ON by default.
-
-The app forces the legacy-LFS path (HF_HUB_DISABLE_XET=1) for clear progress,
-which is single-stream and slow. The segmented accelerator restores parallel
-byte-range speed with a safe fallback to snapshot_download — so it ships ON by
-default for fast first-run downloads. This pins the default so it can't silently
-regress to opt-in, and that the env override still disables it.
-"""
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
-
-from api.routers.setup.download import _segmented_enabled  # noqa: E402
+import httpx
+import pytest
 
 
-def test_segmented_is_on_by_default(monkeypatch):
+def _download_module():
+    from api.routers.setup import download
+    return download
+
+
+def test_segmented_download_default_and_env_values(monkeypatch):
+    module = _download_module()
     monkeypatch.delenv("OMNIVOICE_SEGMENTED_DOWNLOAD", raising=False)
-    assert _segmented_enabled() is True
-
-
-def test_env_override_can_disable(monkeypatch):
+    assert module._segmented_enabled() is True
     monkeypatch.setenv("OMNIVOICE_SEGMENTED_DOWNLOAD", "0")
-    assert _segmented_enabled() is False
+    assert module._segmented_enabled() is False
+    for value in ("1", "true", "on", "yes"):
+        monkeypatch.setenv("OMNIVOICE_SEGMENTED_DOWNLOAD", value)
+        assert module._segmented_enabled() is True
 
 
-def test_env_override_truthy_keeps_it_on(monkeypatch):
-    for val in ("1", "true", "on", "yes"):
-        monkeypatch.setenv("OMNIVOICE_SEGMENTED_DOWNLOAD", val)
-        assert _segmented_enabled() is True
+def test_segmented_retry_policy():
+    module = _download_module()
+    dropped = httpx.RemoteProtocolError("peer closed connection")
+    for attempt in (1, 2, 3):
+        assert module._segmented_retry_plan(dropped, attempt, 5) == (False, True)
+    assert module._segmented_retry_plan(dropped, 4, 5) == (True, True)
+    assert module._segmented_retry_plan(dropped, 5, 5) == (True, False)
+    assert module._segmented_retry_plan(dropped, 1, 1) == (True, False)
+    assert module._segmented_retry_plan(ValueError("bad data"), 1, 5) == (True, False)
+
+
+def test_segmented_retry_log_phrases_are_truthful():
+    module = _download_module()
+    active = module._segmented_retry_log_phrase(False, True)
+    exhausted = module._segmented_retry_log_phrase(True, True)
+    fallback = module._segmented_retry_log_phrase(True, False)
+    assert len({active, exhausted, fallback}) == 3
+    assert "now" not in exhausted.lower()
+    assert "now" in fallback.lower()

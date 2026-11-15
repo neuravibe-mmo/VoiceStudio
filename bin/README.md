@@ -1,15 +1,19 @@
 # Bundled binaries
 
-This directory holds platform-specific binaries that ship inside the
-VoiceStudio installer. Today:
+This directory holds the paths for platform-specific native binaries. The files
+in git are zero-byte placeholders; CI builds the real binaries
+(`.github/workflows/build-omnivoice-tts.yml`), and the desktop installers ship
+them under `resources/bin/` (#2780; not on Intel Macs, which cannot run the
+local backend). Today:
 
 | File | Built from | Purpose |
 |------|------------|---------|
 | `omnivoice-tts-darwin-arm64` | `ServeurpersoCom/omnivoice.cpp` @ pinned SHA | GGUF inference runtime — Apple Silicon |
-| `omnivoice-tts-darwin-x86_64` | same | Intel Mac |
+| `omnivoice-tts-darwin-x86_64` | same | Intel Mac (local builds only; not shipped) |
 | `omnivoice-tts-linux-x86_64` | same | Linux (x86_64) |
 | `omnivoice-tts-linux-aarch64` | same | Linux ARM64 — Apple Silicon under Asahi; built with GGML Vulkan where the toolchain supports it, so the Honeykrisp driver can accelerate generation |
 | `omnivoice-tts-windows-x86_64.exe` | same | Windows |
+| `tts-server-<platform>[.exe]` | same | Resident server for the opt-in "keep the GGUF engine loaded" mode (#3654); built beside `omnivoice-tts-*` for each platform above and listed in the manifest |
 | `checksums.sha256` | computed by `scripts/build-omnivoice-tts.sh` | SHA-256 manifest — verified by `VoiceStudioGGUFBackend.is_available()` |
 
 The pinned commit SHA for `omnivoice.cpp` lives in
@@ -21,13 +25,12 @@ The pinned commit SHA for `omnivoice.cpp` lives in
 scripts/build-omnivoice-tts.sh --platform <slug> --commit-sha <40hex>
 ```
 
-See `.github/workflows/ci.yml` `build-omnivoice-tts` job for the CI
-matrix that produces these artifacts on every PR. The Apple Silicon
-slot (`macos-14`) is marked `continue-on-error: true` because the
-upstream `omnivoice.cpp` README does not publish a `buildmetal.sh`
-(Pitfall 1 in `04-RESEARCH.md`); a failed Metal build is documented
-and the macOS Apple Silicon cloning default falls back to the
-in-process `VoiceStudioBackend`.
+See `.github/workflows/build-omnivoice-tts.yml` `build-omnivoice-tts` job
+for the CI matrix that produces these artifacts. Apple Silicon (`macos-14`)
+builds cleanly with `-DGGML_METAL=ON` at the pinned SHA (#2105), enabling
+hardware-accelerated Metal inference when the packaged artifact passes binary
+preflight and macOS permits execution. Missing or blocked binaries retain the
+in-process `VoiceStudioBackend` fallback.
 
 ## Placeholder note
 

@@ -1,42 +1,33 @@
 # VoiceStudio — Install on macOS
 
-This page is self-contained: follow it top to bottom and you'll end up with a
-working VoiceStudio install on macOS (Apple Silicon).
+VoiceStudio's macOS desktop app is built with Electron. The archived Tauri app
+is no longer maintained; if you still run it, follow the
+[migration guide](../electron-migration.md).
 
 > [!IMPORTANT]
-> **Intel Macs are not supported.** The app UI installs and launches, but the
-> local Python backend **cannot run**: PyTorch stopped shipping Intel-Mac
-> (macOS x86_64) wheels after 2.2.x, and VoiceStudio's dependencies require a
-> newer torch — so the first-run dependency install can never succeed, from
-> the DMG *or* from source
-> ([#889](https://github.com/debpalash/VoiceStudio/issues/889)). The app
-> detects this at first launch and tells you directly instead of failing with
-> a raw installer error. Your options on an Intel Mac: point the UI at a
-> remote backend running on another machine (**Settings → Sharing → Remote
-> backend**), or run VoiceStudio on an Apple Silicon Mac, Windows, or Linux.
+> **Intel Macs are not supported** for the local backend (app UI only).
+> PyTorch stopped shipping Intel-Mac (macOS
+> x86_64) wheels after 2.2.x and VoiceStudio's dependencies need a newer torch,
+> so a local Python backend cannot install on an Intel Mac — from the DMG *or*
+> from source ([#889](https://github.com/debpalash/VoiceStudio/issues/889)).
+> On Intel, packaged setup stops before creating a Python environment or
+> downloading dependencies and shows remote-backend guidance instead: use the
+> remote connection controls on the setup screen to point the app at a backend
+> on another machine, or run VoiceStudio on an Apple Silicon Mac, Windows, or
+> Linux. A source checkout behaves the same way: `bun run setup:api` stops
+> before syncing anything, and the app opens the same remote-backend screen
+> instead of reporting an incomplete Python environment
+> ([#3584](https://github.com/debpalash/VoiceStudio/issues/3584)).
 
-## Prerequisites
+## Requirements
 
-### Using the DMG
-
-- **macOS 13.3 (Ventura) or newer** — Apple Silicon (Intel: UI only, see the
+- **macOS 13.3 (Ventura) or newer** on Apple Silicon (Intel: UI only, see the
   note above).
 - **~10 GB free disk** for the app, its Python environment, and model weights.
 
-That's it — GPU acceleration (Apple MPS) is automatic on Apple Silicon, and
-Python, FFmpeg, and the model weights are bundled or bootstrapped by the app
-itself on first launch. No toolchain needed.
-
-### Building from source
-
-Everything above, plus the toolchain:
-
-- **Xcode Command Line Tools** — `xcode-select --install` (includes **git**
-  and the C toolchain; `curl` ships with macOS).
-- **Python 3.11+** — `brew install python@3.11` (or use `pyenv` / the system Python if you already have ≥3.11).
-- **Bun** — `curl -fsSL https://bun.sh/install | bash`.
-- **Rust / Cargo** — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` or `brew install rust`.
-  If you use rustup, reopen the terminal or source `"$HOME/.cargo/env"` before running `bun run desktop-prod`.
+GPU acceleration (Apple MPS) is automatic on Apple Silicon. Python, FFmpeg,
+and model weights are bootstrapped by the app itself on first launch; no
+toolchain is needed for the packaged app.
 
 FFmpeg/FFprobe and yt-dlp are **not** prerequisites on any install path: the
 app resolves them itself (a static build ships with the Python environment;
@@ -44,120 +35,183 @@ if nothing resolves, the app downloads its own checksummed build on first
 run). Power users can inspect or override the binaries in
 **Settings → Audio tools** — including pointing at a Homebrew copy.
 
-Optional but recommended:
+Optional but recommended: **a Hugging Face account** for diarization and the
+larger TTS models. See [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
 
-- **A Hugging Face account** for diarization and the larger TTS models. See
-  [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
+## Install with Homebrew
 
-## Install (from source)
+The [official tap](https://github.com/debpalash/homebrew-tap) installs the released
+DMG for your Mac’s architecture:
 
-One-liner (installs prerequisites, clones, and builds):
+```sh
+brew tap debpalash/tap
+brew trust --cask debpalash/tap/voicestudio
+brew install --cask debpalash/tap/voicestudio
+```
+
+The trust step is required by recent Homebrew versions for third-party casks.
+Check the cask before trusting it with `brew cat --cask debpalash/tap/voicestudio`.
+Intel Macs still need a backend on another computer. If macOS blocks the first
+launch, follow the [Gatekeeper instructions](#gatekeeper-quarantine).
+
+## Install (DMG)
+
+Download the DMG that matches your Mac (check **Apple menu → About This Mac →
+Chip/Processor**) from the
+[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest),
+double-click to mount it, and drag **VoiceStudio.app** into `/Applications`.
+
+Current builds link the bundled `voicestudio` command into `~/.local/bin` on
+the first launch of the installed app (or during shell-script installation), and
+add that folder to your shell profiles (`~/.zshrc`, `~/.profile`) once if your shell does not
+already search it. Open a new terminal afterwards: `voicestudio` opens the app,
+`voicestudio --help` shows the CLI, and commands start the app in the background
+when it is not running. Python and uv are not required. Existing custom launchers
+are preserved; see the [CLI migration instructions](script.md#terminal-command).
+
+| Mac | DMG to download |
+|-----|-----------------|
+| Apple Silicon (any M-series chip) | `VoiceStudio-<version>-mac-arm64.dmg` |
+| Intel | `VoiceStudio-<version>-mac-x64.dmg` — **UI only**: the local backend cannot run on Intel ([#889](https://github.com/debpalash/VoiceStudio/issues/889)) |
+
+Every Apple Silicon Mac takes the `arm64` DMG, including chips newer than this
+page: VoiceStudio checks the CPU architecture, never the chip's name. If macOS
+says VoiceStudio "is not supported on this Mac" or asks you to install Rosetta,
+you opened the `x64` DMG; install the `arm64` one instead (#3074).
+
+The architectures are **not** interchangeable: an Intel Mac cannot run the
+`arm64` build (Rosetta 2 only translates the other direction). An Apple
+Silicon Mac *can* open the `x64` build through Rosetta, but its local backend
+then needs the Intel-only PyTorch wheels that no longer exist, so setup stops
+and offers the Apple Silicon download instead. Install the `arm64` DMG over it;
+your voices and projects are kept. Compare the download with the release's
+`SHA256SUMS.txt` before opening it.
+
+Or install the latest release from Terminal with the
+[shell installer](script.md), which picks the right DMG, verifies its
+checksum, and installs `VoiceStudio.app` into `/Applications` (or
+`~/Applications` when `/Applications` is not writable):
 
 ```bash
 curl -fsSL https://voicestudio.sh/install | sh
 ```
 
-Or manually:
-
-```bash
-git clone https://github.com/debpalash/VoiceStudio.git
-cd VoiceStudio
-bun install
-bun run desktop-prod
-```
-
-The first launch builds the Tauri shell, creates the Python venv via `uv`,
-syncs deps, and downloads model weights (~2.4 GB). The splash screen shows
-live progress for every step.
-
-## Install (pre-built `.app`)
-
-Download the latest DMG from the
-[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest),
-double-click to mount, drag **VoiceStudio.app** into `/Applications`.
-
-Pick the DMG that matches your Mac (check **Apple menu → About This Mac → Chip/Processor**):
-
-| Mac | DMG to download |
-|-----|-----------------|
-| Apple Silicon (M1/M2/M3/M4…) | `VoiceStudio.Studio_<version>_aarch64.dmg` |
-| Intel | `VoiceStudio.Studio_<version>_x64.dmg` — **UI only**: the local backend cannot run on Intel ([#889](https://github.com/debpalash/VoiceStudio/issues/889)) |
-
-The architectures are **not** interchangeable: an Intel Mac cannot run the
-`aarch64` build (Rosetta 2 only translates the other direction — it lets Apple
-Silicon run Intel apps, never the reverse). And note the Intel caveat above:
-the `x64` DMG installs and launches, but is only useful together with a
-remote backend — the local Python backend cannot install on Intel because
-PyTorch no longer ships Intel-Mac wheels. Installing from source does not
-help; the dependency resolution fails the same way.
-
-If the first launch is blocked by macOS Gatekeeper ("VoiceStudio cannot be
-opened because the developer cannot be verified"), see the next section — it
-opens with one right-click, no Terminal.
+If the first launch is blocked by macOS Gatekeeper (a "developer cannot be
+verified" or "damaged" dialog), see the next section for the fix.
 
 ## App is "damaged" / can't be opened (Gatekeeper)
 
 <a id="gatekeeper-quarantine"></a>
 
-On first launch you'll see **"VoiceStudio cannot be opened because the
-developer cannot be verified"** — macOS Gatekeeper blocking an app it can't trace
-to a paid Apple Developer account (issues #134, #72).
+macOS may refuse to open VoiceStudio with one of two dialogs. Both come from
+Gatekeeper, and neither means the download is broken:
 
-**Why:** the build is **ad-hoc code-signed** (a valid signature, free) but not
-yet **notarised** by Apple, so macOS quarantines any copy downloaded from the
-internet and asks you to confirm the first launch. This is expected for
-open-source builds — releases are notarised (warning-free) only once the
-project's Apple Developer ID pipeline is funded (see "For maintainers" below).
-Confirming is **safe** because you downloaded from the official repo / Releases
-page; for belt-and-braces, verify the SHA-256 against the `*.dmg.sha256` checksum
-on the release page first.
+- **"VoiceStudio is damaged and can't be opened. Move to Trash"**: Gatekeeper
+  is rejecting an app that carries the browser's `com.apple.quarantine`
+  attribute but has no Apple Developer ID signature and no notarization. The
+  wording is misleading; nothing is corrupt.
+- **"VoiceStudio cannot be opened because the developer cannot be verified"**:
+  the milder form of the same check, which offers an Open path.
 
-**Fix — GUI, no Terminal (do this):** in Finder, **right-click** (or
-Control-click) **VoiceStudio.app** → **Open** → click **Open** again in the
-dialog. (On macOS 15 Sequoia: double-click once, then go to **System Settings →
-Privacy & Security**, scroll down, and click **"Open Anyway"**.) This is a
-one-time confirmation per install; afterwards it launches by double-click.
+The release workflow requires Developer ID signing and notarization unless an
+unsigned release is explicitly approved. Older releases and local test builds
+may be signed ad hoc (`identity: '-'`), which is not an Apple identity. Check
+the signing status for the specific release you downloaded. Environments that
+require signed, notarized apps must use a qualifying release; bypassing
+Gatekeeper is not a substitute.
 
-> If you instead see the harsher **"app is damaged and can't be opened. Move to
-> Trash"** with no Open option, the download was corrupted or it's a pre-signing
-> build — re-download the latest release, or use the Terminal fallback below.
+**Check the download first.** Compute its SHA-256 and compare it with
+`SHA256SUMS.txt` from the same GitHub Release:
 
-**Fix — Terminal:** after dragging the app into `/Applications`, run:
+```bash
+shasum -a 256 ~/Downloads/VoiceStudio*.dmg
+```
+
+If the values match, the file is intact and downloading it again will give the
+same dialog. Only re-download when the checksum does **not** match.
+
+**Fix for "damaged" (Terminal).** After dragging the app into `/Applications`,
+clear the quarantine attribute:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/VoiceStudio.app"
 ```
 
-(Adjust the path if you put the app somewhere other than `/Applications`.)
+(Change the path if the app lives elsewhere.) This is a one-time step per
+install. The shell installer already does it for you, and also repairs the
+signature of older releases.
 
-That clears the quarantine attribute so Gatekeeper stops blocking the launch — a
-one-time fix per install.
+**If a build still refuses to open,** re-sign it ad hoc on your own Mac and
+verify the result:
 
-### For maintainers — enabling notarised builds
+```bash
+codesign --force --deep --sign - "/Applications/VoiceStudio.app"
+codesign --verify --deep --strict "/Applications/VoiceStudio.app"
+```
 
-The release workflow (`.github/workflows/release.yml`) is already wired to
-code-sign + notarise the macOS bundle; it activates automatically once these
-repository **secrets** are set (it skips signing — producing today's unsigned
-build — when they're absent):
+The verify command prints nothing when the signature is valid.
 
-| Secret | What |
-|--------|------|
-| `APPLE_CERTIFICATE` | Developer ID Application cert, exported as a base64-encoded `.p12` |
-| `APPLE_CERTIFICATE_PASSWORD` | password for that `.p12` |
-| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
-| `APPLE_ID` | Apple ID email used for notarisation |
-| `APPLE_PASSWORD` | an **app-specific password** for that Apple ID |
-| `APPLE_TEAM_ID` | your 10-char Apple Developer Team ID |
+**Fix for "developer cannot be verified" (no Terminal).** In Finder,
+**right-click** (or Control-click) **VoiceStudio.app** → **Open** → click
+**Open** again in the dialog. On macOS 15 Sequoia, double-click once, then go to
+**System Settings → Privacy & Security**, scroll down and click **"Open
+Anyway"**. You confirm once per install; later launches work by double-click.
 
-Requires a paid Apple Developer account ($99/yr). Once set, downloaded DMGs open
-without the quarantine step.
+### For maintainers — enabling notarized Electron builds
+
+The maintained Electron release workflow uses a Developer ID Application
+certificate (`ELECTRON_MACOS_CSC_LINK` and `ELECTRON_MACOS_CSC_KEY_PASSWORD`)
+plus `APPLE_API_KEY`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` for
+notarization with an App Store Connect team API key. See [the release guide](../RELEASING.md#credentials)
+for all platform credentials and verification gates. An Apple Developer
+membership is required; the archived Tauri workflow's `APPLE_CERTIFICATE`
+secrets do not sign Electron installers.
+
+## Building from source
+
+Use this for development or to run current `main`. To build and install a
+desktop package from `main` without a checkout, use the shell installer's
+[`--main` mode](script.md#building-main). Local source builds are not
+local-backend capable on Intel Macs either.
+
+Prerequisites (use a native arm64 terminal on Apple Silicon):
+
+- **Xcode Command Line Tools** — `xcode-select --install` (includes **git**
+  and the C toolchain; `curl` ships with macOS).
+- **Bun** — `curl -fsSL https://bun.sh/install | bash`.
+- **uv** — `curl -LsSf https://astral.sh/uv/install.sh | sh` (it provides the
+  managed Python 3.11 the backend uses).
+- **Node.js 22.12.0 or newer** and **Rust / Cargo** (`brew install rust`, or rustup —
+  reopen the terminal or source `"$HOME/.cargo/env"` afterwards) for the
+  Electron native helper.
+
+```bash
+git clone https://github.com/debpalash/VoiceStudio.git
+cd VoiceStudio
+node electron/scripts/node-version.mjs
+```
+
+If the Node check fails, stop here, upgrade Node.js, and reopen your terminal
+before continuing. Then install dependencies and prepare the local backend
+(skip API setup when using an external backend or an Intel Mac):
+
+```bash
+bun install
+bun run setup:api   # create the Python environment with uv
+bun run dev         # Electron with hot reload; it starts and supervises the backend
+```
+
+Use `bun run desktop-prod` to build and launch the production bundle, or
+`bun run dist` to create local DMG/zip packages in `electron/release/` without
+publishing. Local packages are unsigned. See
+[Electron setup](../../electron/README.md) for backend configuration.
 
 ## Apple Silicon vs Intel
 
 - **Apple Silicon (M-series):** VoiceStudio automatically picks the `mlx-whisper`
   and `mlx-audio` backends where available — these use the Apple Neural Engine
   and Metal Performance Shaders for ~2× the throughput of the CPU path.
-  Installing the **Parakeet TDT v3 (MLX)** model from **Model Catalogue → Models**
+  Installing the **Parakeet TDT v3 (MLX)** model from **Model Catalogue** (ASR tab → the engine's **Weights**)
   additionally makes dictation/capture prefer the `parakeet-mlx` engine
   (25 European languages, word timestamps, ~2 GB unified memory) — it is never
   downloaded without that explicit install, and it is only auto-preferred when
@@ -167,10 +221,9 @@ without the quarantine step.
 - **Intel Macs:** the local backend is **unsupported** — PyTorch no longer
   ships Intel-Mac wheels, so the Python environment can never install
   ([#889](https://github.com/debpalash/VoiceStudio/issues/889)). The UI
-  works only when pointed at a remote backend (**Settings → Sharing → Remote
-  backend**).
+  works only when connected to a remote backend.
 
-The picker in **Model Catalogue → Engines** shows which backend is active.
+The picker in **Model Catalogue** shows which backend is active.
 
 ## Hugging Face token (optional but recommended)
 
@@ -178,7 +231,7 @@ The default install works without a token, but diarization (the
 `pyannote/speaker-diarization-3.1` model) is gated and the larger
 voice-design engines also download faster with a token attached.
 
-- Open **Settings → API Keys** in the app.
+- Open **Settings → Credentials** in the app.
 - Or set the env var `export HF_TOKEN=hf_…` in `~/.zshrc`.
 
 Full details: [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
@@ -187,6 +240,22 @@ Full details: [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
 
 Hit a wall? See [docs/install/troubleshooting.md](troubleshooting.md).
 
-The in-app error UI (the React error boundary that fires on backend errors)
-includes an **"Open docs for this error"** button — that button deeplinks
-back into this docs tree at the right section for the error class.
+The in-app error UI includes an **"Open docs for this error"** button that
+deeplinks back into this docs tree at the right section for the error class.
+
+### `torch` "doesn't have a source distribution or wheel for the current platform"
+
+If setup fails with `You're on macOS (macosx_…_x86_64), but torch … only has
+wheels for … macosx_11_0_arm64`, the runtime is being built for Intel. On an
+Apple Silicon Mac that means the `x64` DMG (or a Rosetta terminal for source
+installs) is in use: install the `mac-arm64` DMG, or run `bun run setup:api`
+from a native arm64 terminal (`uname -m` prints `arm64`). On an Intel Mac the
+local backend is unsupported; connect to a remote backend instead.
+
+### Fast process shutdown
+
+A process that exits while shutdown is signalling it can report a macOS
+permission error. VoiceStudio accepts this only after confirming the original
+process exited without being reaped (macOS can take a moment to report that
+exit, so it waits up to a quarter of a second), then still waits for nested
+operations to drain. Live-process permission errors and lost process ownership remain failures.

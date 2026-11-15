@@ -40,6 +40,7 @@ import re
 import struct
 import sys
 import traceback
+from pathlib import Path
 
 
 # Mirrors backend/services/subprocess_backend.py::MAX_FRAME_BYTES.
@@ -54,6 +55,8 @@ MOSS_SAMPLE_RATE = 24000
 #: Reviewed HF repo and immutable revision for the default remote-code model.
 _DEFAULT_REPO = "OpenMOSS-Team/MOSS-TTS-v1.5"
 _DEFAULT_REVISION = "cdd3b911b1585e3f2dbc7775ef10f9926f58850a"
+_CODEC_REPO = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
+_CODEC_REVISION = "3cd226ba2947efa357ef453bcad111b6eafba782"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -119,7 +122,11 @@ def _measure_vram_mb() -> float:
     """This sidecar's own GPU memory in MB (MM2-08). The parent can't see a
     child's VRAM, so we self-report it in the pong. 0 on CPU. Never raises."""
     try:
-        import torch
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
     except Exception:
@@ -135,14 +142,130 @@ def _measure_vram_mb() -> float:
 _state = None
 
 
+def _patch_xpu_mem_get_info(torch) -> None:
+    """Pinned copy of ``backend/core/xpu_compat.py`` (this sidecar cannot
+    import parent code): Intel Arc drivers on Windows refuse the free-memory
+    query that transformers/accelerate call while loading onto XPU, so fall
+    back to ``total - reserved``. Kept in step by
+    tests/test_xpu_mem_get_info_shim.py."""
+    xpu = getattr(torch, "xpu", None)
+    original = getattr(xpu, "mem_get_info", None)
+    if original is None or getattr(original, "_omnivoice_fallback", False):
+        return
+
+    def mem_get_info(device=None):
+        try:
+            return original(device)
+        except RuntimeError:
+            if device is None:
+                idx = int(xpu.current_device())
+            elif isinstance(device, int):
+                idx = device
+            else:
+                idx = torch.device(device).index
+                idx = int(xpu.current_device()) if idx is None else int(idx)
+            total = int(xpu.get_device_properties(idx).total_memory)
+            return max(total - int(xpu.memory_reserved(idx)), 0), total
+
+    mem_get_info._omnivoice_fallback = True
+    xpu.mem_get_info = mem_get_info
+
+
+def _snapshot_has_weights(path: str) -> bool:
+    """Legacy Hub caches may contain only config files from a failed load."""
+    root = Path(path)
+    if not (root / "config.json").is_file():
+        return False
+    if any((root / name).is_file() for name in ("model.safetensors", "pytorch_model.bin")):
+        return True
+    for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        try:
+            weight_map = json.loads((root / name).read_text(encoding="utf-8"))["weight_map"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(weight_map, dict) and weight_map and all(
+            isinstance(shard, str) and (root / shard).is_file()
+            for shard in weight_map.values()
+        ):
+            return True
+    return False
+
+
+def _snapshot_has_loading_files(path: str, *, processor: bool) -> bool:
+    """Check loader metadata, tokenizer assets and the remote-code import closure."""
+    from transformers.dynamic_module_utils import get_relative_import_files
+
+    root = Path(path)
+    names = ["config.json"]
+    if processor:
+        names += ["processor_config.json", "tokenizer_config.json"]
+    try:
+        configs = [json.loads((root / name).read_text(encoding="utf-8")) for name in names]
+        if not all(isinstance(config, dict) for config in configs):
+            return False
+        if processor:
+            if not ((root / "tokenizer.json").is_file() or all(
+                (root / name).is_file() for name in ("vocab.json", "merges.txt")
+            )):
+                return False
+            if not configs[-1].get("chat_template") and not (root / "chat_template.jinja").is_file():
+                return False
+        for config in configs:
+            for reference in config.get("auto_map", {}).values():
+                references = [reference] if isinstance(reference, str) else reference
+                for class_name in references:
+                    if class_name is None:  # optional slow/fast tokenizer class
+                        continue
+                    module_name = class_name.rsplit(".", 1)[0]
+                    module = root / (module_name + ".py")
+                    if not module.is_file() or not all(
+                        Path(relative).is_file() for relative in get_relative_import_files(module)
+                    ):
+                        return False
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def _snapshot_path(repo: str, revision: str) -> str:
+    """Reuse a loadable local snapshot or complete its pinned download."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    # A pinned revision can still trigger a Hub tree-listing request. Reuse
+    # complete cached loading files and weights first, including older caches.
+    try:
+        cached = snapshot_download(repo, revision=revision, local_files_only=True)
+    except LocalEntryNotFoundError as error:
+        # IncompleteSnapshotError may flag only missing non-loading files.
+        # Older Hub versions raise errors without a snapshot_path attribute.
+        cached = getattr(error, "snapshot_path", None)
+    if cached and _snapshot_has_weights(cached) and _snapshot_has_loading_files(
+        cached, processor=repo != _CODEC_REPO,
+    ):
+        return cached
+    return snapshot_download(repo, revision=revision)
+
+
+def _rocm_rdna2(torch):
+    """RDNA 2 bf16 GEMM can crash rocBLAS even when Torch claims support (#2372)."""
+    if not getattr(getattr(torch, "version", None), "hip", None):
+        return False
+    try:
+        return str(torch.cuda.get_device_properties(0).gcnArchName).lower().startswith("gfx103")
+    except Exception:  # noqa: BLE001 - unknown ROCm architecture uses safe precision
+        return True
+
+
 def _load_model(stdout):
     """Cold-construct the MOSS-TTS-v1.5 processor + model.
 
-    Device selection is CUDA-or-CPU only — MOSS's upstream documents no MPS
-    path and the custom ``trust_remote_code`` modelling code is untested on
-    Apple Silicon, so we never route to MPS where it might crash. dtype is
-    bf16 on CUDA, fp32 on CPU (bf16 CPU ops are spotty). Emits progress
-    frames so the parent can surface the multi-GB cold-load latency.
+    Device selection uses the torch.accelerator API to support any backend
+    (CUDA, NPU, XPU, etc.) automatically. MPS is excluded — MOSS's upstream
+    ``trust_remote_code`` modelling code is untested on Apple Silicon. dtype is
+    bf16 on GPU-class accelerators, fp32 on CPU (bf16 CPU ops are spotty).
+    Emits progress frames so the parent can surface the multi-GB cold-load
+    latency.
     """
     global _state
     if _state is not None:
@@ -154,14 +277,35 @@ def _load_model(stdout):
     from transformers import AutoModel, AutoProcessor
 
     repo, revision = _model_source()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # current_accelerator() returns None on CPU-only builds (no accelerator
+    # compiled in) or when no accelerator is available; fall back to "cpu".
+    # Existing manually provisioned venvs may predate torch.accelerator.
+    current_accelerator = getattr(getattr(torch, "accelerator", None), "current_accelerator", None)
+    try:
+        if current_accelerator is None:
+            accel = torch.device("cuda") if torch.cuda.is_available() else None
+        else:
+            accel = current_accelerator(check_available=True)
+    except Exception:
+        # Optional drivers can fail during probing; CPU loading remains usable.
+        accel = None
+    device = accel.type if accel is not None else "cpu"  # 'cuda', 'npu', 'mps', 'xpu', 'cpu'
+    if device == "mps":
+        device = "cpu"  # MOSS is untested on MPS; fall back to CPU for safety
+    if device == "xpu":
+        _patch_xpu_mem_get_info(torch)
+    dtype = torch.bfloat16 if device != "cpu" and not (device == "cuda" and _rocm_rdna2(torch)) else torch.float32
     # "sdpa" works on CUDA + CPU and needs no extra dep. flash_attention_2
     # (Ampere+ CUDA, optional flash-attn) is opt-in via env.
     attn = os.environ.get("OMNIVOICE_MOSS_TTS_V15_ATTN", "sdpa")
 
+    # The upstream processor forwards revision to both the separate codec
+    # repo and ProcessorMixin.__init__, where it is invalid (#2690). Resolve
+    # each immutable revision first; the loaders then consume local paths.
+    model_path = _snapshot_path(repo, revision)
+    codec_path = _snapshot_path(_CODEC_REPO, _CODEC_REVISION)
     processor = AutoProcessor.from_pretrained(
-        repo, revision=revision, trust_remote_code=True,
+        model_path, trust_remote_code=True, codec_path=codec_path,
     )
     # The audio tokenizer is a separate sub-module that must be moved to the
     # device independently (easy to miss — see upstream README).
@@ -170,8 +314,7 @@ def _load_model(stdout):
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 50})
 
     model = AutoModel.from_pretrained(
-        repo,
-        revision=revision,
+        model_path,
         trust_remote_code=True,
         attn_implementation=attn,
         torch_dtype=dtype,

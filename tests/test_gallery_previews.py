@@ -11,8 +11,8 @@ Five things must hold, and every one of them is silent when it breaks:
   never asked for;
 * a network gallery is a **filesystem-write primitive**: keys, filenames and tar
   members are all attacker-supplied strings;
-* ``/archetypes/{id}/use`` **never** reads a gallery file — that WAV becomes the
-  reference audio a cloned voice is built from.
+* ``/archetypes/{id}/use`` **never** reads a gallery file or renders audio — it
+  stores a design recipe and leaves model loading to an explicit audio action.
 
 CI runs with ``HF_HUB_OFFLINE=1`` and there is no HTTP-stub fixture in this
 suite, so :class:`StubGallery` below is one: an ``httpx.MockTransport`` that
@@ -236,16 +236,8 @@ def sandbox(tmp_path, monkeypatch, signer, _live_gallery):
 
 # ── The key in the binary ────────────────────────────────────────────────────
 
-def test_pubkey_matches_the_shipped_updater_key():
-    """The gallery's trust root IS the updater's — not a copy that can drift.
-
-    If the release key is ever rotated in tauri.conf.json, this fails here
-    rather than as "gallery quietly stopped updating" months later.
-    """
-    conf = json.loads((_REPO / "frontend" / "src-tauri" / "tauri.conf.json").read_text())
-    assert gallery.UPDATER_PUBKEY == conf["plugins"]["updater"]["pubkey"]
-    # …and is a key this client can actually use — equality alone would still
-    # pass with a truncated or re-encoded blob on both sides.
+def test_gallery_pubkey_is_valid():
+    """The gallery trust root remains a usable minisign public key."""
     algorithm, _key_id, raw = gallery._decode_minisign_pubkey(gallery.UPDATER_PUBKEY)
     assert algorithm in (b"Ed", b"ED") and len(raw) == 32
 
@@ -510,7 +502,7 @@ def client(sandbox):
 
     app = FastAPI()
     app.include_router(router_mod.router)
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 50000))
 
 
 def _first_archetype():
@@ -583,7 +575,7 @@ def test_preview_state_is_three_states(client, sandbox, monkeypatch):
     body = client.get(f"/archetypes/{item['id']}/preview/state").json()
     assert body == {
         "source": "no_model",
-        "message": "You're offline and no voice model is downloaded yet — Model Catalogue → Models → Download.",
+        "message": "You're offline and no voice model is downloaded yet — download one from the engine's Weights list in Model Catalogue.",
     }
 
     monkeypatch.setattr("api.routers.archetypes._no_voice_model_downloaded", lambda: False)
@@ -608,7 +600,7 @@ def test_missing_model_gets_an_action_not_a_log_file(client, sandbox, monkeypatc
     monkeypatch.setattr("api.routers.archetypes._render_archetype_wav", _fail)
     monkeypatch.setattr("api.routers.archetypes._no_voice_model_downloaded", lambda: True)
     detail = client.get(f"/archetypes/{item['id']}/preview").json()["detail"]
-    assert "Model Catalogue → Models → Download" in detail
+    assert "one from the engine's Weights list in Model Catalogue" in detail
     assert "Logs" not in detail
 
 

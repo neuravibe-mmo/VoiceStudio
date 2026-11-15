@@ -20,14 +20,9 @@ import threading
 
 import pytest
 
-
 @pytest.fixture
-def model_manager(monkeypatch):
-    for mod_name in ("core.config", "services.model_manager"):
-        if getattr(sys.modules.get(mod_name), "__file__", None) is None:
-            sys.modules.pop(mod_name, None)
-    import services.model_manager as mm
-    return mm
+def model_manager(fresh_model_manager):
+    return fresh_model_manager()
 
 
 def test_guard_times_out_resets_pool_and_restores_capacity(model_manager):
@@ -103,6 +98,37 @@ def test_cpu_host_gets_bounded_ten_minute_generate_budget(model_manager, monkeyp
     monkeypatch.setattr(model_manager, "CPU_JOB_TIMEOUT_S", 600.0)
 
     assert model_manager.generate_timeout_s("A short CPU render") == 600.0
+
+
+def test_router_timeout_alias_preserves_native_device_metadata(
+    model_manager, monkeypatch,
+):
+    from api.routers.generation import _generate_timeout_s
+
+    captured = {}
+    engine = object()
+
+    def fake_timeout(text, **kwargs):
+        captured.update(kwargs)
+        return 600.0
+
+    monkeypatch.setattr(model_manager, "generate_timeout_s", fake_timeout)
+
+    assert _generate_timeout_s(
+        "test",
+        engine=engine,
+        execution_device="vulkan",
+        min_vram_gb=6.0,
+        hardware_family="cuda",
+        vram_gb=4.0,
+    ) == 600.0
+    assert captured == {
+        "engine": engine,
+        "execution_device": "vulkan",
+        "min_vram_gb": 6.0,
+        "hardware_family": "cuda",
+        "vram_gb": 4.0,
+    }
 
 
 def test_accelerated_host_keeps_five_minute_generate_budget(model_manager, monkeypatch):
@@ -292,7 +318,10 @@ def test_cpu_host_gets_compute_bound_guidance(monkeypatch):
     assert "VRAM" not in msg
     assert "set the engine to CPU" not in msg
     assert "compute-bound" in msg
-    assert "OMNIVOICE_GENERATE_TIMEOUT_S" in msg
+    # #1808: the budget moved into Settings → Performance & Device in #1797,
+    # so the remedy names that control now. The env var still works and still
+    # shadows the setting — only which one we point the user at changed.
+    assert "Settings → Performance & Device" in msg
 
 
 def test_gpu_host_keeps_vram_guidance(monkeypatch):

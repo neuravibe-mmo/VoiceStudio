@@ -16,15 +16,30 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  UVICORN_ARGS,
   buildExitBanner,
   createBackendSupervisor,
   isBackendSourceChange,
+  killProcessTree,
   resolveDataDir,
   tailFile,
+  uvRunArgs,
+  uvicornArgs,
 } from '../../scripts/dev-backend.mjs';
 
-function supervisorHarness() {
+test('CPU/CUDA/ROCm restarts skip sync while preserving bind-host and port overrides', () => {
+  for (const variant of ['auto', 'cpu', 'cuda', 'rocm']) {
+    const args = uvRunArgs({
+      OMNIVOICE_TORCH_VARIANT: variant,
+      OMNIVOICE_BIND_HOST: '192.0.2.10',
+      OMNIVOICE_PORT: '4321',
+    });
+    assert.deepEqual(args.slice(0, 2), ['run', '--no-sync']);
+    assert.equal(args[args.indexOf('--host') + 1], '192.0.2.10');
+    assert.equal(args[args.indexOf('--port') + 1], '4321');
+  }
+});
+
+function supervisorHarness(overrides = {}) {
   const children = [];
   const timers = [];
   const exits = [];
@@ -64,6 +79,8 @@ function supervisorHarness() {
     exit: (code) => exits.push(code),
     report: (message) => reports.push(message),
     dataDir: () => '/missing-test-data',
+    healPthFiles: () => [],
+    ...overrides,
   });
 
   return {
@@ -85,12 +102,26 @@ function supervisorHarness() {
   };
 }
 
-test('uvicorn runs directly because the wrapper owns source reloads', () => {
+test('uvicorn runs directly on loopback because the wrapper owns source reloads', () => {
   assert.equal(
-    ['uv', ...UVICORN_ARGS].join(' '),
-    'uv run uvicorn main:app --app-dir backend --host 0.0.0.0 --port 3900',
+    ['uv', ...uvicornArgs({})].join(' '),
+    'uv run uvicorn main:app --app-dir backend --host 127.0.0.1 --port 3900',
   );
-  assert.equal(UVICORN_ARGS.includes('--reload'), false);
+  assert.equal(uvicornArgs({}).includes('--reload'), false);
+});
+
+test('dev backend honours the backend bind host and port knobs', () => {
+  const args = uvicornArgs({ OMNIVOICE_BIND_HOST: '0.0.0.0', OMNIVOICE_PORT: '3912' });
+  assert.deepEqual(args.slice(-4), ['--host', '0.0.0.0', '--port', '3912']);
+  for (const bad of ['', 'nope', '0', '70000']) {
+    assert.deepEqual(uvicornArgs({ OMNIVOICE_PORT: bad }).slice(-2), ['--port', '3900']);
+  }
+  assert.deepEqual(uvicornArgs({ OMNIVOICE_BIND_HOST: '  ' }).slice(-4, -2), ['--host', '127.0.0.1']);
+  assert.deepEqual(uvRunArgs({ OMNIVOICE_TORCH_VARIANT: 'rocm', OMNIVOICE_PORT: '3912' }).slice(0, 3), [
+    'run',
+    '--no-sync',
+    'uvicorn',
+  ]);
 });
 
 test('only Python source changes trigger backend reloads', () => {
@@ -281,4 +312,87 @@ test('failure to spawn uv exits immediately instead of looping', () => {
 
   assert.deepEqual(exits, [1]);
   assert.match(reports[0], /could not start uv: uv is missing/);
+});
+
+test('process tree shutdown chooses the platform-specific mechanism', () => {
+  const windows = { pid: 43210, signals: [], kill(signal) { this.signals.push(signal); } };
+  const launches = [];
+  const windowsResult = killProcessTree(windows, 'SIGINT', {
+    platform: 'win32',
+    run(command, args, options) {
+      launches.push({ command, args, options });
+      return { status: 0, error: null };
+    },
+  });
+  assert.deepEqual(
+    { result: windowsResult, directSignals: windows.signals, launch: launches[0] },
+    {
+      result: 'taskkill',
+      directSignals: [],
+      launch: {
+        command: 'taskkill',
+        args: ['/pid', '43210', '/T', '/F'],
+        options: { stdio: 'ignore' },
+      },
+    },
+  );
+
+  const posixSignals = [];
+  const posixResult = killProcessTree(
+    { pid: 91, kill: (signal) => posixSignals.push(signal) },
+    'SIGHUP',
+    { platform: 'darwin', run: () => assert.fail('taskkill must not run') },
+  );
+  assert.deepEqual([posixResult, posixSignals], ['signal', ['SIGHUP']]);
+});
+
+test('an unavailable taskkill path delegates to ChildProcess.kill', () => {
+  for (const failedResult of [{ status: 7 }, { status: 0, error: new Error('missing') }, undefined]) {
+    const seen = [];
+    const method = killProcessTree(
+      { pid: 314, kill: (signal) => seen.push(signal) },
+      'SIGTERM',
+      { platform: 'win32', run: () => failedResult },
+    );
+    assert.deepEqual({ method, seen }, { method: 'fallback', seen: ['SIGTERM'] });
+  }
+});
+
+test('a nonzero taskkill reload exit starts a replacement without crash handling', () => {
+  const treeKills = [];
+  const rig = supervisorHarness({
+    killBackend(process, signal) {
+      treeKills.push([process, signal]);
+      return 'taskkill';
+    },
+  });
+  rig.supervisor.start();
+  rig.watchers[0].onChange('backend/routes/catalogue.py');
+  rig.runNextTimer();
+  const original = rig.children[0];
+  original.emit('exit', 5, null);
+
+  assert.equal(treeKills[0][1], 'SIGTERM');
+  assert.equal(rig.children.length, 2);
+  assert.equal(rig.reports.filter((entry) => entry.includes('BACKEND DIED')).length, 0);
+  assert.deepEqual(rig.exits, []);
+});
+
+test('every launch heals the checkout .venv first, and a failed heal never blocks it (#1783)', () => {
+  const order = [];
+  let fail = false;
+  const harness = supervisorHarness({
+    healPthFiles: () => {
+      order.push('heal');
+      if (fail) throw new Error('read-only');
+      return [];
+    },
+  });
+  harness.supervisor.start();
+  order.push(`spawn${harness.children.length}`);
+  fail = true;
+  harness.children[0].emit('exit', 1, null);
+  harness.runNextTimer();
+  order.push(`spawn${harness.children.length}`);
+  assert.deepEqual(order, ['heal', 'spawn1', 'heal', 'spawn2']);
 });

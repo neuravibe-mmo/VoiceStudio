@@ -41,7 +41,7 @@ def _make_wav(path: Path, seconds: float = 1.0, sr: int = 16000) -> None:
 
 
 def _load_fixture(name: str) -> dict:
-    return json.loads((FIXTURES / name).read_text())
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +113,53 @@ def _seed_job(dc_module, tmp_path: Path, duration: float, scene_cuts=None) -> st
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+def test_completed_transcription_replays_without_running_asr(tmp_path, monkeypatch):
+    """A lost final SSE event must reconnect to the persisted result."""
+    import asyncio
+    from api.routers import dub_core as dc
+
+    job_id = "t_completed_replay"
+    cached = [{
+        "id": 0,
+        "start": 0.0,
+        "end": 1.0,
+        "text": "Already transcribed",
+        "text_original": "Already transcribed",
+        "speaker_id": "Speaker 1",
+    }]
+    dc._dub_jobs[job_id] = {
+        "transcription_complete": True,
+        "segments": cached,
+        "source_lang": "en",
+        "full_transcript": "Already transcribed",
+        "cast_sources": {"Speaker 1": {"duration": 1.0}},
+    }
+
+    def _unexpected_asr(*_args, **_kwargs):
+        raise AssertionError("completed transcription re-entered ASR")
+
+    monkeypatch.setattr(
+        "services.asr_backend.load_active_asr_backend",
+        _unexpected_asr,
+    )
+
+    async def _collect():
+        response = await dc.dub_transcribe_stream(job_id)
+        parts = []
+        async for chunk in response.body_iterator:
+            parts.append(chunk.decode() if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+        return "".join(parts)
+
+    try:
+        body = asyncio.run(_collect())
+    finally:
+        dc._dub_jobs.pop(job_id, None)
+
+    assert "event: final" in body, body
+    assert "Already transcribed" in body, body
+    assert "event: done" in body, body
+
 
 def test_transcribe_stream_surfaces_model_load_failure(tmp_path, monkeypatch):
     """Regression #255: when the model fails to load, the SSE transcribe stream
@@ -564,7 +611,8 @@ def test_reset_pool_on_wedge_is_a_noop_without_reset():
         pool.shutdown(wait=False)
 
 
-def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("startup_delay", [0, 0.3])
+def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch, startup_delay):
     """#1669: a timed-out native transcribe keeps executing in its thread.
 
     Resetting the pool and immediately retrying entered the same
@@ -579,23 +627,39 @@ def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch):
     from api.routers import dub_core as dc
     from services import asr_backend
 
+    native_entered = threading.Event()
+
     class _RecordingPool(Executor):
         """Executor with a #851-style reset(): swap the inner pool, count calls."""
 
         def __init__(self):
             self.resets = 0
             self._inner = ThreadPoolExecutor(max_workers=1)
+            self._pools = [self._inner]
+            self.wait_for_native = False
 
         def submit(self, fn, /, *args, **kwargs):
-            return self._inner.submit(fn, *args, **kwargs)
+            def delayed():
+                import time
+                if self.wait_for_native:
+                    time.sleep(startup_delay)
+                return fn(*args, **kwargs)
+            future = self._inner.submit(delayed)
+            if self.wait_for_native:
+                # This fixture must reach native work to test non-overlap;
+                # its explicit chunk budget includes the injected queue delay.
+                assert native_entered.wait(10), "mock ASR never started"
+            return future
 
         def reset(self):
             self.resets += 1
             old, self._inner = self._inner, ThreadPoolExecutor(max_workers=1)
+            self._pools.append(self._inner)
             old.shutdown(wait=False, cancel_futures=True)
 
         def shutdown(self, wait=True, *, cancel_futures=False):
-            self._inner.shutdown(wait=False, cancel_futures=True)
+            for inner in self._pools:
+                inner.shutdown(wait=wait, cancel_futures=cancel_futures)
 
     release_wedge = threading.Event()
 
@@ -608,6 +672,7 @@ def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch):
 
         def transcribe(self, path, *, word_timestamps=True):
             type(self).calls += 1
+            native_entered.set()
             release_wedge.wait(timeout=30)  # wedge far past the tiny chunk timeout
             return {"chunks": [], "segments": [], "language": "en"}
 
@@ -628,9 +693,19 @@ def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch):
         return fake_model
 
     pool = _RecordingPool()
+    real_guard = dc.run_transcribe_guarded
+    guard_calls = 0
+
+    async def guard_running_call(executor, fn, **kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        pool.wait_for_native = True
+        return await real_guard(executor, fn, **kwargs)
+
+    monkeypatch.setattr(dc, "run_transcribe_guarded", guard_running_call)
     monkeypatch.setattr(dc, "get_model", _ok_model)
     monkeypatch.setattr(dc, "_gpu_pool", pool)
-    monkeypatch.setattr(dc, "TRANSCRIBE_CHUNK_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(dc, "TRANSCRIBE_CHUNK_TIMEOUT_S", startup_delay + 0.2)
     monkeypatch.setattr(dc, "_CHUNK_TRANSCRIBE_ATTEMPTS", 2)
     monkeypatch.setattr(dc, "offload_tts_for_asr", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -656,6 +731,7 @@ def test_wedged_chunk_does_not_overlap_a_native_retry(tmp_path, monkeypatch):
         pool.shutdown()
         dc._dub_jobs.pop(job_id, None)
 
+    assert guard_calls == 1, "a timed-out native call must not be retried"
     assert pool.resets == 0, "an in-process native call cannot be killed by swapping pools"
     assert _WedgedASR.calls == 1, "the timed-out native call must not overlap a retry"
     # The user-facing chunk error is the guard's actionable message …
@@ -788,3 +864,269 @@ class TestTranscribeRoute:
         # At least one segment boundary should land at/near the scene cut.
         near_cut = [s for s in segs if abs(s["end"] - 5.5) < 0.2 or abs(s["start"] - 5.5) < 0.2]
         assert near_cut, f"no segment boundary near scene cut 5.5; got {[(s['start'], s['end']) for s in segs]}"
+
+
+def test_stream_pings_while_reference_text_refinement_runs(tmp_path, monkeypatch):
+    """The quiet stretch after the segments event must not be byte-silent."""
+    import asyncio
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from api.routers import dub_core as dc
+    from services import asr_backend, speaker_clone
+
+    class Backend:
+        id = "fake"
+        def ensure_loaded(self): pass
+        def transcribe(self, *a, **kw):
+            return {"chunks": [{"text": "Hello there.", "timestamp": (0.0, 0.8)}],
+                    "segments": [], "language": "en"}
+        def unload(self): pass
+
+    async def model():
+        result = MagicMock()
+        result._asr_pipe = MagicMock()
+        return result
+
+    def fake_refs(vocals, segs, out_dir, seg_ids=None):
+        return {str(i): {"ref_audio": "x.wav", "ref_text": "raw"} for i in (seg_ids or [])}
+
+    def slow_refine(clones, backend):
+        time.sleep(0.4)
+        for entry in clones.values():
+            entry["ref_text"] = "refined"
+        return clones
+
+    monkeypatch.setattr(dc, "get_model", model)
+    monkeypatch.setattr(asr_backend, "get_active_asr_backend", lambda *a, **kw: Backend())
+    monkeypatch.setattr(dc, "get_diarization_pipeline", lambda **kw: (None, None))
+    monkeypatch.setattr(dc, "offload_tts_for_asr", lambda: None)
+    monkeypatch.setattr(dc, "restore_tts_after_asr", lambda: None)
+    monkeypatch.setattr(speaker_clone, "extract_segment_refs", fake_refs)
+    monkeypatch.setattr(speaker_clone, "refine_ref_texts", slow_refine)
+    monkeypatch.setattr(dc, "POST_ASR_PING_S", 0.02)
+
+    audio = tmp_path / "ping.wav"
+    _make_wav(audio, seconds=1.0)
+    job_id = "ping_refine"
+    dc._dub_jobs[job_id] = {"audio_path": str(audio), "vocals_path": None, "scene_cuts": []}
+
+    async def collect():
+        response = await dc.dub_transcribe_stream(job_id)
+        out = []
+        async for chunk in response.body_iterator:
+            out.append(chunk.decode() if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+        return "".join(out)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            monkeypatch.setattr(dc, "_gpu_pool", pool)
+            monkeypatch.setattr(dc, "_cpu_pool", pool)
+            body = asyncio.run(asyncio.wait_for(collect(), timeout=20))
+    finally:
+        dc._dub_jobs.pop(job_id, None)
+
+    last_segments = body.rindex("event: segments")
+    final = body.index("event: final")
+    assert "event: ping" in body[last_segments:final], body
+    assert body.index("event: done") > final
+
+
+@pytest.fixture
+def fast_pings(monkeypatch):
+    from api.routers import dub_core as dc
+
+    monkeypatch.setattr(dc, "POST_ASR_PING_S", 0.01)
+    return dc
+
+
+def test_closing_ping_stream_early_propagates_cancel_to_the_work(fast_pings):
+    dc = fast_pings
+    record = []
+
+    async def scenario():
+        async def long_job():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                record.append("interrupted")
+                raise
+
+        job = asyncio.ensure_future(long_job())
+        pings = dc._ping_while(job)
+        assert bytes(await pings.__anext__()).startswith(b"event: ping")
+        await pings.aclose()
+        done, _ = await asyncio.wait({job}, timeout=2)
+        return job in done and job.cancelled()
+
+    import asyncio
+    assert asyncio.run(scenario()) is True
+    assert record == ["interrupted"]
+
+
+def test_ping_stream_over_completed_future_is_empty_and_leaves_result(fast_pings):
+    import asyncio
+
+    async def scenario():
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"answer": 42})
+        emitted = []
+        async for item in fast_pings._ping_while(fut):
+            emitted.append(item)
+        return emitted, fut.result()
+
+    assert asyncio.run(scenario()) == ([], {"answer": 42})
+
+
+def test_error_surfacing_after_consumer_left_is_not_reported_as_unretrieved(fast_pings):
+    import asyncio
+    import gc
+
+    complaints = []
+
+    async def scenario():
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, ctx: complaints.append(str(ctx.get("message")))
+        )
+
+        async def stubborn():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise ValueError("raised while shutting down")
+
+        job = asyncio.ensure_future(stubborn())
+        stream = fast_pings._ping_while(job)
+        await stream.__anext__()
+        await stream.aclose()
+        await asyncio.sleep(0.05)
+        assert job.done()
+        del job, stream
+        gc.collect()
+        await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+    assert not any("never retrieved" in c for c in complaints), complaints
+
+
+def test_stream_cleanup_waits_for_native_work_and_rejects_late_work():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from api.routers.dub_core import _ASRWorkLifetime
+    lifetime = _ASRWorkLifetime()
+    started, release, cleaned = threading.Event(), threading.Event(), threading.Event()
+    cleanup_started = threading.Event()
+    events = []
+    def native():
+        started.set()
+        assert release.wait(5)
+        events.append("native finished")
+    def cleanup():
+        events.append("unloaded")
+        cleaned.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        work = pool.submit(lifetime.run, native)
+        assert started.wait(5)
+        lifetime.stop()
+        def remove():
+            cleanup_started.set()
+            lifetime.cleanup(cleanup)
+        removal = pool.submit(remove)
+        try:
+            assert cleanup_started.wait(5)
+            assert not cleaned.is_set()
+        finally:
+            release.set()
+        work.result(timeout=5)
+        removal.result(timeout=5)
+    assert events == ["native finished", "unloaded"]
+    with pytest.raises(RuntimeError, match="stream has ended"):
+        lifetime.run(lambda: pytest.fail("late work accessed unloaded model"))
+
+
+def test_stream_unload_is_single_shot_during_disconnect():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from api.routers.dub_core import _ASRWorkLifetime
+    lifetime = _ASRWorkLifetime()
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    def unload():
+        calls.append("unload")
+        assert len(calls) == 1
+        started.set()
+        assert release.wait(5)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        normal = pool.submit(lifetime.cleanup, unload)
+        assert started.wait(5)
+        lifetime.stop()
+        disconnected = pool.submit(lifetime.cleanup, unload)
+        release.set()
+        normal.result(timeout=5)
+        disconnected.result(timeout=5)
+    assert calls == ["unload"]
+
+
+def test_disconnect_during_diarization_waits_before_unload_and_restore(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from api.routers import dub_core as dc
+    from services import asr_backend
+
+    started, release, cleanup_started, restored = [threading.Event() for _ in range(4)]
+    events, guarded = [], []
+    original_cleanup = dc._ASRWorkLifetime.cleanup
+    def cleanup(lifetime, fn):
+        guarded.append(lifetime._lock.locked())
+        cleanup_started.set()
+        return original_cleanup(lifetime, fn)
+    monkeypatch.setattr(dc._ASRWorkLifetime, "cleanup", cleanup)
+    def diarize(**kwargs):
+        started.set()
+        assert release.wait(5)
+        events.append("diarization finished")
+        return None, None
+    class Backend:
+        id = "fake"
+        def ensure_loaded(self): pass
+        def transcribe(self, *a, **kw):
+            return {"chunks": [{"text": "hi", "timestamp": (0., .5)}], "segments": [], "language": "en"}
+        def unload(self): events.append("unloaded")
+    async def model():
+        result = MagicMock()
+        result._asr_pipe = MagicMock()
+        return result
+    def restore():
+        events.append("restored")
+        restored.set()
+    monkeypatch.setattr(dc, "get_model", model)
+    monkeypatch.setattr(asr_backend, "get_active_asr_backend", lambda *a, **kw: Backend())
+    monkeypatch.setattr(dc, "get_diarization_pipeline", diarize)
+    monkeypatch.setattr(dc, "offload_tts_for_asr", lambda: None)
+    monkeypatch.setattr(dc, "restore_tts_after_asr", restore)
+    monkeypatch.setattr(dc, "POST_ASR_PING_S", .01)
+    audio = tmp_path / "diar.wav"
+    _make_wav(audio, seconds=1.)
+    job_id = "diar_disconnect"
+    dc._dub_jobs[job_id] = {"audio_path": str(audio), "vocals_path": None, "scene_cuts": []}
+    async def scenario():
+        response = await dc.dub_transcribe_stream(job_id)
+        try:
+            async for _ in response.body_iterator:
+                if started.is_set():
+                    break
+            await response.body_iterator.aclose()
+            assert await asyncio.to_thread(cleanup_started.wait, 5)
+            assert guarded == [True]
+            assert not restored.is_set()
+        finally:
+            release.set()
+            await response.body_iterator.aclose()
+            assert await asyncio.to_thread(restored.wait, 5)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            monkeypatch.setattr(dc, "_gpu_pool", pool)
+            asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+    finally:
+        dc._dub_jobs.pop(job_id, None)
+    assert events == ["diarization finished", "unloaded", "restored"]

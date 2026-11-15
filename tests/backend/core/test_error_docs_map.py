@@ -1,7 +1,7 @@
 """Tests for backend/core/error_docs_map.py — error → docs URL taxonomy.
 
 The locked taxonomy is the contract Phase 5's bug reporter consumes and
-the TS-side `frontend/src/utils/errorDocsMap.ts` mirrors. These tests pin
+the TS-side `electron/src/shared/utils/errorDocsMap.ts` mirrors. These tests pin
 both the keys and that every URL points back to the project repo.
 """
 from __future__ import annotations
@@ -43,12 +43,42 @@ def test_all_keys_match_taxonomy():
     """
     from core import error_docs_map
     expected = {
+        "GPU_ARCH_UNSUPPORTED",
+        "HOST_MEMORY_EXHAUSTED",
+        "DISK_FULL",
+        "WINDOWS_APP_CONTROL_BLOCKED",
+        "AUDIO_IO_FAILED",
+        "INVALID_MEDIA_FILE",
+
+        "DIARIZATION_MODEL_MISSING",
+        "DIARIZATION_LOAD_FAILED",
         "GATEKEEPER_QUARANTINE",
         "APPIMAGE_WEBKIT_WHITESCREEN",
         "PKG_RESOURCES_MISSING",
         "HF_AUTH_FAILED",
         "PYANNOTE_LICENSE_REQUIRED",
         "POCKETTTS_GATED_WEIGHTS",
+        "ANTIVIRUS_BLOCKED",
+        "EXEC_REFUSED",
+        "EXEC_NOEXEC_MOUNT",
+        "RUNTIME_DOWNLOAD_STALLED",
+        "RUNTIME_DOWNLOAD_INTERRUPTED",
+        "RUNTIME_FOLDER_DENIED",
+        "RUNTIME_FILES_LOCKED",
+        "RUNTIME_IN_SYNCED_FOLDER",
+        "SYSTEM_LIBRARY_PROBLEM",
+        "UNSUPPORTED_PLATFORM",
+        "SOURCE_ENV_INCOMPLETE",
+        "BROKEN_VENV",
+        "NATIVE_ACCESS_VIOLATION",
+        "NATIVE_ILLEGAL_INSTRUCTION",
+        "NATIVE_IN_PAGE_ERROR",
+        "NATIVE_CRASH",
+        "STARTUP_TIMEOUT_SILENT",
+        "STARTUP_TIMEOUT_OUTPUT",
+        "BACKEND_STARTUP_FAILED",
+        "PORT_IN_USE",
+        "ROCM_NOT_CONFIGURED",
     }
     assert set(error_docs_map.ERROR_DOCS.keys()) == expected
 

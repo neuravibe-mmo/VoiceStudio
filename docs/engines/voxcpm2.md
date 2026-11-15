@@ -19,7 +19,7 @@ zero-shot voice cloning, and — uniquely among VoiceStudio's engines —
 
 - Python ≥ 3.10, PyTorch ≥ 2.5.
 - CUDA ≥ 12 recommended for full speed; MPS (Apple Silicon) and CPU also
-  work.
+  work; Linux ROCm uses a matching HIP PyTorch build.
 
 ## Setup
 
@@ -31,13 +31,14 @@ pip install "voxcpm>=2.0.3"
 
 That is a version **floor**, not a pin — an older install still works, but
 the engine logs an upgrade hint at load time. Then select the engine via
-**Model Catalogue → Engines** or `OMNIVOICE_TTS_BACKEND=voxcpm2`.
+**Model Catalogue** or `OMNIVOICE_TTS_BACKEND=voxcpm2`.
 
 ## Model selection
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OMNIVOICE_VOXCPM_MODEL` | `openbmb/VoxCPM2` | HuggingFace checkpoint to load |
+| `OMNIVOICE_VOXCPM_DEVICE` | *(automatic)* | Device for the one-click install (`cpu`, `cuda`, `cuda:1`); overrides the GPU check below |
 
 The first use downloads a multi-GB checkpoint from HuggingFace. A download
 interrupted near the end used to abort the load outright
@@ -47,11 +48,21 @@ now retried once with a fresh client. See
 
 ## Behaviour notes
 
-- **Voice design:** provide a description and no reference audio.
+- **Voice design:** provide a description and no reference audio. VoiceStudio
+  passes it in the native `(description)text` format; there is no separate
+  `voice_description` argument in VoxCPM 2.0.3.
 - **Cloning:** the reference clip is prepared before use (edge-silence trim
-  and length cap) so dead air in a raw clip doesn't condition the output; on
-  any prep problem the raw clip is used as-is.
-- **Style instructions** are passed as an inline prefix to the text.
+  and a cap at the first 30 seconds) so dead air in a raw clip doesn't
+  condition the output; on any prep problem the raw clip is used as-is. When
+  the cap cuts the clip, its whole-clip transcript no longer matches, so it is
+  ignored and the capped clip clones as a plain reference.
+- **Style instructions** (the Style field, API `instruct`, or a leading
+  `(instruction)` in the text) use controllable cloning: the reference supplies
+  timbre, without the saved transcript forcing continuation of its delivery.
+- **Plain cloning** with a reference and transcript retains upstream continuation
+  mode. A transcript without reference audio is ignored. These mappings follow
+  the [VoxCPM 2.0.3 examples](https://github.com/OpenBMB/VoxCPM/blob/2.0.3/README.md#-voice-design)
+  in both the managed sidecar and in-process adapter.
 - VoxCPM2 emits mastered, studio-grade audio, so VoiceStudio **skips its
   shared mastering chain** (which is tuned for 24 kHz engines) — only benign
   loudness normalization applies.
@@ -64,6 +75,26 @@ now retried once with a fresh client. See
   [benchmarks.md](../benchmarks.md) and [performance.md](../performance.md).
 - Language coverage is 30 languages; for anything else use the default
   [OmniVoice](omnivoice.md) engine ([languages.md](../languages.md)).
+
+## One-click install
+
+Click **Install** in **Model Catalogue → VoxCPM2**. VoiceStudio
+puts VoxCPM2 in its own Python environment under its data directory and runs
+it there, in a separate process. It installs the CUDA build of PyTorch on an
+NVIDIA GPU, a matching ROCm build on Linux ROCm hosts, the CPU build on other
+Windows and Linux machines, and the regular build on Apple Silicon.
+
+Nothing it installs touches VoiceStudio itself or any other engine, and
+**Uninstall** in the same row removes only that folder. An existing
+`pip install voxcpm` setup keeps working as it is. The button is not offered
+on Intel Macs, where no PyTorch build it needs exists. The model weights
+download on first use.
+
+Current CUDA builds of PyTorch no longer include kernels for older NVIDIA
+GPUs such as the GTX 10 series (Pascal). When the installed build cannot run
+on your GPU, VoxCPM2 loads on the CPU instead and says so in the backend log.
+It works, but slowly: expect minutes per sentence, and it needs a lot of
+system RAM. Set `OMNIVOICE_VOXCPM_DEVICE` to choose the device yourself.
 
 ## Troubleshooting
 

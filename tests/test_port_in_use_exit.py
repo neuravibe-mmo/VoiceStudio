@@ -8,9 +8,8 @@ cause: the Windows wording is OS-translated (the report was in Russian), so no
 English phrase in the log could be matched.
 
 The fix is to make the signal locale-independent — a dedicated exit code that
-`frontend/src-tauri/src/backend.rs` and `frontend/src/utils/backendCrash.ts`
-both key off. This test pins the code and its cross-language agreement; the
-matcher side is pinned in frontend/src/test/portInUseHint.test.js.
+Electron's backend supervisor and the shared renderer crash hint both key off.
+This test pins the code and its cross-language agreement.
 """
 from __future__ import annotations
 
@@ -36,17 +35,16 @@ def test_backend_declares_the_exit_code():
     assert f"_EXIT_PORT_IN_USE = {_EXPECTED_EXIT}" in src
 
 
-def test_rust_shell_agrees_on_the_exit_code():
-    """The Rust side reads this code to distinguish a conflict from a crash —
-    a silent divergence would restore the unexplained "exit code 1"."""
-    src = _read("frontend", "src-tauri", "src", "backend.rs")
-    match = re.search(r"pub const EXIT_PORT_IN_USE: i32 = (\d+);", src)
-    assert match, "EXIT_PORT_IN_USE missing from backend.rs"
+def test_electron_shell_agrees_on_the_exit_code():
+    """The desktop supervisor must distinguish a conflict from a crash."""
+    src = _read("electron", "src", "main", "backend.ts")
+    match = re.search(r"const EXIT_PORT_IN_USE = (\d+);", src)
+    assert match, "EXIT_PORT_IN_USE missing from Electron backend supervisor"
     assert int(match.group(1)) == _EXPECTED_EXIT
 
 
 def test_frontend_crash_hint_agrees_on_the_exit_code():
-    src = _read("frontend", "src", "utils", "backendCrash.ts")
+    src = _read("electron", "src", "shared", "utils", "backendCrash.ts")
     assert f"marker.exit_code === {_EXPECTED_EXIT}" in src
 
 
@@ -272,6 +270,39 @@ def test_the_watcher_ignores_unrelated_errors(tmp_path):
     )
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     assert proc.stdout.split() == ["CLEAN", "CAUGHT"], (proc.stdout, proc.stderr)
+
+
+def test_a_permission_denied_bind_gets_its_own_actionable_message(tmp_path):
+    """#2460: `[Errno 13]` / WSAEACCES 10013 on bind (a Windows excluded port
+    range, or a privileged port) is not "port in use". It used to surface as a
+    bare `exit code 3` -- uvicorn's startup-failure code -- with nothing about
+    reserved ranges or OMNIVOICE_PORT. The watcher records it separately (never
+    as ``bind_error``: the in-use advice would be wrong) and the shell's
+    "Last output" then carries the explanation."""
+    guard = _read("backend", "main.py")
+    start = guard.index("    def _fail_port_in_use(")
+    end = guard.index("    # #1223: uvicorn does NOT")
+    body = "\n".join(line[4:] for line in guard[start:end].splitlines())
+
+    script = tmp_path / "denied.py"
+    script.write_text(
+        "import errno, logging, sys\n"
+        f"_EXIT_PORT_IN_USE = {_EXPECTED_EXIT}\n"
+        "_port = 3900\n" + body + "\n"
+        "w = _BindErrorWatcher()\n"
+        "log = logging.getLogger('probe'); log.addFilter(w)\n"
+        "log.error(OSError(errno.EACCES, 'permission denied'))\n"
+        "assert w.bind_error is None and w.denied_error is not None\n"
+        "_fail_port_denied(w.denied_error)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stderr
+    assert "excludedportrange" in proc.stderr and "OMNIVOICE_PORT" in proc.stderr
+    assert "already in use" not in proc.stderr
+    assert "_watcher.denied_error is not None" in _read("backend", "main.py"), (
+        "the denied-bind watcher is never consulted in main.py"
+    )
 
 
 # ── the properties the watcher depends on, measured not assumed ───────────

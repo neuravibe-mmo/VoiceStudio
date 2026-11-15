@@ -23,10 +23,11 @@ import argparse
 import logging
 
 import torch
-import torchaudio
+from omnivoice.utils.audio import save_audio
 
 from omnivoice.models.omnivoice import OmniVoice
 from omnivoice.utils.common import str2bool
+from omnivoice.utils.dtype import tts_dtype_name
 
 
 def get_best_device():
@@ -127,7 +128,9 @@ def main():
     device = args.device or get_best_device()
     logging.info(f"Loading model from {args.model} on {device} ...")
     model = OmniVoice.from_pretrained(
-        args.model, device_map=device, dtype=torch.float16
+        args.model,
+        device_map=device,
+        dtype=getattr(torch, tts_dtype_name(device)),
     )
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
@@ -149,7 +152,7 @@ def main():
         class_temperature=args.class_temperature,
     )
 
-    torchaudio.save(args.output, audios[0], model.sampling_rate)
+    save_audio(args.output, audios[0], model.sampling_rate)
     logging.info(f"Saved to {args.output}")
 
 

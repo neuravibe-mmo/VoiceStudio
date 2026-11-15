@@ -14,12 +14,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import subprocess
 from dataclasses import asdict
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from core.browser_guard import reject_cross_site_get
 from core.logging_utils import log_safe
+from core.nvidia_smi import find_nvidia_smi
+from core.engine_licenses import LICENSE_GATED_ENGINES
 from api.dependencies import require_admin, require_admin_action
 
 logger = logging.getLogger("omnivoice.api.settings")
@@ -35,11 +41,11 @@ class _HFTokenBody(BaseModel):
     token: str = Field(..., min_length=1, description="HuggingFace access token")
 
 
-def _state_response() -> dict:
+def _state_response(*, validate: bool = False) -> dict:
     """Return the same shape the React panel renders. Never includes raw token."""
     from services import token_resolver
 
-    s = token_resolver.state()
+    s = token_resolver.state(validate=validate)
     return {
         "active": s["active"],
         "sources": [asdict(row) for row in s["sources"]],
@@ -65,8 +71,7 @@ def save_hf_token(body: _HFTokenBody):
 
 @router.delete("/hf-token")
 def clear_hf_token(also_clear_hf_cli: bool = Query(False)):
-    """Clear the App-source token. Optionally also call huggingface_hub.logout
-    to clear the canonical HF file. Returns the updated cascade state."""
+    """Clear the App token and optionally recognized local Hub token files."""
     from services import token_resolver
     try:
         token_resolver.clear_app_token(also_clear_hf_cli=also_clear_hf_cli)
@@ -76,19 +81,18 @@ def clear_hf_token(also_clear_hf_cli: bool = Query(False)):
     return _state_response()
 
 
-@router.get("/hf-token/state")
+@router.get("/hf-token/state", dependencies=[Depends(reject_cross_site_get)])
 def get_hf_token_state(fresh: bool = Query(False)):
     """3-source HF token cascade state for the Settings UI.
 
     ``fresh=1`` drops the resolver's whoami validation cache first so the
     response re-runs whoami for every source — this is what the panel's
-    "Test now" button sends. Plain GETs (panel mounts) keep the 300s cache
-    so repeat Settings visits don't hammer the HF API.
+    "Test now" button sends. Plain GETs only inspect local token presence.
     """
     from services import token_resolver
     if fresh:
         token_resolver.invalidate_cache()
-    return _state_response()
+    return _state_response(validate=fresh)
 
 
 # ── Performance settings (INST-12) ────────────────────────────────────────
@@ -98,9 +102,74 @@ def get_hf_token_state(fresh: bool = Query(False)):
 
 _TORCH_COMPILE_KEY = "perf.torch_compile_disabled"
 
+from services.performance_profiles import (
+    _PERFORMANCE_PROFILE_KEY, _PERFORMANCE_TIERS, _PERFORMANCE_FAMILIES,
+    activate_performance_tier,
+    profile_state as _performance_profile_state,
+)
+
+
+class _PerformanceProfileBody(BaseModel):
+    tier: str = Field(..., description="fast | balanced | quality | max | auto")
+    family: str | None = Field(None, description="Engine family, or null to set the global tier")
+
+
+
+
+@router.get("/performance-profile")
+def get_performance_profile():
+    """Return the global speed/quality preference and per-engine overrides."""
+    return _performance_profile_state()
+
+
+@router.put("/performance-profile")
+def set_performance_profile(body: _PerformanceProfileBody):
+    """Persist a performance preference and apply installed compatible picks."""
+    from core import prefs
+
+    tier = body.tier.strip().lower()
+    if tier not in (*_PERFORMANCE_TIERS, "auto"):
+        raise HTTPException(status_code=400, detail="Unknown performance tier")
+    family = body.family.strip().lower() if body.family else None
+    if family is not None and family not in _PERFORMANCE_FAMILIES:
+        raise HTTPException(status_code=400, detail="Unknown engine family")
+    if family is not None and tier == "auto":
+        raise HTTPException(status_code=400, detail="Auto manages the whole device; use the global control")
+    state = _performance_profile_state()
+    applicable = state["applicable_families"]
+    # A global pack policy must be saved before its first models are installed.
+    # Activation is installed-only; the installer reconciles the saved policy
+    # as models become available. Family controls still need a usable engine.
+    if family is not None and family not in applicable:
+        raise HTTPException(status_code=409, detail="The selected engines do not support this performance preset")
+    from core import job_store
+    from api.routers.batch import list_batch_jobs
+    if job_store.list_jobs(status="active", limit=1) or list_batch_jobs(status="active", limit=1):
+        raise HTTPException(status_code=409, detail="Wait for queued or running jobs to finish before changing performance presets")
+    try:
+        if family is None:
+            # One atomic write clears family overrides together with the global
+            # choice, so a crash cannot leave half of a global change persisted.
+            prefs.update_mapping(_PERFORMANCE_PROFILE_KEY, {"global": tier}, replace=True)
+        else:
+            stored = prefs.get(_PERFORMANCE_PROFILE_KEY, {})
+            resolved = dict(stored.get("resolved", {})) if isinstance(stored, dict) else {}
+            resolved.pop(family, None)
+            prefs.update_mapping(_PERFORMANCE_PROFILE_KEY, {family: tier, "resolved": resolved})
+    except Exception:
+        logger.exception("set_performance_profile failed")
+        raise HTTPException(status_code=500, detail="Failed to persist performance profile")
+    activations = activate_performance_tier(tier, family)
+    result = _performance_profile_state()
+    if activations:
+        result["runtime_activations"] = activations
+    if tier == "max":
+        result["capacity_activations"] = activations
+    return result
+
 
 class _TorchCompileBody(BaseModel):
-    enabled: bool = Field(..., description="True to set TORCH_COMPILE_DISABLE=1 on engine subprocesses")
+    enabled: bool = Field(..., description="True disables torch.compile and selects eager execution")
 
 
 def _torch_compile_state() -> dict:
@@ -113,16 +182,13 @@ def _torch_compile_state() -> dict:
 
 @router.get("/perf/torch-compile-disabled")
 def get_torch_compile_disabled():
-    """Return the current torch.compile-disabled toggle + the runtime platform.
-    UI uses the platform to render the toggle disabled (with an explainer)
-    on non-Windows hosts, since the OOM is Windows-specific (issue #65)."""
+    """Return the cross-platform compile-disable toggle and runtime platform."""
     return _torch_compile_state()
 
 
 @router.put("/perf/torch-compile-disabled")
 def set_torch_compile_disabled(body: _TorchCompileBody):
-    """Persist the toggle. Honoured by `services.engine_env.build_engine_env()`
-    which injects TORCH_COMPILE_DISABLE=1 on Windows when enabled."""
+    """Persist the toggle used by subprocess environments and in-process compile gates on every host."""
     from services import settings_store
 
     try:
@@ -131,6 +197,184 @@ def set_torch_compile_disabled(body: _TorchCompileBody):
         logger.exception("set_torch_compile_disabled failed")
         raise HTTPException(status_code=500, detail="Failed to persist setting")
     return _torch_compile_state()
+
+
+# ── Offload the TTS model to RAM after generation (#2618) ─────────────────
+
+
+class _OffloadAfterGenerationBody(BaseModel):
+    enabled: bool = Field(..., description="True to move the TTS model to system RAM after each generation")
+
+
+def _offload_after_generation_state() -> dict:
+    """`enabled` is the effective value (env > saved > off). `env_pinned` means
+    OMNIVOICE_OFFLOAD_AFTER_GENERATION decides and a saved value is ignored.
+    `device` is the TTS device: on `cpu` the setting has nothing to move."""
+    from services import model_manager as mm
+
+    try:
+        device = str(mm.get_best_device()).split(":", 1)[0]
+    except Exception:  # noqa: BLE001 — a device probe must not break Settings
+        device = "cpu"
+    return {
+        "enabled": mm.offload_after_generation_enabled(),
+        "env_pinned": bool(os.environ.get(mm.OFFLOAD_AFTER_GENERATION_ENV)),
+        "device": device,
+    }
+
+
+# The device probe can start torch/GPU initialisation, so refuse cross-site loads.
+@router.get("/perf/offload-after-generation", dependencies=[Depends(reject_cross_site_get)])
+def get_offload_after_generation():
+    """Whether the in-process TTS model moves to system RAM after generation."""
+    return _offload_after_generation_state()
+
+
+@router.put("/perf/offload-after-generation")
+def set_offload_after_generation(body: _OffloadAfterGenerationBody):
+    """Persist the toggle. Applies from the next generation, no restart."""
+    from core import prefs
+    from services import model_manager as mm
+
+    try:
+        prefs.set_(mm.OFFLOAD_AFTER_GENERATION_PREF, bool(body.enabled))
+    except Exception:
+        logger.exception("set_offload_after_generation failed")
+        raise HTTPException(status_code=500, detail="Failed to persist setting")
+    return _offload_after_generation_state()
+
+
+# ── OmniVoice GGUF resident server (#3654) ────────────────────────────────
+
+
+class _GgufResidentBody(BaseModel):
+    enabled: bool = Field(..., description="True to keep the GGUF runtime loaded between requests")
+
+
+def _gguf_resident_state() -> dict:
+    """`enabled` is the effective value (env > saved > off; opt-in
+    because upstream tts-server has no API key). `available` means a
+    verified tts-server binary is bundled; without one every request spawns the
+    CLI and the toggle has nothing to switch."""
+    from engines.omnivoice_gguf import resident
+
+    return {
+        "enabled": resident.resident_enabled(),
+        "env_pinned": bool(os.environ.get(resident.RESIDENT_ENV)),
+        "available": resident.server_status()[0],
+    }
+
+
+# Verifying the server binary hashes it, so refuse cross-site loads.
+@router.get("/perf/gguf-resident", dependencies=[Depends(reject_cross_site_get)])
+def get_gguf_resident():
+    """Whether the OmniVoice GGUF runtime stays loaded between requests."""
+    return _gguf_resident_state()
+
+
+@router.put("/perf/gguf-resident")
+def set_gguf_resident(body: _GgufResidentBody):
+    """Persist the toggle. Turning it off stops a running server at once."""
+    from core import prefs
+    from engines.omnivoice_gguf import resident
+
+    try:
+        prefs.set_(resident.RESIDENT_PREF, bool(body.enabled))
+    except Exception:
+        logger.exception("set_gguf_resident failed")
+        raise HTTPException(status_code=500, detail="Failed to persist setting")
+    if not resident.resident_enabled():
+        resident.stop_all()
+    return _gguf_resident_state()
+
+
+# ── Pause fill: digital silence or room tone (#3611) ──────────────────────
+
+
+class _PauseFillBody(BaseModel):
+    mode: Literal["silence", "room_tone"] = Field(
+        ..., description="silence: exact zeros (default); room_tone: the take's own noise floor",
+    )
+
+
+def _pause_fill_state() -> dict:
+    """`mode` is the effective value (env > saved > silence). `env_pinned`
+    means OMNIVOICE_PAUSE_FILL decides and a saved value is ignored."""
+    from services import audio_dsp
+
+    return {
+        "mode": audio_dsp.pause_fill_mode(),
+        "env_pinned": bool((os.environ.get(audio_dsp.PAUSE_FILL_ENV) or "").strip()),
+        "choices": list(audio_dsp.PAUSE_FILL_MODES),
+    }
+
+
+@router.get("/pause-fill")
+def get_pause_fill():
+    """How [pause] markers and audiobook gaps are filled."""
+    return _pause_fill_state()
+
+
+@router.put("/pause-fill")
+def set_pause_fill(body: _PauseFillBody):
+    """Persist the choice. Applies from the next generation, no restart."""
+    from core import prefs
+    from services import audio_dsp
+
+    try:
+        prefs.set_(audio_dsp.PAUSE_FILL_PREF, body.mode)
+    except Exception:
+        logger.exception("set_pause_fill failed")
+        raise HTTPException(status_code=500, detail="Failed to persist setting")
+    return _pause_fill_state()
+
+
+# ── Dub video export: encoder + maximum resolution (#3732) ────────────────
+
+
+class _VideoExportBody(BaseModel):
+    encoder: Literal["software", "hardware"] | None = Field(
+        None, description="software: libx264 (default); hardware: NVENC/QSV/AMF/VideoToolbox when available",
+    )
+    max_resolution: Literal["original", "2160p", "1440p", "1080p", "720p"] | None = Field(
+        None, description="Cap for dub exports; only ever downscales. original = no cap",
+    )
+
+
+def _video_export_state() -> dict:
+    from services import video_encoder
+    from services.ffmpeg_utils import find_ffmpeg
+
+    ffmpeg = find_ffmpeg()
+    return {
+        "encoder": video_encoder.encoder_mode(),
+        "max_resolution": video_encoder.max_resolution(),
+        "hardware_encoders": list(video_encoder.available_hw_encoders(ffmpeg)) if ffmpeg else [],
+        "resolutions": list(video_encoder.MAX_RESOLUTIONS),
+    }
+
+
+@router.get("/video-export")
+def get_video_export():
+    """How dub video exports are encoded and capped."""
+    return _video_export_state()
+
+
+@router.put("/video-export")
+def set_video_export(body: _VideoExportBody):
+    """Persist either field. Applies from the next export, no restart."""
+    from core import prefs
+    from services import video_encoder
+
+    try:
+        if body.encoder is not None:
+            prefs.set_(video_encoder.ENCODER_PREF, body.encoder)
+        if body.max_resolution is not None:
+            prefs.set_(video_encoder.MAX_RES_PREF, body.max_resolution)
+    except Exception:
+        logger.exception("set_video_export failed")
+        raise HTTPException(status_code=500, detail="Failed to persist setting")
+    return _video_export_state()
 
 
 # ── Compute-device override (Settings → Performance) ──────────────────────
@@ -150,7 +394,7 @@ def _compute_device_state() -> dict:
     caps = device_caps.detect_host_caps()
     env_pin = (os.environ.get("OMNIVOICE_DEVICE") or "").strip().lower()
     auto_family = next(
-        (f for f in ("cuda", "rocm", "xpu", "mps") if f in caps.available_families),
+        (f for f in device_caps.ACCELERATOR_PRIORITY if f in caps.available_families),
         "cpu",
     )
     value = device_caps.requested_device_override()
@@ -210,6 +454,111 @@ def set_compute_device(body: _ComputeDeviceBody):
     return _compute_device_state()
 
 
+@router.get("/gpu-report")
+def get_gpu_report():
+    """Which engines will use the GPU on this host, and why not otherwise.
+
+    Codes + params only (the renderer owns the prose, via i18n): the physical
+    GPUs, the installed PyTorch build, a host state such as ``amd_cuda_build``,
+    the honest options for that state, and a verdict per TTS/ASR engine.
+    """
+    from core.gpu_report import collect_gpu_report
+
+    return collect_gpu_report()
+
+
+# ── CUDA adapter selection (multi-GPU hosts) ─────────────────────────────
+
+
+_CUDA_VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
+_CUDA_UUID = re.compile(r"^GPU-[A-Za-z0-9-]+$")
+
+
+class _CudaDeviceBody(BaseModel):
+    value: str = Field(..., description="auto or an NVIDIA GPU UUID")
+
+
+def _cuda_devices() -> list[dict]:
+    """Enumerate physical NVIDIA adapters without importing torch.
+
+    ``torch.cuda`` only exposes adapters allowed by CUDA_VISIBLE_DEVICES, so it
+    cannot offer a way back to a currently hidden card. nvidia-smi sees the
+    physical inventory and gives us stable UUIDs, which CUDA accepts directly.
+    """
+    executable = find_nvidia_smi()
+    if not executable:
+        return []
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--query-gpu=index,uuid,name",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("CUDA adapter enumeration failed", exc_info=True)
+        return []
+    if result.returncode != 0:
+        return []
+    devices = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit() or not _CUDA_UUID.fullmatch(parts[1]):
+            continue
+        devices.append({"index": int(parts[0]), "value": parts[1], "name": parts[2]})
+    return devices
+
+
+def _cuda_device_state() -> dict:
+    from core import prefs
+
+    external = prefs.is_env_shadowed(_CUDA_VISIBLE_DEVICES)
+    saved = str(prefs.get(f"env.{_CUDA_VISIBLE_DEVICES}", "") or "").strip()
+    applied = (
+        os.environ[_CUDA_VISIBLE_DEVICES].strip() or "disabled"
+        if _CUDA_VISIBLE_DEVICES in os.environ else "auto"
+    )
+    value = applied if external else saved
+    return {
+        "value": value or "auto",
+        "applied": applied,
+        "restart_required": (value or "auto") != applied,
+        "env_pinned": external,
+        "devices": _cuda_devices(),
+    }
+
+
+@router.get("/cuda-device")
+def get_cuda_device():
+    """Physical CUDA adapter selected for the next backend launch."""
+    return _cuda_device_state()
+
+
+@router.put("/cuda-device")
+def set_cuda_device(body: _CudaDeviceBody):
+    """Persist CUDA_VISIBLE_DEVICES before torch is imported on next launch."""
+    from core import prefs
+
+    value = (body.value or "").strip()
+    if value != "auto" and value not in {device["value"] for device in _cuda_devices()}:
+        raise HTTPException(status_code=400, detail="Unknown CUDA adapter")
+    try:
+        if value == "auto":
+            prefs.delete(f"env.{_CUDA_VISIBLE_DEVICES}")
+        else:
+            prefs.set_(f"env.{_CUDA_VISIBLE_DEVICES}", value)
+    except Exception:
+        logger.exception("set_cuda_device failed")
+        raise HTTPException(status_code=500, detail="Failed to persist CUDA adapter")
+    return _cuda_device_state()
+
+
 # ── Generation-history retention (Studio takes rail) ──────────────────────
 
 
@@ -258,6 +607,7 @@ class _RefinementBody(BaseModel):
     smart_cleanup: bool | None = None
     self_correction: bool | None = None
     preserve_technical: bool | None = None
+    spoken_punctuation: bool | None = None
 
 
 def _refinement_state():
@@ -345,9 +695,10 @@ def set_llm_endpoint(body: _LLMEndpointBody):
 
     Reuses the env-var persistence path (prefs.json, restored at startup):
     base_url -> TRANSLATE_BASE_URL, model -> TRANSLATE_MODEL,
-    api_key -> TRANSLATE_API_KEY. A None field is left unchanged; an empty
+    api_key -> encrypted TRANSLATE_API_KEY storage. A None field is left unchanged; an empty
     string clears it. Ollama ignores the key; vLLM / LM Studio require it.
     """
+    from services import settings_store
     from core.prefs import set_ as prefs_set, delete as prefs_delete
 
     mapping = {
@@ -361,9 +712,13 @@ def set_llm_endpoint(body: _LLMEndpointBody):
         val = val.strip()
         if val:
             os.environ[env_key] = val
-            prefs_set(f"env.{env_key}", val)
+            if env_key != "TRANSLATE_API_KEY":
+                prefs_set(f"env.{env_key}", val)
         else:
             os.environ.pop(env_key, None)
+            prefs_delete(f"env.{env_key}")
+        if env_key == "TRANSLATE_API_KEY":
+            settings_store.set_secret("translation_env.TRANSLATE_API_KEY", val or None)
             prefs_delete(f"env.{env_key}")
     # get_active_llm_backend() builds a fresh backend (and its OpenAI client
     # reads env at construction) on every call, so there's no singleton to
@@ -381,7 +736,10 @@ class _LLMProviderBody(BaseModel):
     base_url: str | None = None
     model: str | None = None
     account_id: str | None = Field(None, description="Cloudflare account id")
+    allow_plain_http: bool | None = Field(
+        None, description="Allow an API key over plain HTTP to a private-IP LAN host")
     make_active: bool = False
+    activate_if_unset: bool = True  # Legacy clients; editors opt out for save/test.
 
 
 class _LLMActiveBody(BaseModel):
@@ -394,9 +752,11 @@ def list_llm_providers():
 
     Never returns key material — only `has_key`/`key_from_env` booleans.
     """
-    from services import llm_providers
+    from services import llm_providers, llm_backend
     return {
         "active": llm_providers.active_provider_id(),
+        "engine_active": llm_backend.active_backend_id(),
+        "engine_from_env": bool(os.environ.get("OMNIVOICE_LLM_BACKEND")),
         "providers": [llm_providers.describe(p) for p in llm_providers.all_providers()],
     }
 
@@ -411,11 +771,18 @@ def save_llm_provider(provider_id: str, body: _LLMProviderBody):
     p = llm_providers.get_provider(provider_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"unknown provider {provider_id!r}")
+    if not body.make_active and not body.activate_if_unset:
+        from core import prefs
+        from services import llm_backend
+        # Persist the pre-save mode before adding a first cloud key. Otherwise
+        # legacy key auto-detection would enable LLMs before Connect verifies it.
+        if prefs.get("llm_backend") is None and not os.environ.get("OMNIVOICE_LLM_BACKEND"):
+            prefs.set_("llm_backend", llm_backend.active_backend_id())
     if body.api_key is not None:
         llm_providers.save_key(provider_id, body.api_key.strip())
     llm_providers.save_overrides(
         provider_id, base_url=body.base_url, model=body.model,
-        account_id=body.account_id,
+        account_id=body.account_id, allow_plain_http=body.allow_plain_http,
     )
     # An explicit save also claims the active slot when the user has never
     # chosen a provider (#963). Without this, a saved-and-tested local
@@ -424,8 +791,11 @@ def save_llm_provider(provider_id: str, body: _LLMProviderBody):
     # "Save" left nothing persisted to resolve. Gated on the STORED selection
     # only — an explicit prior choice is never stolen by a plain save, and an
     # unconfigured provider can't claim the slot.
-    if body.make_active or (
-        llm_providers.stored_active_provider_id() is None
+    if body.make_active:
+        _activate_llm_provider(provider_id)
+    elif (
+        body.activate_if_unset
+        and llm_providers.stored_active_provider_id() is None
         and llm_providers.is_configured(p)
     ):
         llm_providers.set_active_provider(provider_id)
@@ -437,8 +807,48 @@ def set_active_llm_provider(body: _LLMActiveBody):
     from services import llm_providers
     if llm_providers.get_provider(body.provider) is None:
         raise HTTPException(status_code=404, detail=f"unknown provider {body.provider!r}")
-    llm_providers.set_active_provider(body.provider)
+    _activate_llm_provider(body.provider)
     return list_llm_providers()
+
+
+def _validate_llm_activation(provider_id: str) -> None:
+    from services import llm_providers
+    p = llm_providers.get_provider(provider_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Unknown LLM provider.")
+    pin = llm_providers._active_env_pin()
+    if (pin and pin != provider_id) or os.environ.get("OMNIVOICE_LLM_BACKEND") not in (None, "", "openai-compat"):
+        raise HTTPException(status_code=409, detail="LLM selection is pinned by the environment.")
+    error = llm_providers.configuration_error(p)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+
+def _activate_llm_provider(provider_id: str) -> None:
+    """Explicit activation enables both provider and engine; pins still win."""
+    from core import prefs
+    from services import llm_providers
+    _validate_llm_activation(provider_id)
+    llm_providers.set_active_provider(provider_id)
+    prefs.set_("llm_backend", "openai-compat")
+
+
+@router.post("/llm-providers/{provider_id}/connect")
+def connect_llm_provider(provider_id: str):
+    """Enable a provider only after it returns a usable completion."""
+    from services import llm_providers
+    p = llm_providers.get_provider(provider_id)
+    _validate_llm_activation(provider_id)
+    def configuration():
+        return (llm_providers.resolve_base_url(p), llm_providers.configured_model(p),
+                llm_providers.resolve_api_key(p), llm_providers.resolve_account_id(p))
+    verified = configuration()
+    result = test_llm_provider(provider_id)
+    if result["ok"]:
+        if configuration() != verified:
+            return {"ok": False, "kind": "config"}
+        _activate_llm_provider(provider_id)
+    return result
 
 
 def _scrub_llm_detail(e: Exception, api_key: str | None) -> str:
@@ -461,7 +871,8 @@ def _classify_llm_error(e: Exception) -> str:
     Status codes win when the OpenAI SDK provides one; exception-family
     names catch the non-HTTP failures (DNS, refused, TLS, timeout).
     """
-    status = getattr(e, "status_code", None)
+    from urllib.error import HTTPError
+    status = e.code if isinstance(e, HTTPError) else getattr(e, "status_code", None)
     if status in (401, 403):
         return "auth"
     if status == 404:
@@ -469,7 +880,7 @@ def _classify_llm_error(e: Exception) -> str:
     if status == 429:
         return "rate_limit"
     name = type(e).__name__
-    if name in ("APIConnectionError", "APITimeoutError", "ConnectError",
+    if name in ("APIConnectionError", "APITimeoutError", "ConnectError", "URLError",
                 "ConnectTimeout", "TimeoutError"):
         return "network"
     if name == "AuthenticationError":
@@ -499,26 +910,32 @@ def test_llm_provider(provider_id: str):
         raise HTTPException(status_code=404, detail=f"unknown provider {provider_id!r}")
     base_url = llm_providers.resolve_base_url(p)
     api_key = llm_providers.resolve_api_key(p)
-    if not base_url:
-        return {"ok": False, "kind": "config", "detail": "No Base URL set for this provider."}
-    if not api_key:
-        return {"ok": False, "kind": "config", "detail": "No API key configured for this provider."}
+    error = llm_providers.configuration_error(p)
+    if error:
+        return {"ok": False, "kind": "config", "detail": error}
     t0 = _time.monotonic()
     try:
-        from openai import OpenAI
+        from httpx import Timeout
+        from services.llm_transport import create_client
         # max_retries=0: this is an interactive probe with a live spinner — the
         # SDK's default 2 automatic retries turn a 429/timeout into a ~34s hang.
         # Surface the first failure immediately instead.
-        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+        client = create_client(p)
+        model = llm_providers.resolve_model(p)
         res = client.chat.completions.create(
-            model=llm_providers.resolve_model(p),
+            model=model,
             messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-            timeout=20,
+            # Local runtimes may spend over 20s loading weights on first use.
+            # Keep connection failures fast while allowing that cold start.
+            timeout=Timeout(120 if p.local or p.transport == "cli" else 20, connect=5),
         )
-        reply = (res.choices[0].message.content or "").strip()
+        from services.llm_backend import _strip_reasoning
+        reply = _strip_reasoning(res.choices[0].message.content or "")
+        if not reply:
+            raise ValueError("Provider returned no usable answer.")
         return {
             "ok": True,
-            "model": llm_providers.resolve_model(p),
+            "model": model,
             "reply": reply[:80],
             "latency_ms": int((_time.monotonic() - t0) * 1000),
         }
@@ -573,9 +990,11 @@ def list_llm_provider_models(provider_id: str):
     p = llm_providers.get_provider(provider_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"unknown provider {provider_id!r}")
+    if p.transport != "openai":
+        return {"ok": True, "models": [], "truncated": False}
     base_url = llm_providers.resolve_base_url(p)
     api_key = llm_providers.resolve_api_key(p)
-    if not base_url or not api_key:
+    if llm_providers.configuration_error(p, require_model=False):
         return {"ok": False, "kind": "config", "models": []}
     try:
         from openai import OpenAI
@@ -655,7 +1074,7 @@ def set_llm_skill(skill_id: str, body: _LLMSkillBody):
 #: Engines that have an in-tree acceptance dialog. Adding a new engine
 #: here means adding a corresponding frontend dialog + a license URLs
 #: dict in its constants module. Until that, the API refuses the write.
-_LICENSE_ALLOWED_ENGINES: frozenset[str] = frozenset({"supertonic3", "pockettts"})
+_LICENSE_ALLOWED_ENGINES = LICENSE_GATED_ENGINES
 
 
 class _LicenseAcceptBody(BaseModel):
@@ -684,6 +1103,8 @@ def post_license_acceptance(body: _LicenseAcceptBody) -> dict:
     from services import settings_store
     try:
         settings_store.set_license_accepted(eid, body.accepted)
+        from services import model_acceptance
+        model_acceptance.sync_from_engine(eid, bool(body.accepted))
     except Exception as exc:
         logger.error("set_license_accepted failed for %s: %s", log_safe(eid), log_safe(exc))
         raise HTTPException(status_code=500, detail="Failed to persist license acceptance")
@@ -743,6 +1164,10 @@ def _effective_models_dir() -> str:
 
 
 class _ModelsDirBody(BaseModel):
+    authorization: str = Field(description="One-shot native desktop authorization")
+
+
+class _LocalModelBody(BaseModel):
     authorization: str = Field(description="One-shot native desktop authorization")
 
 
@@ -807,6 +1232,90 @@ def set_models_dir(body: _ModelsDirBody):
     return {"configured": path, "effective": _effective_models_dir(), "restart_required": True}
 
 
+@router.get("/engines/{family}/{engine_id}/local-model")
+def get_local_model(family: str, engine_id: str):
+    from services import local_model_paths
+    if not local_model_paths.supported(family, engine_id):
+        raise HTTPException(404, "This engine does not support local model folders")
+    return local_model_paths.state(family, engine_id)
+
+
+async def _change_local_model(family: str, engine_id: str, path: str | None):
+    from services import local_model_paths, model_manager
+    from core.path_authorization import PathAuthorizationError
+    # This lock is the same exclusion held by OmniVoice generation/load routes.
+    # Reject instead of waiting indefinitely behind a long synthesis.
+    if model_manager._model_lock.locked():
+        raise HTTPException(409, "An engine is busy; wait for generation to finish")
+    async with model_manager._model_lock:
+        def change_in_worker():
+            # The RLock must be acquired and released on the worker thread.
+            lock = model_manager._model_load_thread_lock
+            if not lock.acquire(blocking=False):
+                raise HTTPException(409, "An engine is loading; try again when it finishes")
+            try:
+                return local_model_paths.change(family, engine_id, path)
+            finally:
+                lock.release()
+
+        try:
+            return await model_manager.run_release(change_in_worker)
+        except PathAuthorizationError as exc:
+            raise HTTPException(403, detail=str(exc)) from exc
+        except local_model_paths.EngineBusyError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+        except local_model_paths.LocalModelError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
+
+
+@router.put("/engines/{family}/{engine_id}/local-model")
+async def set_local_model(family: str, engine_id: str, body: _LocalModelBody):
+    from core.path_authorization import PathAuthorizationError, consume
+    from services import local_model_paths
+    if not local_model_paths.supported(family, engine_id):
+        raise HTTPException(404, "This engine does not support local model folders")
+    try:
+        raw = consume(body.authorization, "models_dir", expected_scope=f"local-model:{family}:{engine_id}")
+    except PathAuthorizationError as exc:
+        raise HTTPException(403, detail=str(exc)) from exc
+    except local_model_paths.LocalModelError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return await _change_local_model(family, engine_id, raw)
+
+
+@router.post("/engines/{family}/{engine_id}/local-model/discover")
+def discover_local_models(family: str, engine_id: str, body: _LocalModelBody):
+    """List direct child checkpoint candidates under one native-authorized folder.
+
+    Discovery is read-only: it never persists a candidate, loads an engine, or
+    downloads missing files. The capability is consumed even on failure.
+    """
+    from core.path_authorization import PathAuthorizationError, consume
+    from services import local_model_paths
+    if not local_model_paths.supported(family, engine_id):
+        raise HTTPException(404, "This engine does not support local model folders")
+    try:
+        parent = consume(body.authorization, "models_dir", expected_scope=f"local-model-discover:{engine_id}")
+        result = local_model_paths.discover(family, engine_id, parent)
+        from core.path_authorization import issue_local_model_selection
+        for candidate in result["candidates"]:
+            if candidate["validation"]["status"] == "valid":
+                candidate["authorization"] = issue_local_model_selection(candidate["path"], family, engine_id)
+        return result
+    except PathAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except local_model_paths.LocalModelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/engines/{family}/{engine_id}/local-model")
+async def clear_local_model(family: str, engine_id: str):
+    from services import local_model_paths
+    if not local_model_paths.supported(family, engine_id):
+        raise HTTPException(404, "This engine does not support local model folders")
+    return await _change_local_model(family, engine_id, None)
+
+
 # ── Storage report (Settings → Storage) ────────────────────────────────────
 # Per-volume disk totals + du-style sizes for everything the app owns (HF
 # model cache, app data subtotals, engine venvs, temp files) with server-side
@@ -816,7 +1325,7 @@ def set_models_dir(body: _ModelsDirBody):
 # router-level dep like every sibling.
 
 
-@router.get("/storage")
+@router.get("/storage", dependencies=[Depends(reject_cross_site_get)])
 async def get_storage_report(refresh: bool = Query(False)):
     """Disk + per-category storage usage for the Settings → Storage panel.
 
@@ -921,6 +1430,37 @@ def _hf_mirror_state() -> dict:
     }
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _hf_mirror_url_problem(url: str) -> str | None:
+    """Why ``url`` cannot be a Hugging Face endpoint, or None when it can.
+
+    Requires a well-formed HTTPS origin (optionally with a path prefix) and no
+    embedded credentials, query or fragment. Plain HTTP is accepted only for a
+    loopback host, such as a local caching proxy.
+    """
+    from urllib.parse import urlsplit
+
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F or ch == "\\" for ch in url):
+        return "Mirror URL contains invalid characters"
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        parsed.port  # raises ValueError on a malformed port
+    except ValueError:
+        return "Mirror URL is not a valid URL"
+    if parsed.scheme not in {"http", "https"} or not host:
+        return "Mirror URL must start with https://"
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return "Mirror URL must not contain a user name or password"
+    if parsed.query or parsed.fragment or url.endswith(("?", "#")):
+        return "Mirror URL must not contain a query or fragment"
+    if parsed.scheme == "http" and host.lower() not in _LOOPBACK_HOSTS:
+        return "Mirror URL must use https://"
+    return None
+
+
 @router.get("/hf-mirror")
 def get_hf_mirror():
     return _hf_mirror_state()
@@ -938,8 +1478,10 @@ def set_hf_mirror(body: _HFMirrorBody):
     # read as an explicit choice, so switching to Auto clears it (plus the
     # `hf_endpoint` pref fallback the download paths resolve).
     url = "" if mode == "auto" else (body.url or "").strip().rstrip("/")
-    if url and not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Mirror URL must start with http(s)://")
+    if url:
+        reason = _hf_mirror_url_problem(url)
+        if reason:
+            raise HTTPException(status_code=400, detail=reason)
     # Compare against the currently-persisted value (normalised the same way) so
     # a no-op save doesn't nag the user to restart. Only a real change to the
     # persisted endpoint can require a restart.
@@ -952,6 +1494,9 @@ def set_hf_mirror(body: _HFMirrorBody):
         else:
             user_env.unset_user_env(_HF_ENDPOINT_ENV)
             os.environ.pop(_HF_ENDPOINT_ENV, None)
+        from services.hf_auth import apply_process_token_policy
+
+        apply_process_token_policy()
         from core import prefs
         if not url:
             # No endpoint anywhere: clearing to official (manual) or switching
@@ -1083,13 +1628,14 @@ def get_changelog(limit_versions: int = Query(5, ge=1, le=50)):
     frontend renders them safely without HTML. `available: false` when this
     install has no changelog (never an error: the viewer just hides)."""
     from core import changelog
+    from core.version import APP_VERSION
 
     path = changelog.changelog_path()
     if not path:
         return {"available": False, "releases": []}
     try:
         with open(path, encoding="utf-8") as fh:
-            releases = changelog.parse_changelog(fh.read(), limit_versions)
+            releases = changelog.parse_changelog(fh.read(), limit_versions, APP_VERSION)
     except Exception:
         logger.exception("changelog parse failed")
         return {"available": False, "releases": []}
@@ -1138,6 +1684,21 @@ def get_analytics():
         # enables anything by itself.
         "prompted": analytics.user_prompted(),
     }
+
+
+class _UiEventBody(BaseModel):
+    event: str = Field(..., max_length=64)
+    props: dict = Field(default_factory=dict)
+    screen: str | None = Field(default=None, max_length=96)
+
+
+@router.post("/analytics/event")
+def post_analytics_event(body: _UiEventBody):
+    """An event the interface reports. A no-op unless the user opted in; only
+    allowlisted, content-free properties are forwarded."""
+    from core import analytics
+
+    return {"sent": analytics.capture_from_ui(body.event, body.props, body.screen)}
 
 
 @router.put("/analytics")

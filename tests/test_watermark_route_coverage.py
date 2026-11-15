@@ -70,11 +70,6 @@ _PRODUCERS = [
     "api/routers/audiobook.py",
     "api/routers/archetypes.py",
     "services/persona_bundle.py",
-    # Remote execution: the synthesis happens on another machine, so the mark
-    # has to be embedded there — the control plane only ever sees encoded
-    # bytes. The guard walked api/ and services/ only, so this producer would
-    # have shipped unmarked with every check green.
-    "worker/executor.py",
 ]
 
 
@@ -222,7 +217,7 @@ def test_mark_synthetic_delegates_and_respects_pref(monkeypatch):
     assert watermark.mark_synthetic(wav, 24000, context="t", force=True) is not wav
     monkeypatch.setattr(watermark, "is_enabled", lambda: True)
     assert watermark.mark_synthetic(wav, 24000, context="t") is not wav
-    assert calls == [2400, 2400]
+    assert calls == [1600, 1600]  # AudioSeal receives normalized 16 kHz input
 
 
 def test_mark_synthetic_never_raises(monkeypatch):

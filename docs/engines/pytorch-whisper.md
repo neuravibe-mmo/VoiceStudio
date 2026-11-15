@@ -9,7 +9,7 @@ genuinely uses **AMD ROCm** GPUs, so auto-detect picks it on ROCm hosts
 
 ## Selecting it
 
-- **Model Catalogue → Engines**, ASR tab → **Use** on the PyTorch Whisper
+- **Model Catalogue**, ASR tab → **Use** on the PyTorch Whisper
   row, or `OMNIVOICE_ASR_BACKEND=pytorch-whisper`.
 - `OMNIVOICE_ASR_BACKEND=omnivoice` is accepted as a compatibility alias and
   selects this same PyTorch-native ASR path on ROCm hosts.
@@ -41,12 +41,31 @@ transformers-format Whisper repo works. Weights download on first load — see
 
 ## VRAM preflight
 
-whisper-large-v3-turbo needs roughly 3.2 GiB before generation adds its
-workspace; loading it onto a nearly-full card "succeeds" and then the first
-transcribe OOMs with zero segments. So on CUDA the engine checks free VRAM
-against a 5 GB budget before loading and uses the CPU instead when the card
-is too full (flush the TTS model to restore GPU-speed ASR). Disable with
-`OMNIVOICE_ASR_VRAM_PREFLIGHT=0`.
+Loading a model onto a nearly-full card "succeeds", and then the first
+transcribe runs out of memory with zero segments. So on CUDA the engine
+checks free VRAM before loading and uses the CPU instead when the card is
+too full (flush the TTS model to restore GPU-speed ASR).
+
+For the OpenAI Whisper checkpoints, the budget follows the model it loads in
+fp16: the weights, plus about 1.5 GB of working memory and 0.5 GB of
+headroom. Any other repository, including a fine-tune, keeps 5 GB.
+
+| Model | Free VRAM needed |
+|---|---|
+| `openai/whisper-large-v3-turbo` (default) | 3.6 GB |
+| `openai/whisper-large`, `-large-v2`, `-large-v3` | 5 GB |
+| `openai/whisper-medium` / `-small` / `-base` / `-tiny` (and `.en`) | 3.5 / 2.5 / 2.2 / 2.1 GB |
+| any other repository | 5 GB |
+
+A 6 GB card with nothing else loaded runs the default model on the GPU
+([#2041](https://github.com/debpalash/VoiceStudio/issues/2041)). Disable
+the check with `OMNIVOICE_ASR_VRAM_PREFLIGHT=0`.
+
+If a GPU run still runs out of memory (the preflight only sizes the model
+weights, not activations), the backend retries the same audio with smaller
+batches instead of failing: 16, then 4, then 1, or 8, then 2, then 1 when word
+timestamps are requested. If even batch size 1 does not fit, the pipeline moves
+to the CPU and finishes there, so no chunk is dropped.
 
 ## Quirks
 
@@ -58,6 +77,8 @@ is too full (flush the TTS model to restore GPU-speed ASR). Disable with
   [#1376](https://github.com/debpalash/VoiceStudio/issues/1376)).
 - Transcribes are time-bounded like every local engine:
   `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (default 120 s per dub chunk),
-  `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s whole-file).
+  `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (default 300 s whole-file floor).
+  Whole files allow at least twice their duration; see
+  [timeout settings](../install/troubleshooting.md).
 
 Speed comparisons across engines live in [performance](../performance.md).

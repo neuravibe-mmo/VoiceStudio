@@ -363,7 +363,7 @@ class TestSpeakerAssignment:
         out = assign_speakers_from_diarization(segs, FakeDiar())
         assert out[0]["speaker_id"] == "Speaker 1"  # SPEAKER_00 + 1
 
-    def test_diarization_falls_back_to_midpoint_when_no_overlap(self):
+    def test_diarization_falls_back_to_nearest_turn_when_no_overlap(self):
         class FakeTurn:
             def __init__(self, start, end):
                 self.start = start
@@ -375,8 +375,9 @@ class TestSpeakerAssignment:
 
         segs = [{"start": 0.0, "end": 2.0, "text": "x", "id": "1", "speaker_id": "?"}]
         out = assign_speakers_from_diarization(segs, FakeDiar())
-        # No overlap, no midpoint match — speaker_id stays "?"
-        assert out[0]["speaker_id"] == "?"
+        # No overlap, no midpoint match: the nearest turn's speaker, never the
+        # stale pre-diarization label (#3419).
+        assert out[0]["speaker_id"] == "Speaker 4"
 
 
 # ---------------------------------------------------------------------------
@@ -393,3 +394,89 @@ class TestSegmentDictContract:
             assert isinstance(s["end"], float)
             assert isinstance(s["text"], str)
             assert s["end"] > s["start"]
+
+
+# ── #2572: segments without word timings keep their speech ──────────────────
+
+@pytest.mark.parametrize("unaligned_first", [True, False])
+def test_mixed_aligned_and_unaligned_segments_keep_all_speech(unaligned_first):
+    aligned = {
+        "start": 2.0, "end": 3.0, "text": "exact words",
+        "words": [
+            {"word": "exact", "start": 2.05, "end": 2.4},
+            {"word": "words", "start": 2.5, "end": 2.95},
+        ],
+    }
+    unaligned = {"start": 0.0, "end": 1.5, "text": " kept speech here ", "words": []}
+    if not unaligned_first:
+        unaligned = {"start": 4.0, "end": 5.5, "text": "kept speech here"}
+    segs = [unaligned, aligned] if unaligned_first else [aligned, unaligned]
+
+    words = _words_from_whisper({"segments": segs, "chunks": []})
+
+    texts = [w.text for w in words]
+    expected = ["kept", "speech", "here", "exact", "words"]
+    assert texts == (expected if unaligned_first else expected[3:] + expected[:3])
+    exact = [(w.start, w.end) for w in words if w.text in ("exact", "words")]
+    assert exact == [(2.05, 2.4), (2.5, 2.95)]
+    spread = [w for w in words if w.text in ("kept", "speech", "here")]
+    base = 0.0 if unaligned_first else 4.0
+    assert spread[0].start == pytest.approx(base)
+    assert spread[-1].end == pytest.approx(base + 1.5)
+    assert all(w.end > w.start for w in spread)
+
+
+def test_unaligned_segment_without_a_usable_span_is_skipped():
+    segs = [
+        {"start": 0.0, "end": 1.0, "words": [{"word": "hi", "start": 0.1, "end": 0.4}]},
+        {"start": None, "end": None, "text": "untimed"},
+        {"start": 2.0, "end": 2.0, "text": "zero span"},
+    ]
+    assert [w.text for w in _words_from_whisper({"segments": segs})] == ["hi"]
+
+
+# ---------------------------------------------------------------------------
+# Unspaced scripts: ASR returns CJK/Thai words without spaces between them
+# ---------------------------------------------------------------------------
+
+def _word_result(*words, end=3.0):
+    step = end / len(words)
+    return {"segments": [{
+        "start": 0.0, "end": end, "text": "".join(words),
+        "words": [{"word": w, "start": i * step, "end": (i + 1) * step}
+                  for i, w in enumerate(words)],
+    }]}
+
+
+def test_chinese_words_rejoin_without_spaces():
+    result = _word_result("我们", "今天", "去", "公园", "散步。")
+    assert [s["text"] for s in segment_transcript(result, 3.0)] == ["我们今天去公园散步。"]
+
+
+def test_japanese_and_thai_words_rejoin_without_spaces():
+    result = _word_result("今日は", "公園に", "行きます。")
+    assert segment_transcript(result, 3.0)[0]["text"] == "今日は公園に行きます。"
+    result = _word_result("สวัสดี", "ครับ")
+    assert segment_transcript(result, 3.0)[0]["text"] == "สวัสดีครับ"
+
+
+def test_spaced_scripts_and_mixed_words_keep_their_spaces():
+    result = _word_result(" Hello", " there,", " friend.")
+    assert segment_transcript(result, 3.0)[0]["text"] == "Hello there, friend."
+    result = _word_result("用", "iPhone", "拍照。")
+    assert segment_transcript(result, 3.0)[0]["text"] == "用 iPhone 拍照。"
+
+
+def test_merging_short_chinese_segments_adds_no_space():
+    segs = [Segment(start=0.0, end=0.3, text="好。"),
+            Segment(start=0.35, end=2.5, text="我们走吧。")]
+    merged = _merge_short(segs)
+    assert merged[0].text == "好。我们走吧。"
+
+
+def test_fullwidth_letters_and_digits_are_not_unspaced_punctuation():
+    from services.segmentation import _UNSPACED
+    for ch in ("\uff21", "\uff41", "\uff10", "\uff19"):
+        assert not _UNSPACED.match(ch)
+    for ch in ("\uff0c", "\uff01", "\uff1f", "\u3002", "\uff71"):
+        assert _UNSPACED.match(ch)

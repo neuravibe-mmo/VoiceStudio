@@ -5,7 +5,7 @@
 # job updates (or creates) ONE issue labeled `docs-drift` in place — no issue
 # spam — and closes it automatically when the check is clean again.
 #
-# Companion to the PR-gating validate-install-docs.py step in ci.yml.
+# Scheduled documentation-link and structure audit.
 # Spec: docs/competitive-analysis.md Spec 9a / parity program Wave 0.1.
 # Rolling-issue pattern adapted from Patter (MIT).
 
@@ -25,9 +25,9 @@ jobs:
   drift:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -40,7 +40,7 @@ jobs:
         run: python scripts/check-docs-drift.py --output drift-report.md
 
       - name: Update rolling docs-drift issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           DRIFT_OUTCOME: ${{ steps.drift.outcome }}
         with:

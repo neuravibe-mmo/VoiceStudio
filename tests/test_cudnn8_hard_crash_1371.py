@@ -146,6 +146,7 @@ def test_ctranslate2_engines_report_unavailable(engine, ab, cudnn8_missing, ctra
     assert "cudnn_ops_infer" in reason
 
 
+@pytest.mark.usefixtures("neutral_asr_host")
 def test_auto_detect_falls_back_to_pytorch_whisper(
     monkeypatch, ab, cudnn8_missing, ctranslate2_importable
 ):
@@ -158,7 +159,7 @@ def test_auto_detect_falls_back_to_pytorch_whisper(
 def test_the_isolated_sidecar_engine_reports_the_same_reason(cudnn8_missing, ctranslate2_importable):
     """Crash isolation makes the missing library a failed job instead of a dead
     backend — which is worse than it sounds: it fails on every transcribe, with
-    nothing explaining why. Model Catalogue → Engines gets the reason."""
+    nothing explaining why. Model Catalogue gets the reason."""
     from services import subprocess_asr
 
     ok, reason = subprocess_asr.IsolatedFasterWhisperBackend.is_available()

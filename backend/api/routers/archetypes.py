@@ -1,7 +1,7 @@
 """Voice-gallery archetype API.
 
 Serves the catalog of *designed* voice archetypes from ``core.archetypes`` and
-renders previews / materializes them into voice profiles on demand.
+renders previews and saves their recipes as voice profiles on demand.
 
 Design notes
 ============
@@ -19,12 +19,12 @@ Design notes
   (``services.gallery``), which is consulted BEFORE the engine so a fresh
   install can hear voices before the 2.4 GB checkpoint finishes downloading.
   Gallery files win over a local render of the same key — but only for
-  ``/preview``. ``/use`` always renders locally: the WAV it keeps in
-  ``VOICES_DIR`` is the reference audio a cloned voice is built from, and a
-  downloaded MP3 must never become that.
+  ``/preview``. ``/use`` stores the design recipe without rendering; synthesis
+  loads the model only when the user asks to generate audio.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -33,15 +33,18 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query, Depends
 from fastapi.responses import FileResponse
 
+from api.dependencies import require_admin
 from core import archetypes
 from core.audio_validation import is_playable_wav, resolve_regular_file
 from core.config import OUTPUTS_DIR, VOICES_DIR
 from services import gallery
+from services.model_acceptance import ModelLicenceNotAccepted
+from core.browser_guard import reject_cross_site_get
 
 logger = logging.getLogger("omnivoice.archetypes")
 
@@ -57,11 +60,12 @@ _PREVIEW_SEED = 42
 # 32 reliably converges to speech across the gallery's instruct/script space
 # at a one-time (cached) render cost.
 _PREVIEW_NUM_STEP = 32
-# Spectral-flatness floor below which a render is a degenerate tonal artifact
-# rather than speech. Real, mastered speech sits ~0.04–0.07; a tonal buzz
-# collapses to <0.005. 0.015 separates the two with wide margin and sits well
-# below even breathy/whisper voices (which are broadband → high flatness).
-_DEGENERATE_FLATNESS = 0.015
+# Reject near-pure tonal artifacts using mean framed spectral flatness.
+# Calibrated against the tracked speech demos exercised by
+# test_archetype_preview_quality.py: the quietest (Mandarin dubbing, 44.1 kHz)
+# measures ~7.7e-6, while the worst tested tonal buzz measures ~3.3e-9.
+# 1e-7 leaves >10x margin on both sides without rejecting low-flatness speech.
+_DEGENERATE_FLATNESS = 1e-7
 
 
 def _preview_key(a: dict) -> str:
@@ -139,7 +143,7 @@ def _legacy_archetype_profile(conn, a: dict):
 
 
 def _is_materialized_archetype_row(row, a: dict) -> bool:
-    """Recognize rows owned by this materializer without trusting identity text alone."""
+    """Recognize deferred or previously rendered rows owned by this materializer."""
     try:
         states_match = json.loads(row["vd_states"]) == a["attrs"]
     except (TypeError, ValueError):
@@ -148,7 +152,7 @@ def _is_materialized_archetype_row(row, a: dict) -> bool:
         row["personality"] == _archetype_personality(a)
         and row["kind"] == "design"
         and row["seed"] == _PREVIEW_SEED
-        and row["ref_audio_path"] == _profile_audio_filename(row["id"])
+        and row["ref_audio_path"] in (None, "", _profile_audio_filename(row["id"]))
         and row["instruct"] == a["instruct"]
         and row["language"] == a["language"]
         and row["ref_text"] == a["sample_script"]
@@ -167,29 +171,6 @@ def _existing_archetype_profile(conn, a: dict):
     return owned if owned is not None else _legacy_archetype_profile(conn, a)
 
 
-async def _render_profile_audio(
-    a: dict, profile_id: str, *, publish: bool = True,
-) -> tuple[str, Path]:
-    """Render one validated sample, optionally staging it for a later CAS."""
-    audio_filename = _profile_audio_filename(profile_id)
-    safe_id = Path(audio_filename).stem
-    audio_path = Path(VOICES_DIR) / audio_filename
-    if publish:
-        await _render_wav_atomic(a, audio_path, prefix=f".{safe_id}-")
-    else:
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
-        audio_path = audio_path.parent / f".{safe_id}-{uuid.uuid4().hex}.staged.wav"
-        try:
-            await _render_archetype_wav(a, audio_path)
-            if not is_playable_wav(audio_path):
-                raise RuntimeError("the voice engine produced an invalid WAV")
-        except BaseException:
-            with __import__("contextlib").suppress(OSError):
-                audio_path.unlink()
-            raise
-    return audio_filename, audio_path
-
-
 async def _render_wav_atomic(a: dict, out_path: Path, *, prefix: str = ".render-") -> Path:
     """Render and validate a WAV before atomically replacing *out_path*."""
     audio_path = Path(out_path)
@@ -206,8 +187,33 @@ async def _render_wav_atomic(a: dict, out_path: Path, *, prefix: str = ".render-
     return audio_path
 
 
-def _heal_materialized_profile(conn, row, a: dict, audio_filename: str) -> None:
-    """Repair profiles created before archetype `/use` persisted design kind."""
+# One render per output file. A media element may re-request, a user may
+# re-click, and two views may preview the same voice at once — each used to
+# queue its own render on the GPU pool. The shared task is shielded from the
+# request, so a cancelled or disconnected client still lands the clip on disk
+# and the next click serves it instead of starting over.
+_renders: dict[str, asyncio.Task] = {}
+
+
+def _forget_render(key: str, task: asyncio.Task) -> None:
+    if _renders.get(key) is task:
+        del _renders[key]
+    if not task.cancelled():
+        task.exception()  # retrieved: an orphaned failure must not warn at GC
+
+
+async def _render_once(key: str, render: Callable[[], Awaitable[Any]]) -> Any:
+    """Run *render* once per *key*; concurrent callers await the same result."""
+    task = _renders.get(key)
+    if task is None:
+        task = asyncio.ensure_future(render())
+        _renders[key] = task
+        task.add_done_callback(lambda t: _forget_render(key, t))
+    return await asyncio.shield(task)
+
+
+def _heal_archetype_profile(conn, row, a: dict, audio_filename: Optional[str]) -> None:
+    """Refresh an owned profile without starting synthesis."""
     instruct, vd_states = _design_profile_values(a)
     conn.execute(
         "UPDATE voice_profiles SET kind='design', instruct=?, vd_states=?, language=?, "
@@ -248,24 +254,39 @@ def _is_blank_audio(audio_tensor) -> bool:
         return False
 
 
-def _spectral_flatness(audio_tensor) -> Optional[float]:
-    """Geometric-mean / arithmetic-mean of the power spectrum.
+_WIN_LEN = 1024
+_WIN_STEP = _WIN_LEN // 2
+_LOG_FLOOR = 1e-12
+_PAUSE_FRACTION = 1e-4  # frames below this share of the loudest one are pauses
 
-    ~1.0 for broadband noise, →0 for a pure tone. The degenerate diffusion
-    renders this guards against are near-pure tonal buzzes (flatness <0.005),
-    distinct from both silence (caught by ``_is_blank_audio``) and real speech
-    (~0.04+). Returns ``None`` if it can't be computed so callers don't act on
-    a bad measurement.
+
+def _spectral_flatness(audio_tensor) -> Optional[float]:
+    """Average spectral flatness over speech-carrying windows, or ``None``.
+
+    Flatness of one window is geometric mean / arithmetic mean of its power
+    spectrum: close to 0 for a tone, towards 1 for noise. Windowing the clip
+    (instead of one transform over all of it) keeps the number independent of
+    duration; pauses are dropped so their noise floor doesn't pull it up.
+    Too-short, non-finite or otherwise unmeasurable audio yields ``None``,
+    and so does any error: this check must never stop a render.
     """
     try:
         import torch
 
-        t = audio_tensor if isinstance(audio_tensor, torch.Tensor) else torch.as_tensor(audio_tensor)
-        t = t.detach().to("cpu", dtype=torch.float32).flatten()
-        if t.numel() < 1024 or not torch.isfinite(t).all():
+        x = torch.as_tensor(audio_tensor).detach().to("cpu", dtype=torch.float32)
+        if x.ndim > 1:
+            x = x.mean(dim=0)
+        x = x.flatten()
+        if x.numel() < _WIN_LEN or not bool(torch.isfinite(x).all()):
             return None
-        spec = torch.fft.rfft(t * torch.hann_window(t.numel())).abs().pow(2) + 1e-12
-        return float(torch.exp(torch.mean(torch.log(spec))) / torch.mean(spec))
+        windows = x.unfold(0, _WIN_LEN, _WIN_STEP) * torch.hann_window(_WIN_LEN)
+        spectra = torch.fft.rfft(windows, dim=1).abs().square() + _LOG_FLOOR
+        loudness = spectra.sum(dim=1)
+        spectra = spectra[loudness > loudness.max() * _PAUSE_FRACTION]
+        if spectra.shape[0] == 0:
+            return None
+        flat = torch.exp(spectra.log().mean(dim=1)) / spectra.mean(dim=1)
+        return float(flat.mean())
     except Exception:  # never let the checker itself block a render
         return None
 
@@ -283,7 +304,7 @@ def _is_unusable_audio(audio_tensor) -> bool:
     return flatness is not None and flatness < _DEGENERATE_FLATNESS
 
 
-async def _render_archetype_wav(a: dict, out_path: Path) -> None:
+async def _render_archetype_wav(a: dict, out_path: Path, *, allow_model_load: bool = True) -> None:
     """Render an archetype's sample script to ``out_path`` using the live engine.
 
     Reuses generation.py's inference primitives so there is exactly one TTS code
@@ -298,7 +319,9 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
         _safe_torchaudio_save,
     )
 
-    model = await get_model()
+    # Save-time samples are optional: an unload after the residency probe must
+    # not turn persistence into a cold load. Explicit previews retain loading.
+    model = await get_model() if allow_model_load else await get_model(allow_load=False)
     language = a["language"]
     if language in (None, "", "Auto"):
         language = None
@@ -331,17 +354,21 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
     # length-scaled helper (#1190) instead of the flat 300s default.
     from services.model_manager import generate_timeout_s
     _budget = generate_timeout_s(text, engine=model)
+    # A design profile's sample uses the seed the user saved it with (#3254);
+    # archetype previews keep the fixed preview seed.
+    seed = a.get("seed")
+    seed = _PREVIEW_SEED if seed is None else int(seed)
     audio_tensor = await run_on_gpu_pool_guarded(
-        lambda: _infer(_PREVIEW_SEED), what="Archetype preview generate",
+        lambda: _infer(seed), what="Archetype preview generate",
         timeout=_budget)
     if _is_unusable_audio(audio_tensor):
         # Blank OR a degenerate tonal buzz — retry once on a different seed to
         # step off the bad diffusion trajectory. Static message only: the
-        # archetype id is request-derived (CodeQL log-injection); the seed is a
-        # module constant, safe to log.
-        logger.warning("Archetype rendered unusable at seed %d — retrying once", _PREVIEW_SEED)
+        # archetype id is request-derived (CodeQL log-injection); the seed is an
+        # int, safe to log.
+        logger.warning("Archetype rendered unusable at seed %d — retrying once", seed)
         audio_tensor = await run_on_gpu_pool_guarded(
-            lambda: _infer(_PREVIEW_SEED + 1), what="Archetype preview generate",
+            lambda: _infer(seed + 1), what="Archetype preview generate",
             timeout=_budget)
     if _is_unusable_audio(audio_tensor):
         raise RuntimeError("the voice engine returned no audible audio for this archetype")
@@ -405,8 +432,8 @@ def _preview_source(a: dict) -> tuple[str, str]:
         return "cached", ""
     if _no_voice_model_downloaded():
         return "no_model", (
-            "You're offline and no voice model is downloaded yet — "
-            "Model Catalogue → Models → Download."
+            "You're offline and no voice model is downloaded yet — download "
+            "one from the engine's Weights list in Model Catalogue."
         )
     return "rendering", "Rendering this preview on your machine — it may take a moment."
 
@@ -429,7 +456,7 @@ def preview_gallery_status():
     return gallery.status()
 
 
-@router.put("/archetypes/previews")
+@router.put("/archetypes/previews", dependencies=[Depends(require_admin)])
 async def set_preview_gallery(enabled: bool = Body(..., embed=True)):
     """Turn pre-rendered previews on or off.
 
@@ -445,7 +472,7 @@ async def set_preview_gallery(enabled: bool = Body(..., embed=True)):
     return state
 
 
-@router.post("/archetypes/previews/check")
+@router.post("/archetypes/previews/check", dependencies=[Depends(require_admin)])
 async def check_preview_gallery():
     """Manual "check now" — bypasses the 24 h throttle, never the signature."""
     return await gallery.check_for_updates(force=True)
@@ -505,7 +532,7 @@ def preview_archetype_state(archetype_id: str):
     return {"source": source, "message": message}
 
 
-@router.get("/archetypes/{archetype_id}/preview")
+@router.get("/archetypes/{archetype_id}/preview", dependencies=[Depends(reject_cross_site_get)])
 async def preview_archetype(
     archetype_id: str,
     local: bool = Query(False, description="Bypass gallery audio after a client decode failure"),
@@ -536,7 +563,13 @@ async def preview_archetype(
     cache_path = _PREVIEW_DIR / f"{key}.wav"
     if not is_playable_wav(cache_path):
         try:
-            await _render_wav_atomic(a, cache_path, prefix=".preview-")
+            async def _render_preview() -> None:
+                if not is_playable_wav(cache_path):  # landed while we queued
+                    await _render_wav_atomic(a, cache_path, prefix=".preview-")
+
+            await _render_once(str(cache_path), _render_preview)
+        except ModelLicenceNotAccepted:
+            raise  # the structured 403 that opens the acceptance dialog
         except Exception as e:  # model missing / OOM / inference failure
             logger.error("Archetype preview render failed", exc_info=True)
             # Two different failures, two different answers. Without a model
@@ -544,8 +577,8 @@ async def preview_archetype(
             if _no_voice_model_downloaded():
                 detail = (
                     "You're offline and no voice model is downloaded yet — "
-                    "Model Catalogue → Models → Download. (Or turn on pre-rendered "
-                    "voice previews in Model Catalogue → Models.)"
+                    "download one from the engine's Weights list in Model Catalogue. (Or turn "
+                    "on pre-rendered voice previews in Settings → Storage.)"
                 )
             else:
                 detail = (
@@ -564,20 +597,9 @@ async def preview_archetype(
     )
 
 
-@router.post("/archetypes/{archetype_id}/use")
-async def use_archetype(archetype_id: str, name: Optional[str] = Query(None)):
-    """Materialize an archetype into a reusable voice profile.
-
-    Renders a reference sample (so the voice has a concrete identity and a
-    preview) and inserts a ``voice_profiles`` row carrying the archetype's
-    instruct + language. The profile then shows up everywhere voices are
-    picked (Dub / Generate / Clone).
-
-    Never sourced from the voice gallery, no matter how cheap that would be:
-    this WAV lands in ``VOICES_DIR`` as the profile's reference audio, so a
-    downloaded, lossily-encoded MP3 would silently become the sample every
-    future clone of this voice is built from. It renders locally or it fails.
-    """
+@router.post("/archetypes/{archetype_id}/use", dependencies=[Depends(require_admin)])
+def use_archetype(archetype_id: str, name: Optional[str] = Query(None)):
+    """Save an archetype recipe as a reusable design profile without rendering."""
     a = archetypes.get_archetype(archetype_id)
     if a is None:
         raise HTTPException(status_code=404, detail="Archetype not found")
@@ -585,125 +607,36 @@ async def use_archetype(archetype_id: str, name: Optional[str] = Query(None)):
     from core import event_bus
     from core.db import db_conn
 
-    # Idempotent (dedup): an archetype materializes to exactly ONE voice profile.
-    # Picking the same gallery voice again — from any picker (Gallery grid,
-    # VoiceSelector, …) — must reuse that one row instead of rendering + inserting
-    # a fresh duplicate every time. Use a namespaced personality identity so an
-    # imported persona cannot collide with and be rewritten by an archetype id.
-    with db_conn() as conn:
-        existing = _existing_archetype_profile(conn, a)
-
-    profile_id = existing["id"] if existing is not None else str(uuid.uuid4())[:8]
-    audio_path: Optional[Path] = None
-    if existing is not None and _materialized_audio_is_current(existing, a):
-        audio_filename = existing["ref_audio_path"]
-    else:
-        try:
-            audio_filename, audio_path = await _render_profile_audio(
-                a, profile_id, publish=existing is None,
-            )
-        except Exception as e:
-            logger.error("Archetype 'use' render failed", exc_info=True)
-            # Same actionable/diagnostic split as /preview — minus the gallery
-            # suggestion, which cannot help here.
-            if _no_voice_model_downloaded():
-                detail = (
-                    "Creating a voice needs the voice model — no voice model is "
-                    "downloaded yet. Model Catalogue → Models → Download."
-                )
-            else:
-                detail = (
-                    "Couldn't create a voice from this archetype — the voice engine "
-                    f"reported: {e}"
-                )
-            raise HTTPException(status_code=503, detail=detail) from e
-
-    if existing is not None:
-        with db_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = conn.execute(
-                "SELECT * FROM voice_profiles WHERE id=?", (existing["id"],),
-            ).fetchone()
-            owned = _existing_archetype_profile(conn, a)
-            still_owned = current is not None and (
-                owned is not None and owned["id"] == current["id"]
-            )
-            if still_owned:
-                if audio_path is not None:
-                    destination = Path(VOICES_DIR) / audio_filename
-                    os.replace(audio_path, destination)
-                    audio_path = None
-                _heal_materialized_profile(conn, current, a, audio_filename)
-                existing_result = {"profile_id": current["id"], "name": current["name"]}
-            else:
-                existing_result = None
-        if existing_result is not None:
-            event_bus.emit("profiles", {"action": "updated", "id": existing_result["profile_id"]})
-            return existing_result
-        # The row was edited/deleted while rendering. Preserve it and use the
-        # validated staged sample for a fresh canonical materialization.
-        profile_id = str(uuid.uuid4())[:8]
-        audio_filename = _profile_audio_filename(profile_id)
-        destination = Path(VOICES_DIR) / audio_filename
-        if audio_path is None:
-            try:
-                audio_filename, audio_path = await _render_profile_audio(a, profile_id)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=503, detail="Couldn't create a voice from this archetype.",
-                ) from e
-        else:
-            os.replace(audio_path, destination)
-            audio_path = destination
-
-    if audio_path is None:  # defensive: a new profile always rendered above
-        raise RuntimeError("new archetype profile has no rendered audio")
-
     profile_name = (name or a["name"]).strip() or a["name"]
-    try:
-        with db_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # Re-check under the write connection right before inserting: a
-            # concurrent /use for the same archetype may have inserted while we
-            # were rendering (the pre-render SELECT above raced). Reuse that row
-            # and drop our just-rendered sample instead of creating a duplicate.
-            # `personality` is not globally UNIQUE, so serialize and re-check.
-            dup = _existing_archetype_profile(conn, a)
-            if dup is not None:
-                duplicate_audio = dup["ref_audio_path"]
-                if not _materialized_audio_is_current(dup, a):
-                    duplicate_audio = _profile_audio_filename(dup["id"])
-                    _duplicate_path = Path(VOICES_DIR) / duplicate_audio
-                    _duplicate_path.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(audio_path, _duplicate_path)
-                    audio_path = None
-                _heal_materialized_profile(conn, dup, a, duplicate_audio)
-                with __import__("contextlib").suppress(OSError):
-                    if audio_path is not None:
-                        os.remove(audio_path)
-                duplicate_result = {"profile_id": dup["id"], "name": dup["name"]}
-            else:
-                duplicate_result = None
-            if duplicate_result is None:
-                instruct, vd_states = _design_profile_values(a)
-                conn.execute(
-                    "INSERT INTO voice_profiles "
-                    "(id, name, ref_audio_path, ref_text, instruct, language, seed, personality, "
-                    "created_at, kind, vd_states) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'design', ?)",
-                    (
-                        profile_id, profile_name, audio_filename, a["sample_script"],
-                        instruct, a["language"], _PREVIEW_SEED,
-                        _archetype_personality(a), time.time(), vd_states,
-                    ),
-                )
-    except Exception:
-        with __import__("contextlib").suppress(OSError):
-            if audio_path is not None:
-                os.remove(audio_path)
-        raise
+    with db_conn() as conn:
+        # Serialize deduplication: personality is intentionally not globally
+        # unique because other import formats may contain arbitrary values.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _existing_archetype_profile(conn, a)
+        if existing is not None:
+            audio_filename = (
+                existing["ref_audio_path"]
+                if _materialized_audio_is_current(existing, a)
+                else None
+            )
+            _heal_archetype_profile(conn, existing, a, audio_filename)
+            result = {"profile_id": existing["id"], "name": existing["name"]}
+            action = "updated"
+        else:
+            profile_id = str(uuid.uuid4())[:8]
+            instruct, vd_states = _design_profile_values(a)
+            conn.execute(
+                "INSERT INTO voice_profiles "
+                "(id, name, ref_audio_path, ref_text, instruct, language, seed, personality, "
+                "created_at, kind, vd_states) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'design', ?)",
+                (
+                    profile_id, profile_name, a["sample_script"], instruct,
+                    a["language"], _PREVIEW_SEED, _archetype_personality(a),
+                    time.time(), vd_states,
+                ),
+            )
+            result = {"profile_id": profile_id, "name": profile_name}
+            action = "created"
 
-    if duplicate_result is not None:
-        event_bus.emit("profiles", {"action": "updated", "id": duplicate_result["profile_id"]})
-        return duplicate_result
-    event_bus.emit("profiles", {"action": "created", "id": profile_id})
-    return {"profile_id": profile_id, "name": profile_name}
+    event_bus.emit("profiles", {"action": action, "id": result["profile_id"]})
+    return result

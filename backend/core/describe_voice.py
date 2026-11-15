@@ -31,7 +31,7 @@ Design notes
 
 Localization note (CLAUDE.md): the only hardcoded CJK here is
 ``DIALECT_PINYIN`` — a functional pinyin → Chinese-dialect-token mapping
-(model vocabulary, like ``frontend/src/utils/constants.js``). Registered in
+(model vocabulary, like ``electron/src/shared/utils/constants.js``). Registered in
 ``tests/test_no_hardcoded_cjk.py``'s allowlist with this justification.
 """
 from __future__ import annotations
@@ -50,6 +50,23 @@ _DIALECTS = set(_VD._INSTRUCT_CATEGORIES[5])  # the 12 Chinese dialect tokens
 # Category names match the frontend's CATEGORIES keys (utils/constants.js) and
 # the archetype ``attrs`` shape, so the response drops straight into vdStates.
 CATEGORY_ORDER = ("Gender", "Age", "Pitch", "Style", "EnglishAccent", "ChineseDialect")
+
+
+def instruct_to_vd_states(instruct: str | None) -> dict[str, str]:
+    """Project a saved validator-token instruct onto the complete UI recipe."""
+    attrs = {category: "Auto" for category in CATEGORY_ORDER}
+    sanitized = _VD.sanitize_instruct(instruct)
+    if not sanitized:
+        return attrs
+    for token in sanitized.split(", "):
+        category_index = _VD._instruct_category_index(token)
+        if category_index < 0 or category_index >= len(CATEGORY_ORDER):
+            continue
+        # The first four frontend categories use the English canonical token;
+        # dialects and accents already use their engine-native form.
+        canonical = _VD._INSTRUCT_ZH_TO_EN.get(token, token)
+        attrs[CATEGORY_ORDER[category_index]] = canonical
+    return attrs
 
 # ── Pinyin / romanized names → Chinese-dialect tokens (functional vocabulary) ─
 DIALECT_PINYIN = {
@@ -230,10 +247,12 @@ def _compiled_rules():
 
 _COMPILED = _compiled_rules()
 
-# "<N> year(s) old / <N>-year-old / <N> yo" → an age bracket. Runs before the
-# keyword rules so the trailing "old" never misfires as elderly.
+# "<N> year(s) old / <N>-year-old / <N> yo / aged <N> / age: <N>" → an age
+# bracket. Runs before the keyword rules so the trailing "old" never misfires
+# as elderly, and "aged 22" never reaches elderly's bare "aged" synonym.
 _AGE_NUM = re.compile(
     r"\b(\d{1,3})(?:[\s\-]*(?:years?|yrs?|yr)[\s\-]*old|[\s\-]*(?:yo|y/o))\b"
+    r"|\baged?\s*(?::\s*)?(\d{1,3})\b"
 )
 
 
@@ -265,7 +284,7 @@ def _match_category(category: str, text: str):
     if category == "Age":
         m = _AGE_NUM.search(text)
         if m:
-            return _age_token_for(int(m.group(1))), m
+            return _age_token_for(int(m.group(1) or m.group(2))), m
     for token, patterns in _COMPILED[category]:
         best = None
         for pat in patterns:

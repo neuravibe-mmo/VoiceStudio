@@ -41,8 +41,10 @@ from __future__ import annotations
 import atexit
 import base64
 import contextlib
+import collections
 import json
 import logging
+import math
 import os
 import struct
 import subprocess
@@ -97,11 +99,21 @@ SIDECAR_INBOUND_OPS = frozenset({"ping", "synthesize", "transcribe", "shutdown"}
 #: emitting the first frame; 30 s is a comfortable upper bound that still
 #: surfaces a hung sidecar within a single CI run.
 SPAWN_READY_TIMEOUT_S = 30.0
+# How much of a sidecar's stderr a failed ready handshake quotes (#2026).
+_STDERR_TAIL_LINES = 12
+_STDERR_TAIL_CHARS = 800
 
-#: Per-frame _recv read timeout (best-effort — applies to header read; body
-#: read is uninterruptible on a stdlib BufferedReader). Used in health_check
-#: and generate to bound a hung sidecar.
+# Silence budget for ping/health-check reads (header only, best effort). It
+# bounds a hung sidecar in health_check(), so it has to stay short; generate()
+# uses GENERATE_RECV_TIMEOUT_S instead.
 RECV_TIMEOUT_S = 60.0
+
+# Floor for generate()'s per-frame silence deadline when an engine does not pick
+# its own. It must never undercut model_manager.generate_timeout_s (300 s on an
+# accelerator, 600 s on CPU), so it sits at the CPU figure. A literal on purpose:
+# model_manager is only imported lazily here and its value is env-driven; a test
+# keeps the two aligned.
+GENERATE_RECV_TIMEOUT_S = 600.0
 
 
 # ── Idle sidecar reaping (parity Action 13) ─────────────────────────────────
@@ -350,6 +362,16 @@ def _heartbeat_while_resolving(engine_id: str):
         t.join()
 
 
+def bootstrap_python_hint(bootstrap) -> Optional[Path]:
+    """Return only an interpreter chosen by the bootstrap's import checks.
+
+    Candidate paths can exist but fail imports. Inventory must not select a
+    candidate itself or execute a potentially expensive bootstrap probe.
+    """
+    resolved = getattr(bootstrap, "_resolved_python", None)
+    return Path(resolved) if resolved is not None else None
+
+
 class SubprocessBackend(TTSBackend):
     """Long-lived sidecar-process TTS backend. Subclasses provide
     ``venv_python()`` and ``sidecar_script()``; the base class owns
@@ -372,23 +394,32 @@ class SubprocessBackend(TTSBackend):
     # Default sample rate; subclasses override.
     _DEFAULT_SAMPLE_RATE = 24000
 
-    # Per-engine recv timeout for generate(): how long the parent waits for the
-    # sidecar's audio frame before the watchdog hard-kills the child and reclaims
-    # its VRAM/device. Default is the conservative RECV_TIMEOUT_S (60s). A
-    # subclass whose legitimate generates run longer overrides it (or exposes it
-    # as a property) so a slow-but-valid synth is not falsely killed, while a
-    # genuinely wedged one is still reclaimed. health_check() keeps using
-    # RECV_TIMEOUT_S directly, since a ping must stay fast.
-    recv_timeout_s: float = RECV_TIMEOUT_S
+    # Seconds of sidecar silence generate() tolerates before killing it. The
+    # old default was the 60 s ping budget, which cut engines off mid-sentence
+    # (#2103). Engines may override with a class attribute or a property.
+    recv_timeout_s: float = GENERATE_RECV_TIMEOUT_S
+    # Gated weights need the official Hub and its credentials in auto mode.
+    requires_hf_auth: bool = False
 
     # ── instance state (initialised in __init__) ───────────────────────────
 
     def __init__(self) -> None:
+        from services.sidecar_revisions import current
+        self._sidecar_revision = current(self.id)
         self._proc: Optional[subprocess.Popen] = None
+        # A failed bounded reap must retain ownership and forbid reuse. This
+        # lock is separate from _lock: the receive owner joins its watchdog.
+        self._timeout_quarantine: list[subprocess.Popen] = []
+        self._timeout_quarantine_lock = threading.Lock()
         # Single lock serialises spawn + every send/recv pair so two threads
         # can't interleave half-frames on the same pipe.
         self._lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
+        # The current sidecar's last stderr lines and whether the last
+        # receive hit its deadline, so a failed ready handshake can say
+        # which way it failed (#2026).
+        self._stderr_tail: collections.deque = collections.deque(maxlen=_STDERR_TAIL_LINES)
+        self._last_recv_timed_out = False
         # Monotonic timestamp of the last sidecar activity, for the idle reaper
         # (parity Action 13). Registered in the weak live-backend set so the
         # reaper can find this instance's sidecar.
@@ -442,6 +473,52 @@ class SubprocessBackend(TTSBackend):
         raise NotImplementedError
 
     @classmethod
+    def shares_parent_torch(cls) -> bool:
+        """Whether the sidecar runs this process's interpreter, and so imports
+        this process's PyTorch build.
+
+        Must stay cheap and side-effect free: the Settings GPU report asks it
+        for every subprocess engine, so it may not resolve, probe or bootstrap
+        a venv the way some ``venv_python()`` implementations do. Subclasses
+        whose ``venv_python()`` can return ``sys.executable`` override it.
+        """
+        return False
+
+    @classmethod
+    def sidecar_python_hint(cls) -> Optional[Path]:
+        """The interpreter the sidecar would run, if it can be told cheaply.
+
+        Used only for routing metadata, so it must never spawn, probe or
+        bootstrap a venv (unlike some ``venv_python()`` implementations).
+        ``None`` means unknown. Subclasses with a cheap lookup override it.
+        """
+        return None
+
+    @classmethod
+    def _sidecar_torch_lacks_hip(cls) -> Optional[bool]:
+        """Return True for non-HIP Torch, or None when GPU execution is unverified."""
+        from services.sidecar_rocm_metadata import sidecar_torch_lacks_hip
+        return sidecar_torch_lacks_hip(cls)
+
+    @classmethod
+    def runtime_compute_profile(cls, caps) -> dict:
+        """Report unknown until separate sidecar GPU execution is verified."""
+        profile = super().runtime_compute_profile(caps)
+        compat = tuple(profile["gpu_compat"])
+        if caps.family == "rocm" and "rocm" in compat:
+            lacks_hip = cls._sidecar_torch_lacks_hip()
+            if lacks_hip is None:
+                profile.update(effective_device="unknown", routing_status="unknown",
+                               routing_reason=None, runtime_device_verified=False)
+            elif lacks_hip:
+                from services.engine_routing import resolve_routing
+                compat = tuple(c for c in compat if c != "rocm")
+                profile.update(gpu_compat=compat, **resolve_routing(
+                    compat, caps, profile["min_vram_gb"], parent_torch=False,
+                ))
+        return profile
+
+    @classmethod
     def sidecar_script(cls) -> Path:
         """Path to the sidecar entrypoint (`backend/engines/<id>/main.py`)."""
         raise NotImplementedError
@@ -451,8 +528,19 @@ class SubprocessBackend(TTSBackend):
     def _spawn(self) -> None:
         """Launch the sidecar if not already running. Blocks on the ready
         handshake. Caller must hold self._lock."""
+        if not self._retry_timeout_cleanup():
+            raise RuntimeError(
+                f"{self.id} sidecar is still stopping after a timeout; retry once it exits"
+            )
+        from services.sidecar_revisions import current
+        revision = current(self.id)
         if self._proc is not None and self._proc.poll() is None:
-            return  # already up
+            if self._sidecar_revision == revision:
+                return  # already up with the selected installation
+            self.shutdown()  # caller holds the request lock; no operation is interrupted
+        # Capture before resolving/spawning: a concurrent promotion must cause
+        # this process to be replaced on the next request, not lost in a race.
+        self._sidecar_revision = revision
 
         # Env forwarding contract (Locked Decision D5):
         #   - Inherit the parent's full env via os.environ.copy().
@@ -464,6 +552,19 @@ class SubprocessBackend(TTSBackend):
         #     past our length-prefix reads.
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Hub clients in sidecars read HF_ENDPOINT at import time. Forward the
+        # current download choice only to this child; setting it in the parent
+        # would turn an automatic selection into a manual override.
+        from services import endpoint_race
+        from services.hf_auth import env_allows_token
+
+        endpoint = endpoint_race.download_endpoint(gated=self.requires_hf_auth)
+        if endpoint:
+            env["HF_ENDPOINT"] = endpoint
+        if not env_allows_token(env):
+            env.pop("HF_TOKEN", None)
+            env.pop("YOUR_HF_TOKEN", None)
+            env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
         kwargs: dict = {
             "stdin": subprocess.PIPE,
@@ -494,7 +595,7 @@ class SubprocessBackend(TTSBackend):
         from services.binary_preflight import InvalidBinaryError, validate_executable
         _venv_hint = (
             f"the '{self.id}' engine's private environment is broken — "
-            f"reinstall the engine from Model Catalogue → Engines"
+            f"reinstall the engine from Model Catalogue"
         )
         validate_executable(python_path, hint=_venv_hint)
         # Basenames only — absolute paths embed the user's home directory,
@@ -505,6 +606,7 @@ class SubprocessBackend(TTSBackend):
         )
         try:
             self._proc = spawn_owned([python_path, script_path], **kwargs)
+            self._spawn_hf_endpoint = env.get("HF_ENDPOINT") or endpoint_race.CANONICAL_ENDPOINT
         except OSError as exc:
             raise InvalidBinaryError(
                 python_path,
@@ -516,8 +618,13 @@ class SubprocessBackend(TTSBackend):
         # a full pipe. Lines flow into the root logger; AUTH-05's
         # HFTokenRedactor (already installed in Phase 1) strips token bytes.
         # See T-02-03.
+        # A fresh buffer per process, owned by its drain thread: a previous
+        # process's drain that is still finishing writes to its own buffer,
+        # never into the one this start-up failure will quote.
+        self._stderr_tail = collections.deque(maxlen=_STDERR_TAIL_LINES)
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, daemon=True,
+            args=(self._proc, self._stderr_tail),
             name=f"{self.id}-stderr-drain",
         )
         self._stderr_thread.start()
@@ -530,18 +637,116 @@ class SubprocessBackend(TTSBackend):
             self._force_kill()
             raise
         if not frame or frame.get("op") != "ready":
+            # Read the cause before the kill: afterwards every child has
+            # an exit code, and it is ours.
+            reason = self._ready_failure_reason(frame)
             self._force_kill()
-            raise RuntimeError(
-                f"{self.id} sidecar did not signal ready: {frame!r}"
-            )
+            raise RuntimeError(f"{self.id} sidecar did not signal ready: {reason}")
         logger.info("[%s] sidecar ready", self.id)
         self._touch()
         _ensure_reaper_running()
+
+    def _ready_failure_reason(self, frame: Optional[dict]) -> str:
+        """Say which of the three handshake failures happened (#2026).
+
+        ``_recv`` returns None on EOF, and a watchdog kill closes stdout just
+        like a sidecar that crashed on its own, so the frame alone reads
+        ``None`` for both. The deadline flag, the child's exit code and its
+        last stderr lines tell them apart.
+        """
+        from core.scrub import scrub_text
+
+        if frame:
+            op = frame.get("op")
+            if op == "error":
+                message = scrub_text(str(frame.get("message") or ""))[:_STDERR_TAIL_CHARS]
+                reason = f"it reported an error instead: {message}"
+            else:
+                reason = f"it sent op={op!r} instead of 'ready' (a protocol mismatch)"
+        elif self._last_recv_timed_out:
+            reason = (
+                f"no ready frame within {self.spawn_ready_timeout_s:g}s, so it was stopped"
+            )
+        else:
+            code = None
+            proc = self._proc
+            if proc is not None:
+                try:
+                    code = proc.wait(timeout=2)
+                except Exception:
+                    code = proc.poll()
+            reason = (
+                f"it exited with code {code} before signalling ready"
+                if code is not None
+                else "it closed its output before signalling ready"
+            )
+        tail = self._stderr_tail_text()
+        return f"{reason}. Last stderr: {tail}" if tail else f"{reason} (no stderr output)"
+
+    def _effective_recv_timeout_s(self, text: str) -> float:
+        """How long generate() lets this sidecar stay silent for ``text``.
+
+        Engines that declare ``recv_timeout_s`` themselves (on any subclass
+        between the concrete class and ``SubprocessBackend``) are trusted as
+        is, even when the figure is lower than the shared budget. For the rest
+        the answer is the flat default, raised to the length-scaled budget from
+        model_manager when that is bigger. The scaled figure is only a hint, so
+        any problem computing it leaves the flat default in force.
+        """
+        flat = self.recv_timeout_s
+        declared_by_engine = any(
+            "recv_timeout_s" in vars(klass)
+            for klass in type(self).__mro__[: type(self).__mro__.index(SubprocessBackend)]
+        )
+        if declared_by_engine:
+            return flat
+        try:
+            from services.model_manager import generate_timeout_s
+
+            scaled = float(
+                generate_timeout_s(text, engine=self, _include_sidecar_grace=False)
+            )
+        except Exception:
+            return flat
+        return flat if not math.isfinite(scaled) else max(flat, scaled)
+
+    def _generate_failure_reason(self, elapsed_s: float, deadline_s: float) -> str:
+        """Error text for a sidecar that vanished while generate() waited on it."""
+        if self._last_recv_timed_out:
+            head = (
+                f"The {self.id} sidecar sent nothing for {deadline_s:g}s "
+                f"(request age {elapsed_s:.0f}s), so VoiceStudio stopped it. "
+                f"This engine may simply need longer on this hardware: retry, "
+                f"or give it a larger receive timeout (see Troubleshooting)"
+            )
+        else:
+            head = f"{self.id} sidecar closed pipe mid-generate"
+        stderr_tail = self._stderr_tail_text()
+        if stderr_tail:
+            head += f". Last stderr: {stderr_tail}"
+        return head
+
+    def _stderr_tail_text(self) -> str:
+        """The sidecar's last stderr lines, scrubbed for a user-visible error."""
+        from core.scrub import scrub_text
+
+        thread = self._stderr_thread
+        if thread is not None and thread.is_alive():
+            # The child is gone or going; let the drain catch its last lines.
+            thread.join(timeout=1.0)
+        lines = list(getattr(self, "_stderr_tail", ()))
+        if not lines:
+            return ""
+        text = scrub_text(" | ".join(lines))
+        if len(text) > _STDERR_TAIL_CHARS:
+            text = "…" + text[-_STDERR_TAIL_CHARS:]
+        return text
 
     def shutdown(self) -> None:
         """Idempotent. Sends {op:shutdown}; falls back to terminate/kill."""
         proc = self._proc
         if proc is None:
+            self._retry_timeout_cleanup()
             return
         try:
             try:
@@ -577,6 +782,7 @@ class SubprocessBackend(TTSBackend):
                         pass
         finally:
             self._proc = None
+            self._retry_timeout_cleanup()
 
     def _force_kill(self) -> None:
         """Internal: kill a sidecar that never reached the ready state."""
@@ -593,10 +799,6 @@ class SubprocessBackend(TTSBackend):
             pass
         finally:
             self._proc = None
-
-    def unload(self) -> None:
-        """TTSBackend.unload override — idempotent shutdown."""
-        self.shutdown()
 
     # ── health check + generate ────────────────────────────────────────────
 
@@ -622,16 +824,81 @@ class SubprocessBackend(TTSBackend):
                     except (TypeError, ValueError):
                         pass
                 return True, "pong"
-            return False, f"unexpected reply: {reply!r}"
+            result = (False, f"unexpected reply: {reply!r}")
         except Exception as exc:
-            return False, f"{type(exc).__name__}: {exc}"
+            result = (False, f"{type(exc).__name__}: {exc}")
+        self._log_health_failure(result[1])
+        return result
+
+    def _log_health_failure(self, message: str) -> None:
+        """Keep the reason in the local log. The HTTP route withholds engine
+        text from its response and log line, so without this a failed probe
+        could not be told apart from a missing install (#2837)."""
+        from core.scrub import scrub_text
+
+        logger.warning(
+            "[%s] health check failed: %s", self.id, scrub_text(str(message))[:_STDERR_TAIL_CHARS]
+        )
 
     def generate(self, text: str, **kw) -> torch.Tensor:
         """Synthesize one utterance through the sidecar.
 
         Returns a tensor of shape (1, n_samples) at the sidecar-reported
-        sample rate. Decodes the int16 PCM the sidecar returns into float32
-        in [-1, 1].
+        sample rate. Negotiates float32 with capable sidecars and accepts
+        legacy int16 frames from existing installations.
+        """
+        language = self._check_language(kw.get("language"))
+        msg = {"op": "synthesize", "text": text}
+        # Filter kwargs to JSON-safe primitives. Tensor / Path / etc.
+        # don't survive json.dumps and are silently dropped — the
+        # sidecar can't use them anyway.
+        for k, v in kw.items():
+            if _is_jsonable(v):
+                msg[k] = v
+        if language is not None:
+            # A finite engine gets the code it declared, not the picker
+            # name: sidecars parse codes, and "Standard Arabic" or
+            # "Chinese" would otherwise reach them as an unknown token
+            # (#3816). Open-ended engines keep the caller's value.
+            msg["language"] = language
+        if isinstance(msg.get("ref_audio"), str):
+            # Engine venvs may read only plain PCM WAV (#3688); decode here and
+            # hold the copy until the sidecar has answered.
+            from core.voice_leases import VoiceFileLease
+            from services.reference_wav import sidecar_reference_wav
+
+            with VoiceFileLease() as lease:
+                msg["ref_audio"] = sidecar_reference_wav(msg["ref_audio"], lease=lease)
+                return self._exchange(msg, deadline_text=text)
+        return self._exchange(msg, deadline_text=text)
+
+    def _retry_changed_download_endpoint(self, proc, reply: dict) -> bool:
+        """Retire a child pinned to a failed automatic endpoint. Caller holds _lock."""
+        from core.failure import is_hf_connectivity_error
+        from services import endpoint_race
+
+        previous = getattr(self, "_spawn_hf_endpoint", None)
+        reason = str(reply.get("message") or "") + "\n" + str(reply.get("traceback") or "")
+        if not previous or not is_hf_connectivity_error(reason) or endpoint_race.mode() != "auto":
+            return False
+        # No repository is exposed by the sidecar protocol; use one stable
+        # guard per engine so repeated failed calls cannot keep re-racing.
+        # Its result compares global endpoints, not the child's endpoint:
+        # another caller may already have selected a working route while
+        # this child still uses the failed one. Compare the actual child below.
+        endpoint_race.reselect_after_failure(f"sidecar:{self.id}", reason)
+        current = endpoint_race.download_endpoint(gated=self.requires_hf_auth) or endpoint_race.CANONICAL_ENDPOINT
+        if current.rstrip("/") == previous.rstrip("/"):
+            return False
+        self._reap_unusable_process(proc)
+        return True
+
+    def _exchange(self, msg: dict, *, deadline_text: str) -> torch.Tensor:
+        """One request/audio-reply round trip with the sidecar.
+
+        Shared by :meth:`generate` and other audio-producing ops (voice
+        conversion, #3421): same pool slot, watchdog, progress handling and
+        audio decoding.
         """
         # On-pool callers (every HTTP/dub/batch generate, dispatched via
         # run_on_gpu_pool_guarded) already own a pool slot; re-acquiring would
@@ -667,46 +934,82 @@ class SubprocessBackend(TTSBackend):
                     slot_future.cancel()
                 raise TimeoutError("timed out waiting for a free GPU worker")
             with self._lock:
-                self._validate_generate_authorization()
-                self._spawn()
-                msg = {"op": "synthesize", "text": text}
-                # Filter kwargs to JSON-safe primitives. Tensor / Path / etc.
-                # don't survive json.dumps and are silently dropped — the
-                # sidecar can't use them anyway.
-                for k, v in kw.items():
-                    if _is_jsonable(v):
-                        msg[k] = v
-                self._send(msg)
-                reply = self._recv_with_timeout(self.recv_timeout_s)
-                # A cold sidecar may emit non-terminal {"op": "progress"} frames
-                # (during a model load, etc.) before the terminal audio frame.
-                # Each recv re-arms the watchdog, so a long-but-active load
-                # survives while a silent wedge is still killed at the deadline.
-                #
-                # Each frame is also reported to the GPU pool's execution clock
-                # (#1367): the sidecar heartbeats every ~5s precisely to prove a
-                # cold download is healthy, and without this the outer 300s
-                # generate budget expired mid-download and blamed the hardware.
-                while reply is not None and reply.get("op") == "progress":
+                for endpoint_attempt in range(2):
+                    self._validate_generate_authorization()
+                    self._spawn()
+                    # getattr keeps lightweight protocol-loop test doubles valid;
+                    # real instances always initialise _proc in __init__.
+                    proc = getattr(self, "_proc", None)
+                    if getattr(self, "supports_float_transport", False):
+                        msg["audio_format"] = "f32le"
+                    deadline_s = self._effective_recv_timeout_s(deadline_text)
+                    started_at = time.monotonic()
                     try:
-                        from services.model_manager import (
-                            report_model_load_activity, running_on_gpu_pool,
+                        self._send(msg)
+                        reply = self._recv_with_timeout(deadline_s)
+                    except (RuntimeError, OSError):
+                        # A broken stream cannot be reused; reap before the lock is
+                        # released so an immediate retry cannot race poll().
+                        self._reap_unusable_process(proc)
+                        raise
+                    # A cold sidecar may emit non-terminal {"op": "progress"} frames
+                    # (during a model load, etc.) before the terminal audio frame.
+                    # Each recv re-arms the watchdog, so a long-but-active load
+                    # survives while a silent wedge is still killed at the deadline.
+                    #
+                    # Each frame is also reported to the GPU pool's execution clock
+                    # (#1367): the sidecar heartbeats every ~5s precisely to prove a
+                    # cold download is healthy, and without this the outer 300s
+                    # generate budget expired mid-download and blamed the hardware.
+                    while reply is not None and reply.get("op") == "progress":
+                        try:
+                            from services.model_manager import (
+                                report_model_load_activity, running_on_gpu_pool,
+                            )
+                            # Pool jobs only: an off-pool caller (the diagnostic
+                            # probe) never runs _job(), so its thread ident would
+                            # never be cleared — and a pool worker later reusing
+                            # that ident would inherit up to a grace period of
+                            # unearned extension (CodeRabbit on #1379).
+                            #
+                            # Only COLD-LOAD frames are load evidence. A sidecar may
+                            # also heartbeat while it generates (so a slow CPU render
+                            # is not mistaken for a hang by the recv watchdog), but a
+                            # timer thread proves nothing about synthesis progress:
+                            # crediting it would let a stalled native generate hold
+                            # its GPU worker past the execution budget (#2435).
+                            if running_on_gpu_pool() and reply.get("stage") != "generating":
+                                report_model_load_activity()
+                        except Exception:
+                            pass  # the heartbeat is best-effort; never fail a synth over it
+                        try:
+                            reply = self._recv_with_timeout(deadline_s)
+                        except (RuntimeError, OSError):
+                            self._reap_unusable_process(proc)
+                            raise
+                    if not reply:
+                        reason = self._generate_failure_reason(
+                            time.monotonic() - started_at, deadline_s
                         )
-                        # Pool jobs only: an off-pool caller (the diagnostic
-                        # probe) never runs _job(), so its thread ident would
-                        # never be cleared — and a pool worker later reusing
-                        # that ident would inherit up to a grace period of
-                        # unearned extension (CodeRabbit on #1379).
-                        if running_on_gpu_pool():
-                            report_model_load_activity()
-                    except Exception:
-                        pass  # the heartbeat is best-effort; never fail a synth over it
-                    reply = self._recv_with_timeout(self.recv_timeout_s)
-            if not reply:
-                raise RuntimeError(f"{self.id} sidecar closed pipe mid-generate")
+                        self._reap_unusable_process(proc)
+                        raise RuntimeError(reason)
+                    if (endpoint_attempt == 0 and reply.get("op") == "error"
+                            and self._retry_changed_download_endpoint(proc, reply)):
+                        continue
+                    break
             if reply.get("op") == "error":
+                stage = str(reply.get("stage") or "unknown")
+                message = str(reply.get("message") or "unknown sidecar error")
+                traceback_text = str(reply.get("traceback") or "").strip()
+                logger.error(
+                    "[%s] sidecar %s error: %s%s",
+                    self.id,
+                    stage,
+                    message,
+                    f"\n{traceback_text[:20_000]}" if traceback_text else "",
+                )
                 raise RuntimeError(
-                    f"{self.id} sidecar error: {reply.get('message')!r}"
+                    f"{self.id} sidecar {stage} error: {message}"
                 )
             if reply.get("op") != "audio":
                 raise RuntimeError(
@@ -714,7 +1017,15 @@ class SubprocessBackend(TTSBackend):
                 )
             pcm_b64 = reply.get("audio_pcm_b64", "")
             pcm = base64.b64decode(pcm_b64)
-            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            audio_format = reply.get("audio_format", "s16le")
+            if audio_format == "f32le":
+                arr = np.frombuffer(pcm, dtype="<f4")
+            elif audio_format == "s16le":
+                arr = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+            else:
+                raise RuntimeError(f"Unsupported sidecar audio format: {audio_format!r}")
+            if not np.isfinite(arr).all():
+                raise RuntimeError("Sidecar returned non-finite audio samples")
             tensor = torch.from_numpy(arr.copy()).unsqueeze(0)
             return tensor
         finally:
@@ -755,7 +1066,10 @@ class SubprocessBackend(TTSBackend):
         if header is None:
             return None
         (n,) = struct.unpack("!I", header)
-        if n > MAX_FRAME_BYTES:
+        # Float samples occupy twice the PCM16 payload. Keep the previous
+        # maximum audio duration while retaining a bounded allocation guard.
+        response_limit = MAX_FRAME_BYTES * (2 if getattr(self, "supports_float_transport", False) else 1)
+        if n > response_limit:
             # T-02-01 — refuse to allocate before the body even arrives.
             raise IOError(f"frame too large: {n}")
         body = _read_exact(stdout, n)
@@ -777,49 +1091,127 @@ class SubprocessBackend(TTSBackend):
         return msg
 
     def _recv_with_timeout(self, timeout_s: float) -> Optional[dict]:
-        """Recv that aborts if the sidecar goes silent.
+        """Read one frame, finishing timeout cleanup before the caller can retry.
 
-        Implemented by polling the proc for liveness with a deadline. We
-        don't block on a `select` of the pipe because Windows can't select
-        on subprocess pipes — keeping the implementation cross-platform
-        means a simpler polling loop here.
+        A watchdog closes the pipe on timeout; Windows cannot select on pipes.
+        EOF alone does not prove the owned process/supervisor has exited.
         """
         # On Unix we could use selectors; on Windows the pipe is not
         # selectable. Use a watchdog thread that kills the sidecar on
         # timeout — that triggers EOF on stdout, so _recv returns None
         # and the caller raises.
-        watchdog = threading.Timer(timeout_s, self._timeout_kill)
-        watchdog.daemon = True
+        proc = self._proc
+        fired = threading.Event()
+
+        def _on_timeout() -> None:
+            fired.set()
+            self._timeout_kill(proc)
+
+        from services.inference_cancellation import current_cancellation
+        cancellation = current_cancellation()
+        stop_watchdog = threading.Event()
+
+        def _watch() -> None:
+            deadline = time.monotonic() + timeout_s
+            while not stop_watchdog.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (cancellation and cancellation.cancelled.is_set()):
+                    _on_timeout()  # captured process only; never a later retry
+                    return
+                stop_watchdog.wait(min(remaining, 0.05))
+
+        if cancellation is None:
+            watchdog = threading.Timer(timeout_s, _on_timeout)
+            watchdog.daemon = True
+        else:
+            watchdog = threading.Thread(target=_watch, daemon=True)
         watchdog.start()
         try:
             return self._recv()
         finally:
-            watchdog.cancel()
+            stop_watchdog.set()
+            if cancellation is None:
+                watchdog.cancel()
+            # cancel() cannot stop an already-running callback. Finish its
+            # bounded reap before another receive or generation starts.
+            watchdog.join()
+            # EOF reads the same after a deadline kill and after a crash;
+            # this is what tells the two apart (#2026).
+            self._last_recv_timed_out = fired.is_set()
             self._touch()  # any reply (or attempt) counts as recent activity
 
-    def _timeout_kill(self) -> None:
-        proc = self._proc
+    def _timeout_kill(self, proc: Optional[subprocess.Popen]) -> None:
+        """Kill only the child this receive captured, then reap its owner."""
+        if proc is None:
+            return
+        logger.error("[%s] sidecar exceeded recv timeout; killing", self.id)
+        try:
+            proc.kill()
+        except Exception:
+            # A raced exit can make kill fail, but its owner still needs reaping.
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            # Do not discard a possibly live owner, or replace a newer _proc.
+            with self._timeout_quarantine_lock:
+                if not any(item is proc for item in self._timeout_quarantine):
+                    self._timeout_quarantine.append(proc)
+        else:
+            with self._timeout_quarantine_lock:
+                self._timeout_quarantine = [
+                    item for item in self._timeout_quarantine if item is not proc
+                ]
+
+    def _reap_unusable_process(self, proc: Optional[subprocess.Popen]) -> None:
+        """Synchronously retire a sidecar whose protocol pipe is unusable."""
         if proc is None:
             return
         try:
-            logger.error(
-                "[%s] sidecar exceeded recv timeout; killing",
-                self.id,
-            )
-            proc.kill()
+            proc.wait(timeout=0.25)
         except Exception:
-            pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                with self._timeout_quarantine_lock:
+                    if not any(item is proc for item in self._timeout_quarantine):
+                        self._timeout_quarantine.append(proc)
+                return
+        with self._timeout_quarantine_lock:
+            self._timeout_quarantine = [
+                item for item in self._timeout_quarantine if item is not proc
+            ]
+
+    def _retry_timeout_cleanup(self) -> bool:
+        """Retry bounded cleanup, retaining every owner that could still be live."""
+        with self._timeout_quarantine_lock:
+            pending = tuple(self._timeout_quarantine)
+        for proc in pending:
+            self._timeout_kill(proc)
+        with self._timeout_quarantine_lock:
+            return not self._timeout_quarantine
 
     # ── stderr drain ───────────────────────────────────────────────────────
 
-    def _drain_stderr(self) -> None:
+    def _drain_stderr(
+        self,
+        proc: Optional[subprocess.Popen] = None,
+        tail: Optional[collections.deque] = None,
+    ) -> None:
         """Pump sidecar stderr lines into the parent logger.
 
-        Prefixes each line with `[<engine_id>]`. The HFTokenRedactor filter
-        installed at the root logger in Phase 1 redacts any token bytes
-        that slip through. See T-02-03.
+        Scrub home paths and secrets before either logging or buffering, then
+        prefix each line with `[<engine_id>]`.
         """
-        proc = self._proc
+        from core.scrub import scrub_text
+        # Bound at spawn: a drain thread that starts late must still read
+        # its own process, never a replacement published since (#2026).
+        if proc is None:
+            proc = self._proc
         if proc is None or proc.stderr is None:
             return
         try:
@@ -828,10 +1220,13 @@ class SubprocessBackend(TTSBackend):
                     line = raw.decode("utf-8", errors="replace").rstrip()
                 except Exception:
                     line = repr(raw)
+                line = scrub_text(line)
                 if line:
                     logger.info("[%s] %s", self.id, line)
+                    if tail is not None:
+                        tail.append(line)
         except Exception as exc:
-            logger.debug("[%s] stderr drain ended: %s", self.id, exc)
+            logger.debug("[%s] stderr drain ended: %s", self.id, scrub_text(str(exc)))
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

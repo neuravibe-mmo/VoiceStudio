@@ -15,18 +15,21 @@ Environment variables (`OMNIVOICE_TTS_BACKEND`, `OMNIVOICE_ASR_BACKEND`,
 `OMNIVOICE_LLM_BACKEND`) still win over the UI choice so power-users can pin
 a backend without Settings silently undoing it.
 """
+import asyncio
 import logging
 import os
+import re
 import threading
-from time import perf_counter
+from time import monotonic, perf_counter
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from huggingface_hub import utils as hf_utils
 from huggingface_hub.errors import HFValidationError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from api.dependencies import require_admin, require_admin_action, require_desktop
+from api.dependencies import require_admin, require_admin_action, require_desktop, is_loopback
 from core import prefs
+from core.engine_licenses import LICENSE_GATED_ENGINES
 from services import tts_backend, asr_backend, llm_backend, translation_engines
 from services.audio_dsp import list_effect_presets
 from api.schemas import EffectPresetsResponse
@@ -42,12 +45,75 @@ _FAMILIES = {
 }
 
 
+def _visible_active_backend(family: str, selected_id: str) -> str:
+    should_translate = family == "tts" and selected_id == "omnivoice-subprocess"
+    if not should_translate:
+        return selected_id
+    try:
+        from core.device_caps import detect_host_caps
+        host_family = detect_host_caps().family
+    except Exception:
+        return selected_id
+    return "omnivoice" if host_family == "mps" else selected_id
+
+
 def _family_payload(family: str, module):
     """Public inventory plus whether an environment pin owns this family."""
+    configured_id = module.active_backend_id()
+    # Older MPS preferences point at a valid but deliberately unlisted alias.
+    active = _visible_active_backend(family, configured_id)
+    model = None
+    if family == "asr":
+        model = asr_backend._offline_asr_repo(active)
+    elif family == "llm" and active != "off":
+        from services import llm_providers
+        provider = llm_providers.active_provider()
+        model = llm_providers.configured_model(provider) if provider else None
+    elif family == "tts":
+        if active in {"omnivoice", "omnivoice-subprocess"}:
+            from services.model_manager import resolve_omnivoice_checkpoint
+            model = resolve_omnivoice_checkpoint()
+        elif active == "mlx-audio":
+            from core import prefs
+            cls = tts_backend.MLXAudioBackend
+            key = prefs.resolve("mlx_audio_model_id", env="OMNIVOICE_MLX_AUDIO_MODEL", default=cls.DEFAULT_MODEL_KEY)
+            model = cls.CURATED_MODELS.get(key, key)
+        else:
+            instance = getattr(tts_backend, "_active_instance", None)
+            if instance is not None and getattr(tts_backend, "_active_instance_id", None) == active:
+                model = instance.model_identity()
+    backends = public_backends(module.list_backends())
+    if family == "tts":
+        from services import settings_store
+
+        for backend in backends:
+            engine_id = backend.get("id")
+            if engine_id == active:
+                backend["output_sample_rate"] = tts_backend.output_sample_rate(active)
+                # TTSBackend's output contract is mono; unknown formats stay unknown.
+                backend["output_channels"] = 1 if backend["output_sample_rate"] else None
+            if engine_id == active:
+                backend["supported_language_names"] = tts_backend.language_options(active)
+                backend["rendered_dialects"] = tts_backend.rendered_dialects(active)
+            if engine_id == active == "mlx-audio":
+                # Constructor resolves model preferences only; never loads weights.
+                backend["supports_cloning"] = tts_backend.MLXAudioBackend().supports_cloning
+            if engine_id in LICENSE_GATED_ENGINES:
+                backend["license_required"] = True
+                try:
+                    backend["license_accepted"] = settings_store.get_license_accepted(engine_id)
+                except Exception:
+                    logger.warning(
+                        "Could not read license acceptance for %s",
+                        engine_id,
+                        exc_info=True,
+                    )
+                    backend["license_accepted"] = False
     return {
-        "active": module.active_backend_id(),
+        "active": active,
+        "active_model": model,
         "env_override": bool(os.environ.get(f"OMNIVOICE_{family.upper()}_BACKEND")),
-        "backends": public_backends(module.list_backends()),
+        "backends": backends,
     }
 
 def _is_hf_repo_id(value: str) -> bool:
@@ -61,18 +127,29 @@ def _is_hf_repo_id(value: str) -> bool:
     return True
 
 
+def _request_install_capability(payload, request):
+    allowed = bool(request and request.client and is_loopback(request.client.host))
+    result = dict(payload)
+    result["backends"] = [dict(entry) for entry in payload["backends"]]
+    for entry in result["backends"]:
+        if entry.get("one_click_install") and not allowed:
+            entry["one_click_install"] = False
+            entry["local_install_required"] = True
+    return result
+
+
 @router.get("/engines")
-def list_all_engines():
+def list_all_engines(request: Request):
     return {
-        "tts": _family_payload("tts", tts_backend),
+        "tts": _request_install_capability(_family_payload("tts", tts_backend), request),
         "asr": _family_payload("asr", asr_backend),
         "llm": _family_payload("llm", llm_backend),
     }
 
 
 @router.get("/engines/tts")
-def list_tts_backends():
-    return _family_payload("tts", tts_backend)
+def list_tts_backends(request: Request):
+    return _request_install_capability(_family_payload("tts", tts_backend), request)
 
 
 @router.get(
@@ -110,6 +187,90 @@ def list_effects_presets():
     return {"presets": list_effect_presets()}
 
 
+@router.get("/engines/diarisation")
+def diarisation_status():
+    """Describe the selected local diarisation runtime without loading weights."""
+    from services.diarization_runtime import (
+        PYANNOTE,
+        SORTFORMER,
+        selected_backend,
+        sortformer_status,
+    )
+
+    selected = selected_backend()
+    native = selected == SORTFORMER
+    options = []
+    from api.routers.setup.models import KNOWN_MODELS, cache_is_complete, is_cached
+    pyannote_repo = "pyannote/speaker-diarization-3.1"
+    spec = next(model for model in KNOWN_MODELS if model["repo_id"] == pyannote_repo)
+    pyannote_installed = is_cached(pyannote_repo) and cache_is_complete(spec)
+    pyannote_reason = None if pyannote_installed else "Install the pyannote model bundle"
+    options.append({
+        "id": PYANNOTE,
+        "label": "pyannote 3.1",
+        "model": pyannote_repo,
+        "installed": pyannote_installed,
+        "reason": pyannote_reason,
+    })
+
+    native_status = sortformer_status()
+    native_installed = native_status["installed"]
+    native_model = native_status["model"]
+    native_reason = native_status["reason"]
+    options.append({
+        "id": SORTFORMER,
+        "label": "Sortformer v1 (audio.cpp)",
+        "model": native_model,
+        "model_installed": native_status["model_installed"],
+        "runtime_installed": native_status["runtime_installed"],
+        "installed": native_installed,
+        "reason": native_reason,
+    })
+
+    if native:
+        from services.diarization_native import is_running
+        return {"active": SORTFORMER, "label": "Sortformer v1 (audio.cpp)",
+                "model": native_model, "installed": native_installed, "loaded": False,
+                "model_installed": native_status["model_installed"],
+                "runtime_installed": native_status["runtime_installed"],
+                "busy": is_running(), "reason": native_reason, "options": options}
+    from services import model_manager
+    return {"active": PYANNOTE, "label": "pyannote 3.1", "model": pyannote_repo,
+            "installed": pyannote_installed,
+            "loaded": model_manager._diar_pipeline is not None, "reason": pyannote_reason,
+            "options": options}
+
+
+class DiarisationSelection(BaseModel):
+    engine_id: str
+
+
+@router.post("/engines/diarisation/select", dependencies=[Depends(require_admin)])
+def select_diarisation_engine(request: DiarisationSelection):
+    """Persist an installed diarisation runtime; environment overrides still win."""
+    from services.diarization_runtime import SORTFORMER, select_backend, selected_backend
+
+    status = diarisation_status()
+    option = next(
+        (item for item in status["options"] if item["id"] == request.engine_id),
+        None,
+    )
+    if option is None:
+        raise HTTPException(404, "Unknown diarisation engine")
+    if not option["installed"]:
+        raise HTTPException(409, option.get("reason") or "Install this diarisation engine first")
+    select_backend(request.engine_id)
+    if request.engine_id == SORTFORMER:
+        # Native Sortformer is stateless. Release a previously loaded pyannote
+        # pipeline so Engine Ready cannot hide stale accelerator memory.
+        from services import model_manager
+        model_manager.unload_diarization_pipeline()
+    return {
+        "active": selected_backend(),
+        "env_override": bool(os.environ.get("OMNIVOICE_DIARIZATION_BACKEND")),
+    }
+
+
 @router.get("/engines/translation")
 def list_translation_engines():
     """Translation engines with per-engine pip-package availability.
@@ -120,12 +281,96 @@ def list_translation_engines():
     an engine whose Python dependency isn't importable yet.
     """
     return {
+        "active": prefs.get("translation_backend", "argos"),
         "engines": [
             {**entry, "availability_reason": public_unavailability(entry.get("availability_reason"))}
             for entry in translation_engines.list_engines()
         ],
         "sandboxed": translation_engines.is_frozen(),
     }
+
+
+class TranslationSelection(BaseModel):
+    engine_id: str
+
+
+class ArgosPackRequest(BaseModel):
+    source_lang: str | None = None
+    target_langs: list[str] = Field(min_length=1, max_length=32)
+    job_id: str | None = None
+
+
+def _argos_pack_request(request: ArgosPackRequest) -> tuple[str, list[str]]:
+    source = request.source_lang
+    if not source and request.job_id:
+        from api.routers.dub_core import _get_job
+
+        job = _get_job(request.job_id)
+        source = job.get("source_lang") if job else None
+    if not source:
+        # The job can already be transcribed while its source language is
+        # still unknown (a whisper.cpp run without language metadata), so
+        # "transcribe the source first" is the wrong advice - the remedy is
+        # choosing the source language. Same structured code the translation
+        # path answers with, so the app can localize one guidance string.
+        raise HTTPException(
+            422,
+            detail={
+                "code": "source_language_required",
+                "message": (
+                    "Source language is unknown. Select the source language "
+                    "before checking or installing its language pack."
+                ),
+            },
+        )
+    return source, request.target_langs
+
+
+@router.post(
+    "/engines/translation/argos/packs/status",
+    dependencies=[Depends(require_admin)],
+)
+def argos_pack_status(request: ArgosPackRequest):
+    source, targets = _argos_pack_request(request)
+    try:
+        return translation_engines.argos_pack_status(source, targets)
+    except (ImportError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/engines/translation/argos/packs/install",
+    dependencies=[Depends(require_admin)],
+)
+async def install_argos_packs(request: ArgosPackRequest):
+    source, targets = _argos_pack_request(request)
+    try:
+        return await asyncio.to_thread(
+            translation_engines.install_argos_packs,
+            source,
+            targets,
+        )
+    except (ImportError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/engines/translation/select", dependencies=[Depends(require_admin)])
+def select_translation_engine(request: TranslationSelection):
+    entry = translation_engines.get_engine(request.engine_id)
+    if not entry:
+        raise HTTPException(404, "Unknown translation engine")
+    if not translation_engines.is_installed(request.engine_id):
+        raise HTTPException(409, "Install this translation engine before selecting it")
+    if not translation_engines.is_ready(request.engine_id):
+        raise HTTPException(409, "Configure this translation provider before selecting it")
+    if request.engine_id == "amazon":
+        from services.translation_apis import AmazonConfigurationError, validate_amazon_configuration
+        try:
+            validate_amazon_configuration()
+        except AmazonConfigurationError as exc:
+            raise HTTPException(409, exc.public_message) from None
+    prefs.set_("translation_backend", request.engine_id)
+    return {"active": request.engine_id}
 
 
 @router.post(
@@ -188,10 +433,121 @@ async def uninstall_translation_engine(engine_id: str):
     pkg = entry.get("pip_package")
     if not pkg:
         return {"status": "no_op", "engine": engine_id}
+    # The builtin flag is a promise someone has to remember to make; this
+    # check does not depend on it (#2019).
+    blocked = translation_engines.uninstall_blocker(engine_id)
+    if blocked:
+        raise HTTPException(status_code=blocked[0], detail=blocked[1])
     rc, out = await translation_engines.run_pip(["uninstall", "-y", pkg])
     if rc != 0:
         raise HTTPException(status_code=500, detail=f"pip uninstall {pkg} failed ({rc}): {out[-1000:]}")
     return {"status": "uninstalled", "engine": engine_id, "package": pkg, "log_tail": out[-800:]}
+
+
+# ── Checksummed native audio.cpp runtime install ───────────────────────────
+
+
+@router.get(
+    "/engines/audiocpp/runtime/install/status",
+    dependencies=[Depends(require_admin)],
+)
+def audiocpp_runtime_install_status(request: Request):
+    from services import audiocpp_runtime_install
+
+    return {**audiocpp_runtime_install.status(), "install_allowed": bool(request.client and is_loopback(request.client.host))}
+
+
+@router.post(
+    "/engines/audiocpp/runtime/install",
+    dependencies=[Depends(require_admin), Depends(require_desktop)],
+)
+def install_audiocpp_runtime():
+    from services import audiocpp_runtime_install
+
+    try:
+        return audiocpp_runtime_install.start_install()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+# ── OmniVoice GGUF quant picker + weight prefetch ──────────────────────────
+#
+# The engine sizes its quant on the verified native GPU (Vulkan) and fetches
+# the pair on first generate. These routes let Settings › Models show that
+# choice, pin a larger (or smaller) quant, and download it ahead of time.
+# A download starts only on an explicit POST.
+
+
+class GGUFQuantRequest(BaseModel):
+    quant: str | None = Field(
+        default=None,
+        max_length=128,
+        description='"auto", a quant tag (Q4_K_M, Q8_0, BF16, F32) or its base '
+        "filename; omitted on download means the selected quant.",
+    )
+
+
+@router.get("/engines/omnivoice-gguf/quants")
+def omnivoice_gguf_quants():
+    from engines.omnivoice_gguf import quants
+
+    return quants.quant_status()
+
+
+@router.post("/engines/omnivoice-gguf/quants/select", dependencies=[Depends(require_admin)])
+def select_omnivoice_gguf_quant(req: GGUFQuantRequest):
+    from engines.omnivoice_gguf import quants
+
+    try:
+        quants.select_quant(req.quant or "auto")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unknown OmniVoice GGUF quant") from exc
+    return quants.quant_status()
+
+
+@router.post("/engines/omnivoice-gguf/quants/download", dependencies=[Depends(require_admin)])
+def download_omnivoice_gguf_quant(req: GGUFQuantRequest):
+    from api.routers.setup.models import disk_space_error
+    from engines.omnivoice_gguf import quants
+
+    target = None if req.quant in (None, "auto") else req.quant
+    size = quants.approx_bytes(target)
+    if target is not None and not size:
+        raise HTTPException(status_code=400, detail=f"Unknown OmniVoice GGUF quant {target!r}")
+    no_space = disk_space_error(size)
+    if no_space:
+        raise HTTPException(status_code=507, detail=no_space)
+    try:
+        return quants.start_download(target)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unknown OmniVoice GGUF quant") from exc
+
+
+class GGUFGpuOfferAnswer(BaseModel):
+    accept: bool
+
+
+@router.get("/engines/omnivoice-gguf/gpu-offer")
+def omnivoice_gguf_gpu_offer():
+    """The one-time "use your GPU?" offer: eligibility, GPU, quant, download size."""
+    from engines.omnivoice_gguf import gpu_offer
+
+    return gpu_offer.offer_status()
+
+
+@router.post("/engines/omnivoice-gguf/gpu-offer", dependencies=[Depends(require_admin)])
+def answer_omnivoice_gguf_gpu_offer(req: GGUFGpuOfferAnswer):
+    """Accept (switch to GGUF on Vulkan and fetch the weights) or decline the
+    offer. An unaccepted model licence answers 403 so the app shows its
+    licence dialog first."""
+    from engines.omnivoice_gguf import gpu_offer
+
+    try:
+        return gpu_offer.respond(req.accept)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail="GPU acceleration is not available on this machine",
+        ) from exc
 
 
 # ── One-click sidecar-engine install (IndexTTS-2 & friends) ────────────────
@@ -199,7 +555,7 @@ async def uninstall_translation_engine(engine_id: str):
 # Sidecar engines (dedicated venv + source checkout + weights, isolated from
 # the parent's transformers>=5.3) used to require four manual terminal steps.
 # These routes drive services.sidecar_install: POST starts a resumable
-# background job, GET polls its step-by-step status (the Model Catalogue → Engines
+# background job, GET polls its step-by-step status (the Model Catalogue
 # Install button polls this), DELETE removes an app-managed install.
 #
 # Path namespace: /engines/sidecar/{engine_id}/… — NOT /engines/{engine_id}/…
@@ -230,6 +586,11 @@ def install_sidecar_engine(engine_id: str):
     from services import sidecar_install
     try:
         return sidecar_install.start_install(engine_id)
+    except sidecar_install.HostUnsupported as exc:
+        # The engine has an installer, but not one that can work on this
+        # machine. 409, not 404: the route is right, the host is the problem,
+        # and the message (a VoiceStudio-owned sentence) says what to do.
+        raise HTTPException(status_code=409, detail=str(exc))
     except KeyError:
         raise HTTPException(
             status_code=404,
@@ -246,16 +607,16 @@ def install_sidecar_engine(engine_id: str):
     "/engines/sidecar/{engine_id}/install/status",
     dependencies=[Depends(require_admin)],
 )
-def sidecar_install_status(engine_id: str):
+def sidecar_install_status(engine_id: str, request: Request = None):
     """Step-by-step status of the sidecar install job (poll while running).
 
-    Shape: ``{engine_id, installed, managed, install_dir, job}`` where job is
+    Shape: ``{engine_id, installed, repair_available, managed, install_dir, job}`` where job is
     null before the first run, else ``{state, steps[], log[], error,
     remediation, weights_progress, started_at, finished_at}``.
     """
     from services import sidecar_install
     try:
-        return sidecar_install.get_status(engine_id)
+        return {**sidecar_install.get_status(engine_id), "install_allowed": bool(request and request.client and is_loopback(request.client.host))}
     except KeyError:
         raise HTTPException(
             status_code=404,
@@ -321,11 +682,12 @@ def _resolve_engine_class(engine_id: str):
     tts → asr → llm so the most-common case (TTS engine matrix) wins
     early. No collision risk today — all current ids are family-unique.
     """
-    for registry in (
-        tts_backend._REGISTRY,
-        asr_backend._REGISTRY,
-        llm_backend._REGISTRY,
-    ):
+    if engine_id in tts_backend._REGISTRY:
+        # Managed installs keep the public id but run from a private venv.
+        # Probe the same effective class that generation and the catalogue use,
+        # not the unavailable in-process adapter stored in the raw registry.
+        return tts_backend.get_backend_class(engine_id)
+    for registry in (asr_backend._REGISTRY, llm_backend._REGISTRY):
         if engine_id in registry:
             return registry[engine_id]
     return None
@@ -354,16 +716,24 @@ def engine_health(engine_id: str):
         )
 
     t0 = perf_counter()
+    # Stable exception class when the probe itself raised, None when it merely
+    # returned not-available. Never the exception text — see the log line below.
+    raised_class: str | None = None
     if hasattr(cls, "health_check"):
         # SubprocessBackend path — spawn sidecar (if not running) and ping.
         # ``health_check`` already swallows its own exceptions per Plan
         # 02-01's contract; we still wrap in a defensive try so a custom
         # subclass that violates the contract can't 500 the endpoint.
+        from services.model_acceptance import ModelLicenceNotAccepted
+
         try:
             instance = _get_engine_instance(cls)
             ok, msg = instance.health_check()
+        except ModelLicenceNotAccepted:
+            raise  # the structured 403: spawning the sidecar would load the model
         except Exception as exc:
             ok, msg = False, f"{type(exc).__name__}: {exc}"
+            raised_class = type(exc).__name__
     else:
         # In-process backend — `is_available()` is the classmethod-level
         # liveness check. Cheap and side-effect-free for every shipping
@@ -372,6 +742,7 @@ def engine_health(engine_id: str):
             ok, msg = cls.is_available()
         except Exception as exc:
             ok, msg = False, f"{type(exc).__name__}: {exc}"
+            raised_class = type(exc).__name__
 
     # Engine-owned output can contain much more than shaped HF tokens: local
     # paths, arbitrary credentials, source lines, or a nested traceback.
@@ -379,7 +750,38 @@ def engine_health(engine_id: str):
 
     latency_ms = (perf_counter() - t0) * 1000.0
     if not ok:
-        logger.warning("Engine health check failed; details withheld")
+        # The response tells the user to "check the backend log for details",
+        # and docs/engines/*.md asks a user diagnosing an unavailable engine to
+        # copy that engine's log lines. The old line named neither the engine
+        # nor anything about the probe, so neither instruction could be
+        # followed (#1866).
+        #
+        # `probe=` reports what the PROBE DID, not what went wrong. It cannot
+        # classify the cause: SubprocessBackend.health_check() swallows its own
+        # exceptions per Plan 02-01's contract, so a dead sidecar and a package
+        # that was never installed both arrive here as `returned-unavailable`.
+        # Separating those needs structured failure metadata from the probes
+        # themselves, which is a wider change than this one.
+        #
+        # Still no diagnostic text and still not the caller-supplied id: the
+        # engine id comes off the resolved registry class and a raised probe
+        # contributes only its exception class, the same shape
+        # core.public_errors.public_failure() logs as `class=`.
+        # tests/test_response_safety.py pins that boundary and passes
+        # unchanged.
+        #
+        # The id is a class attribute off the registry rather than caller
+        # input, but this line is a log-injection surface either way, so it is
+        # flattened to a single token before it goes in.
+        engine_label = str(getattr(cls, "id", None) or cls.__name__)
+        engine_label = "".join(
+            c if (c.isalnum() or c in "-_.") else "-" for c in engine_label
+        )[:64]
+        logger.warning(
+            "Engine health check failed; engine=%s probe=%s, details withheld",
+            engine_label or "unknown",
+            f"raised:{raised_class}" if raised_class else "returned-unavailable",
+        )
     return {
         "id": engine_id,
         "ok": bool(ok),
@@ -395,18 +797,25 @@ def engine_health(engine_id: str):
 # route goes one step further: for an AVAILABLE, IN-PROCESS TTS engine it runs
 # a *tiny real synthesis* from a fixed short phrase and reports duration +
 # sample-rate + sample count, proving the engine actually emits audio rather
-# than merely importing. The Compat Matrix's "Self-test" button calls it.
+# than merely importing. The Compat Matrix's "Self-test" button and the
+# OmniVoice GGUF row in Settings › Models call it.
 #
 # Guardrails (kept identical across macOS/Windows/Linux per the default-feature
 # rule — the phrase, timeout and gating don't branch on OS):
 #   * TTS family + available + in-process only. Subprocess engines keep their
 #     spawn-and-ping ``health_check`` (a real synth there is a sidecar
 #     cold-start — out of scope for a click-to-test affordance).
+#   * An engine with ``selftest_generate`` (OmniVoice GGUF, which drives a
+#     native CLI) runs that instead: one bounded per-request run that returns
+#     its own runtime log, so the response can name the Vulkan device used.
 #   * Bounded wall-clock timeout (``OMNIVOICE_SELFTEST_TIMEOUT_S``, default 90s):
 #     a runaway synth returns ``ok=False`` / ``timed_out=True`` instead of
-#     hanging the Settings panel. The orphaned worker is best-effort daemon.
+#     hanging the Settings panel. ``selftest_generate`` applies the same
+#     deadline to its whole run and kills its child; an in-process orphan is
+#     a best-effort daemon thread.
 #   * A process-wide lock serialises self-tests so a click-storm can't stack
-#     concurrent model loads.
+#     concurrent model loads. The worker owns the lock until it exits, so a
+#     timed-out test can never overlap the next one.
 #   * Only ever on user click (POST) — never on Settings load. Admin-gated.
 
 # Deliberately short + ASCII so the synth stays CPU-cheap and the phrase never
@@ -437,27 +846,111 @@ def _sample_count(audio) -> int:
 def _run_synth_bounded(backend, timeout_s: float) -> dict | None:
     """Run one tiny synthesis in a daemon thread, bounded by ``timeout_s``.
 
-    Returns ``{"audio": .., "duration_ms": ..}`` on success, ``{"error": exc}``
-    on a synth exception, or ``None`` when the timeout elapsed (worker left
-    running best-effort — Python threads can't be force-killed)."""
+    The caller must hold ``_SELFTEST_LOCK``; ownership passes to the worker,
+    which releases it when it exits, so a timed-out run still blocks the next
+    self-test until it has really stopped.
+
+    Returns ``{"audio": .., "duration_ms": ..}`` on success (plus
+    ``runtime_log`` from a ``selftest_generate`` engine), ``{"error": exc}``
+    on a synth exception, or ``None`` when the timeout elapsed."""
     box: dict = {}
 
     def _worker():
         t0 = perf_counter()
         try:
-            audio = backend.generate(_SELFTEST_PHRASE, language="en", num_step=8)
+            if callable(getattr(type(backend), "selftest_generate", None)):
+                audio, runtime_log = backend.selftest_generate(
+                    _SELFTEST_PHRASE, timeout_s=timeout_s, language="en",
+                )
+                box["runtime_log"] = runtime_log or ""
+            else:
+                audio = backend.generate(_SELFTEST_PHRASE, language="en", num_step=8)
             box["audio"] = audio
         except Exception as exc:  # noqa: BLE001 — surfaced to the caller as ok=False
             box["error"] = exc
         finally:
             box["duration_ms"] = (perf_counter() - t0) * 1000.0
+            _SELFTEST_LOCK.release()
 
     th = threading.Thread(target=_worker, name="engine-selftest", daemon=True)
-    th.start()
+    try:
+        th.start()
+    except BaseException:
+        _SELFTEST_LOCK.release()
+        raise
     th.join(timeout_s)
     if th.is_alive():
         return None
     return box
+
+
+# The directory part of an absolute path (POSIX, ``~``, drive letter or UNC),
+# up to its line's last separator so directories with spaces go too.
+_SELFTEST_DIR_RE = re.compile(r"(?:\b[A-Za-z]:|~|(?<![\w/\\]))[\\/][^\r\n'\"|<>]*[\\/]")
+
+
+# ``ggml_vulkan: 1 = AMD Radeon RX 5500M (AMD proprietary driver) | uma: 0 | ...``
+_VK_DEVICE_RE = re.compile(r"ggml_vulkan:\s*(\d+)\s*=\s*(.+)")
+
+
+def _logged_vulkan_device(lines: list[str]) -> str | None:
+    """The Vulkan device this run opened, named only from its own log.
+
+    The index is the one GGML was told to use (``GGML_BACKEND=Vulkan<N>``),
+    or GGML's automatic pick among the devices this run listed (first
+    discrete, else the first). ``None`` when the route is not Vulkan or the
+    log does not list that device, so a CPU run never borrows a GPU name.
+    """
+    devices: dict[int, tuple[str, bool]] = {}
+    for line in lines:
+        m = _VK_DEVICE_RE.search(line)
+        if not m:
+            continue
+        rest = m.group(2)
+        # Drop the " (driver)" and "| field" suffixes; keep "Radeon(TM)".
+        name = re.split(r"\s+\(|\s*\|", rest, maxsplit=1)[0].strip()
+        uma = re.search(r"\buma:\s*(\d)", rest)
+        if name:
+            devices.setdefault(int(m.group(1)), (name, bool(uma and uma.group(1) == "0")))
+    if not devices:
+        return None
+    try:
+        from engines.omnivoice_gguf.compute import apply_compute_env, selected_vulkan_adapter
+
+        if selected_vulkan_adapter() is None:  # CPU, CUDA or no verified Vulkan route
+            return None
+        ggml = apply_compute_env(os.environ.copy()).get("GGML_BACKEND", "").strip()
+    except Exception:  # noqa: BLE001 - diagnostic metadata is optional
+        return None
+    if ggml[6:].isdecimal():
+        index = int(ggml[6:])
+    else:
+        index = next((i for i in sorted(devices) if devices[i][1]), min(devices))
+    if index not in devices:
+        return None
+    return f"Vulkan {index}: {devices[index][0]}"
+
+
+def _selftest_runtime(raw_log: str) -> tuple[str | None, str | None]:
+    """``(runtime_device, runtime_log)`` from a GGUF run, scrubbed of paths.
+
+    Secrets and home paths go through ``scrub_text``; every remaining
+    absolute path is cut to its file name (``ggml-vulkan.dll`` stays useful;
+    the install and model directories are dropped).
+    """
+    from core.scrub import scrub_text
+
+    lines = [
+        line.strip()
+        for line in raw_log.splitlines()
+        if any(word in line.lower() for word in ("vulkan", "device", "backend"))
+    ]
+    # Device enumeration comes first; a resident log may grow after it.
+    text = scrub_text("\n".join(lines[:12]))
+    text = _SELFTEST_DIR_RE.sub("", text)
+    runtime_log = text[:2400] or None
+    device = _logged_vulkan_device(lines)
+    return (scrub_text(device) if device else None), runtime_log
 
 
 class SelfTestResponse(BaseModel):
@@ -469,6 +962,8 @@ class SelfTestResponse(BaseModel):
     num_samples: int | None = None
     audio_seconds: float | None = None
     timed_out: bool = False
+    runtime_device: str | None = None
+    runtime_log: str | None = None
 
 
 @router.post(
@@ -512,10 +1007,23 @@ def engine_selftest(engine_id: str):
         )
 
     timeout_s = _selftest_timeout_s()
-    # Serialise so a click-storm can't stack concurrent model loads.
-    with _SELFTEST_LOCK:
+    # One deadline covers the wait for a previous test and this run.
+    deadline = monotonic() + timeout_s
+    # Serialise so a click-storm can't stack concurrent model loads. The
+    # worker releases the lock, so a timed-out run keeps it until it stops.
+    if not _SELFTEST_LOCK.acquire(timeout=timeout_s):
+        return SelfTestResponse(
+            id=engine_id,
+            ok=False,
+            message="a previous self-test is still running; try again when it finishes",
+            duration_ms=0.0,
+        )
+    try:
         backend = _get_engine_instance(cls)
-        res = _run_synth_bounded(backend, timeout_s)
+    except BaseException:
+        _SELFTEST_LOCK.release()
+        raise
+    res = _run_synth_bounded(backend, max(0.001, deadline - monotonic()))
 
     if res is None:
         return SelfTestResponse(
@@ -527,10 +1035,12 @@ def engine_selftest(engine_id: str):
         )
     if "error" in res:
         exc = res["error"]
+        from core.scrub import scrub_text
+
         return SelfTestResponse(
             id=engine_id,
             ok=False,
-            message=tts_backend._mask_hf_tokens(f"{type(exc).__name__}: {exc}"),
+            message=scrub_text(tts_backend._mask_hf_tokens(f"{type(exc).__name__}: {exc}")),
             duration_ms=res.get("duration_ms", 0.0),
         )
 
@@ -540,6 +1050,9 @@ def engine_selftest(engine_id: str):
     except Exception:
         sr = None
     secs = round(n / sr, 3) if (sr and n) else None
+    runtime_device, runtime_log = (
+        _selftest_runtime(str(res["runtime_log"])) if "runtime_log" in res else (None, None)
+    )
     return SelfTestResponse(
         id=engine_id,
         ok=n > 0,
@@ -548,6 +1061,8 @@ def engine_selftest(engine_id: str):
         sample_rate=sr,
         num_samples=n or None,
         audio_seconds=secs,
+        runtime_device=runtime_device,
+        runtime_log=runtime_log,
     )
 
 
@@ -589,7 +1104,9 @@ def select_engine(req: SelectEngineRequest):
     if not family:
         raise HTTPException(400, f"Unknown family: {req.family}. Expected one of tts/asr/llm.")
     module, pref_key = family
-    available = {b["id"]: b for b in module.list_backends()}
+    catalogue_options = {"include_hidden": True} if req.family == "tts" else {}
+    rows = module.list_backends(**catalogue_options)
+    available = {b["id"]: b for b in rows}
     if req.backend_id not in available:
         raise HTTPException(400, f"Unknown {req.family} backend: {req.backend_id!r}")
     entry = available[req.backend_id]
@@ -608,7 +1125,7 @@ def select_engine(req: SelectEngineRequest):
     # #981: mlx-audio multiplexes 7+ curated models behind one backend id —
     # persist the model pick alongside the backend id so the UI can actually
     # select which curated model gets loaded (previously it always defaulted
-    # to Kokoro no matter what the user downloaded in Model Catalogue → Models).
+    # to Kokoro no matter what the user downloaded in the engine's Weights list in Model Catalogue).
     if req.family == "tts" and req.backend_id == "mlx-audio" and req.model_id is not None:
         known_keys = tts_backend.MLXAudioBackend.CURATED_MODELS
         # Accept a curated key OR a raw HF repo id ("owner/name") — the same
@@ -623,6 +1140,23 @@ def select_engine(req: SelectEngineRequest):
                 "Hugging Face repo ID like 'owner/name'.",
             )
         prefs.set_("mlx_audio_model_id", req.model_id)
+    if req.family == "asr" and req.model_id is not None:
+        if req.backend_id not in {"faster-whisper", "faster-whisper-isolated"}:
+            raise HTTPException(400, "This ASR engine does not accept a CTranslate2 model")
+        from api.routers.setup.models import KNOWN_MODELS, is_cached
+
+        model = next((item for item in KNOWN_MODELS if item["repo_id"] == req.model_id), None)
+        compatible = req.model_id.startswith("Systran/faster-") or req.model_id == (
+            "deepdml/faster-whisper-large-v3-turbo-ct2"
+        )
+        if model is None or str(model.get("role", "")).lower() != "asr" or not compatible:
+            raise HTTPException(400, "This model is not compatible with Faster-Whisper")
+        if not is_cached(req.model_id):
+            raise HTTPException(409, "Install this ASR model before selecting it")
+        try:
+            asr_backend.select_faster_whisper_model(req.model_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
     prefs.set_(pref_key, req.backend_id)
     return {
         "family": req.family,

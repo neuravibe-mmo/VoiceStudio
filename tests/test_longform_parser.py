@@ -1,6 +1,6 @@
 """Canonical longform parser (#27) — pytest side of the cross-impl golden corpus.
 
-This suite and ``frontend/src/test/longformParser.test.js`` load the SAME JSON
+This suite and ``electron/src/shared/test/longformParser.test.js`` load the SAME JSON
 (`tests/fixtures/longform_parser_cases.json`) and assert both impls produce it
 byte-for-byte. A divergence cannot pass both suites — the side that drifts fails
 its own assertion against the shared truth.
@@ -42,7 +42,8 @@ def test_pathological_inputs_are_linear():
     # ReDoS guard: adversarial repeats must finish fast (mirrors the JS suite).
     import time
     for blob in ("[slow]" * 5000, "[pause" * 5000, "[voice:" * 5000,
-                 "# \n" * 5000, "[a]" * 5000):
+                 "# \n" * 5000, "[a]" * 5000, "[emotion:" * 5000,
+                 "[emotion:x]" * 5000):
         t0 = time.perf_counter()
         parse_script_to_spans(blob, default_voice="v")
         assert time.perf_counter() - t0 < 1.0

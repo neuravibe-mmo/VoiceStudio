@@ -31,9 +31,12 @@ Protocol:
     ``"final_kind": "utterance"|"summary"``. Utterances are mid-session
     commits; the summary is the authoritative whole-session result at EOF.
 
-    Every ``final`` text is normalised by services.text_polish (leading
-    capital for Latin scripts, terminal punctuation, single-spaced) so the
-    pasted result reads like typed text. Partials are raw.
+    Every dictation ``final`` text is cleaned by services.dictation_cleanup
+    (hesitations, stutters, all-caps, punctuation spacing, optional spoken
+    punctuation) and normalised by services.text_polish (leading capital for
+    Latin scripts, terminal punctuation, single-spaced) so the pasted result
+    reads like typed text. Platform-stream API clients get polish only.
+    Partials are raw.
 """
 from __future__ import annotations
 
@@ -49,11 +52,23 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from api.dependencies import is_local_host, ws_remote_authorized
+from api.dependencies import require_ws_access
+from services.dictation_cleanup import join_dictation_pieces, polish_dictation
 from services.text_polish import polish_text
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.capture_ws")
+
+
+def _timing(value):
+    """A segment timing, or ``None`` when the engine could not determine one.
+
+    ``dict.get(key, 0)`` returns a stored ``None`` rather than the default, so
+    rounding it raised (#1904). The null is the honest answer here — this module
+    emits it deliberately for un-endpointed utterances — and the segment list
+    renders whichever half of the range is known.
+    """
+    return round(value, 2) if isinstance(value, (int, float)) else None
 
 SPEECH_PROTOCOL = "voicestudio.speech.v1"
 PLATFORM_STREAM_PATH = "/v1/audio/transcriptions/stream"
@@ -87,6 +102,37 @@ _AEC_FAR = 0x01   # playback reference frame (feed the echo model only)
 # absurd rate must never be believed: it would re-open the unbounded-memory
 # path the recovery-tail cap closed.
 SR_MIN, SR_MAX = 8000, 96000
+
+
+# Marks "no language passed" apart from an explicit None (language unknown).
+_SESSION_LANGUAGE = object()
+
+
+def _final_polisher(websocket, language: str | None):
+    """The text normaliser for this session's ``final`` frames.
+
+    Dictation sessions get the full cleanup (services.dictation_cleanup);
+    platform-stream API clients keep the plain polish they always had. The
+    spoken-punctuation setting is read once per session. The returned
+    callable takes ``(text, language=None)``; a language passed in overrides
+    the session's, even when it is ``None``: the silent-model recovery's
+    fallback recognizer may not report a language, and the failed model's
+    English hint must not then strip Portuguese "um" or German "er"."""
+    if isinstance(websocket, _PlatformWebSocket):
+        return lambda text, lang=_SESSION_LANGUAGE: polish_text(text)
+    from services.dictation_cleanup import _spoken_punctuation_enabled
+
+    spoken = _spoken_punctuation_enabled()
+    return lambda text, lang=_SESSION_LANGUAGE: polish_dictation(
+        text,
+        language if lang is _SESSION_LANGUAGE else lang,
+        spoken_punctuation=spoken,
+    )
+
+
+def _spec_language(spec) -> str | None:
+    """Language hint for a sherpa model's text (None when multilingual)."""
+    return "en" if getattr(spec, "languages", "") == "English" else None
 
 
 def _is_end_control(text: str | None) -> bool:
@@ -233,6 +279,27 @@ def _select_sherpa_spec(websocket: WebSocket):
     return _usable_spec(mid) if mid else None
 
 
+def _dictation_licence_error(spec) -> dict | None:
+    """``model_licence_required`` detail for the model this session would use.
+
+    Mirrors the session's routing: the selected sherpa model when sherpa is
+    installed, otherwise the capture engine the legacy path resolves.
+    """
+    from services.asr_backend import SherpaDictationBackend, get_capture_asr_backend
+    from services.model_acceptance import ModelLicenceNotAccepted, ensure_accepted
+
+    try:
+        if spec is not None and SherpaDictationBackend.is_available()[0]:
+            ensure_accepted([spec.repo_id])
+        else:
+            get_capture_asr_backend()
+    except ModelLicenceNotAccepted as exc:
+        return exc.detail()
+    except Exception:  # noqa: BLE001 — other failures surface on the real path
+        logger.debug("dictation licence preflight could not resolve the engine", exc_info=True)
+    return None
+
+
 @router.websocket(PLATFORM_STREAM_PATH)
 @router.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
@@ -240,28 +307,13 @@ async def ws_transcribe(websocket: WebSocket):
     is_platform_stream = websocket.url.path == PLATFORM_STREAM_PATH
     if is_platform_stream:
         websocket = _PlatformWebSocket(websocket)
-    # A browser can reach localhost regardless of the page's own origin.
-    # Reject ambient cross-site WebSocket handshakes before the loopback-host
-    # shortcut or accept(), while keeping native clients (no Origin header)
-    # and configured/same-origin browser UIs working (#1646 review).
-    origin = websocket.headers.get("origin")
-    if origin:
-        from core.csrf import origin_allowed
-
-        if not origin_allowed(websocket):
-            await websocket.close(code=1008, reason="browser origin not allowed")
-            return
-    # Loopback origin guard — refuse anything not from 127.0.0.1, ::1, or
-    # localhost. Privileged HTTP routers use Depends(require_admin) at router
-    # level; WebSocket dependency injection differs across FastAPI versions, so we
-    # inline the check before accept(). Without it, any local process could
-    # stream the user's microphone over this endpoint.
-    # Wave 2.3 (remote backend): a non-loopback client that presents the
-    # OMNIVOICE_API_KEY bearer is the thin-client dictation case — the mic
-    # lives on the user's machine, the GPU here — and is allowed through.
-    host = websocket.client.host if websocket.client else None
-    if not is_local_host(host) and not ws_remote_authorized(websocket):
-        await websocket.close(code=1008, reason="loopback origin required")
+    # Shared WS admission gate (cross-site Origin rejection, then the
+    # loopback/trusted-network/remote-credential check) before accept().
+    # Privileged HTTP routers use Depends(require_admin) at router level, but
+    # WebSocket dependency injection differs across FastAPI versions, so the
+    # guard is a plain function awaited here. Without it, any local process
+    # could stream the user's microphone over this endpoint.
+    if not await require_ws_access(websocket):
         return
 
     await websocket.accept()
@@ -310,6 +362,17 @@ async def ws_transcribe(websocket: WebSocket):
         except Exception:  # noqa: BLE001 — client may already be gone
             pass
         return
+    # Licence acceptance (#2689): a gated model the user has not accepted gets
+    # a typed frame the client can turn into the acceptance dialog, before any
+    # recognizer is built — never a generic failure or a silent engine swap.
+    licence = await asyncio.to_thread(_dictation_licence_error, spec)
+    if licence is not None:
+        try:
+            await websocket.send_json({"type": "error", "kind": licence["code"], **licence})
+            await websocket.close()
+        except Exception:  # noqa: BLE001 — client may already be gone
+            pass
+        return
     if spec is not None:
         from services.asr_backend import SherpaDictationBackend, capture_lease
         ok, _reason = SherpaDictationBackend.is_available()
@@ -349,6 +412,7 @@ async def ws_transcribe(websocket: WebSocket):
     audio_chunks: list[bytes] = []
     total_bytes = 0
     last_audio_time = time.monotonic()
+    paused = False
     running = True
     partial_text = ""
     # Track whether the client initiated the disconnect. When True the
@@ -366,7 +430,7 @@ async def ws_transcribe(websocket: WebSocket):
         message as the authoritative result and skip the duplicate HTTP
         POST that used to run on every dictation.
         """
-        nonlocal total_bytes, last_audio_time, running, client_disconnected
+        nonlocal total_bytes, last_audio_time, running, client_disconnected, paused
         try:
             while running:
                 msg = await websocket.receive()
@@ -395,6 +459,10 @@ async def ws_transcribe(websocket: WebSocket):
                         data = aec.process_near_end(payload)
                     audio_chunks.append(data)
                     total_bytes += len(data)
+                    last_audio_time = time.monotonic()
+                    continue
+                if msg.get("text") in ("PAUSE", "RESUME"):
+                    paused = msg["text"] == "PAUSE"
                     last_audio_time = time.monotonic()
                     continue
                 if _is_end_control(msg.get("text")):
@@ -429,6 +497,9 @@ async def ws_transcribe(websocket: WebSocket):
             if not running:
                 break
 
+            if paused:
+                continue
+
             # Check silence timeout
             if time.monotonic() - last_audio_time > SILENCE_TIMEOUT_S and total_bytes > MIN_BUFFER_BYTES:
                 running = False
@@ -439,7 +510,10 @@ async def ws_transcribe(websocket: WebSocket):
 
             # Transcribe current buffer
             try:
-                text = await _transcribe_buffer(audio_chunks[:], pcm_sr=pcm_sr)
+                # Only the dictation socket carries the vocabulary hint, never the public stream API.
+                text = await _transcribe_buffer(
+                    audio_chunks[:], pcm_sr=pcm_sr, dictation=not is_platform_stream,
+                )
                 if text and text != partial_text:
                     partial_text = text
                     await _safe_send({
@@ -469,10 +543,17 @@ async def ws_transcribe(websocket: WebSocket):
     # Final transcription on complete buffer — skip if client already gone.
     if total_bytes > MIN_FINAL_BUFFER_BYTES:
         try:
-            result = await _transcribe_buffer_full(audio_chunks, pcm_sr=pcm_sr)
+            result = await _transcribe_buffer_full(
+                audio_chunks, pcm_sr=pcm_sr, dictation=not is_platform_stream,
+            )
             # Dictation v2: deterministic polish so the pasted final reads
             # like typed text (leading capital, terminal punctuation).
-            result["text"] = polish_text(result.get("text", ""))
+            if is_platform_stream:
+                result["text"] = polish_text(result.get("text", ""))
+            else:
+                result["text"] = await asyncio.to_thread(
+                    polish_dictation, result.get("text", ""), result.get("language"),
+                )
             # Wave 2.1: optional local-LLM refinement of the final text.
             # HARD-BOUNDED (maybe_refine_async, ~4s OMNIVOICE_REFINE_TIMEOUT_S):
             # a slow/dead LLM can never delay this `final` beyond the budget —
@@ -490,9 +571,15 @@ async def ws_transcribe(websocket: WebSocket):
             if not await _safe_send({"type": "final", **result}):
                 logger.debug("Skipped final send — client already disconnected")
         except Exception as e:
-            logger.exception("Final transcription failed")
-            await _safe_send({"type": "error", "message": str(e),
-                              "kind": "transcribe", "detail": str(e)})
+            from services.model_acceptance import ModelLicenceNotAccepted
+
+            if isinstance(e, ModelLicenceNotAccepted):
+                # Accepted at session start, revoked since: keep it typed.
+                await _safe_send({"type": "error", "kind": e.detail()["code"], **e.detail()})
+            else:
+                logger.exception("Final transcription failed")
+                await _safe_send({"type": "error", "message": str(e),
+                                  "kind": "transcribe", "detail": str(e)})
     else:
         await _safe_send({
             "type": "final",
@@ -623,9 +710,12 @@ def _pcm16_rms(pcm: bytes) -> float:
 
 
 async def _recover_silent_sherpa(
-    spec, pcm: bytes, pcm_sr: int,
+    spec, pcm: bytes, pcm_sr: int, polish=None,
 ) -> tuple[str, list[dict]]:
-    """Retry a token-silent Sherpa session through an installed local ASR."""
+    """Retry a token-silent Sherpa session through an installed local ASR.
+
+    ``polish`` is the session's :func:`_final_polisher`, so platform-stream
+    clients keep plain polish on this path too."""
     logger.warning(
         "dictation model %s decoded NOTHING from %.1fs of speech-level audio "
         "— falling back to the capture ASR engine for this session",
@@ -650,7 +740,7 @@ async def _recover_silent_sherpa(
         result = await _transcribe_buffer_full(
             [pcm], pcm_sr=pcm_sr, skip_sherpa=True,
         )
-        text = polish_text(_result_text(result))
+        text = (polish or polish_dictation)(_result_text(result), result.get("language"))
         if not text:
             return "", []
         # The RMS gate can fire on fan/keyboard noise. Only another recognizer
@@ -773,6 +863,7 @@ async def _run_sherpa_streaming(websocket: WebSocket, spec):
     from services.asr_backend import get_sherpa_dictation_backend
 
     pcm_sr, aec = await _sherpa_session(websocket)
+    polish = _final_polisher(websocket, _spec_language(spec))
     logger.info("sherpa streaming dictation: model=%s sr=%d aec=%s",
                 spec.id, pcm_sr, bool(aec))
 
@@ -841,7 +932,7 @@ async def _run_sherpa_streaming(websocket: WebSocket, spec):
             if endpoint:
                 # Commit this utterance (polished — it gets pasted); reset
                 # for the next one.
-                text = polish_text(text)
+                text = polish(text)
                 if text:
                     committed.append(text)
                     await _send({"type": "final", "text": text,
@@ -865,18 +956,18 @@ async def _run_sherpa_streaming(websocket: WebSocket, spec):
     except Exception as e:
         logger.debug("sherpa streaming flush failed: %s", e)
         tail_text = ""
-    tail_text = polish_text(tail_text)
+    tail_text = polish(tail_text)
     if tail_text and tail_text != (committed[-1] if committed else None):
         committed.append(tail_text)
 
-    # Pieces are already polished; the join is too (polish is idempotent).
-    full = " ".join(t for t in committed if t).strip()
+    # Pieces are already polished; join them as typed (no space across CJK).
+    full = join_dictation_pieces(committed)
     segments = [{"start": 0.0, "end": None, "text": t} for t in committed if t]
 
     model_silent = is_model_silent(full, heard_speech, session_pcm.total_bytes)
     if model_silent:
         recovered, recovered_segments = await _recover_silent_sherpa(
-            spec, session_pcm.tail(), pcm_sr,
+            spec, session_pcm.tail(), pcm_sr, polish,
         )
         if recovered:
             full = recovered
@@ -924,6 +1015,7 @@ async def _run_sherpa_offline(websocket: WebSocket, spec):
     from services.asr_backend import get_sherpa_dictation_backend
 
     pcm_sr, aec = await _sherpa_session(websocket)
+    polish = _final_polisher(websocket, _spec_language(spec))
     logger.info("sherpa offline dictation: model=%s sr=%d aec=%s",
                 spec.id, pcm_sr, bool(aec))
 
@@ -1000,7 +1092,7 @@ async def _run_sherpa_offline(websocket: WebSocket, spec):
             return
         del buf[:len(snapshot)]
         last_partial = ""
-        text = polish_text(text)
+        text = polish(text)
         if text:
             committed.append(text)
             await _send({"type": "final", "text": text,
@@ -1051,11 +1143,11 @@ async def _run_sherpa_offline(websocket: WebSocket, spec):
     except Exception:
         logger.exception("sherpa offline final failed")
         tail = ""
-    tail = polish_text(tail)
+    tail = polish(tail)
     if tail:
         committed.append(tail)
-    # Pieces are already polished; the join is too (polish is idempotent).
-    full = " ".join(committed).strip()
+    # Pieces are already polished; join them as typed (no space across CJK).
+    full = join_dictation_pieces(committed)
     segments = [{"start": 0.0, "end": None, "text": t} for t in committed]
 
     # Silent-model fallback: we heard speech-level audio but the selected
@@ -1066,7 +1158,7 @@ async def _run_sherpa_offline(websocket: WebSocket, spec):
     model_silent = is_model_silent(full, heard_speech, session_pcm.total_bytes)
     if model_silent:
         recovered, recovered_segments = await _recover_silent_sherpa(
-            spec, session_pcm.tail(), pcm_sr,
+            spec, session_pcm.tail(), pcm_sr, polish,
         )
         if recovered:
             full = recovered
@@ -1131,8 +1223,14 @@ def _result_text(result: dict | None) -> str:
     return ""
 
 
-async def _transcribe_buffer(chunks: list[bytes], *, pcm_sr: int | None = None) -> str:
-    """Quick partial transcription of the current audio buffer."""
+async def _transcribe_buffer(
+    chunks: list[bytes], *, pcm_sr: int | None = None, dictation: bool = False,
+) -> str:
+    """Transcribe the buffered audio so far and return the text.
+
+    ``dictation=True`` passes the saved vocabulary hint to engines that take a
+    prompt; every other caller gets an unbiased decode.
+    """
 
     tmp = _pcm16_to_wav(b"".join(chunks), pcm_sr) if pcm_sr else _chunks_to_wav(chunks)
     if tmp is None:
@@ -1144,13 +1242,19 @@ async def _transcribe_buffer(chunks: list[bytes], *, pcm_sr: int | None = None) 
 
         def _run():
             backend = get_capture_asr_backend()
-            result = backend.transcribe(tmp, word_timestamps=False)
+            hint = {}
+            if dictation:
+                from api.routers.dictation import dictation_transcribe_kwargs
+                hint = dictation_transcribe_kwargs(backend)
+            result = backend.transcribe(tmp, word_timestamps=False, **hint)
             return _result_text(result)
 
-        # Bound dictation transcribes (#730): a wedged whisperx/CTranslate2 call
-        # must not hold its GPU-pool worker forever and starve TTS / other ASR
-        # into a "can't reach backend"; on timeout the pool is reset to recover.
-        text = await run_transcribe_guarded(_gpu_pool, _run, what="Dictation")
+        # Bound dictation requests (#730). Timed-out native work retains its
+        # worker accounting until it exits, preventing overlapping retries (#1669).
+        text = await run_transcribe_guarded(
+            _gpu_pool, _run, what="Dictation",
+            **({"duration_s": sum(map(len, chunks)) / (pcm_sr * 2)} if pcm_sr else {"audio_path": tmp}),
+        )
         return text.strip()
     finally:
         try:
@@ -1161,12 +1265,18 @@ async def _transcribe_buffer(chunks: list[bytes], *, pcm_sr: int | None = None) 
 
 async def _transcribe_buffer_full(
     chunks: list[bytes], *, pcm_sr: int | None = None, skip_sherpa: bool = False,
+    dictation: bool = False,
 ) -> dict:
-    """Full transcription with timing info for the final result."""
+    """Transcribe the whole buffer and return text, segments and timing.
+
+    ``dictation=True`` hands the saved vocabulary hint to engines that accept
+    one. The default (used by the silent-model rescue and other callers) never does.
+    """
     tmp = _pcm16_to_wav(b"".join(chunks), pcm_sr) if pcm_sr else _chunks_to_wav(chunks)
     if tmp is None:
         return {"text": "", "segments": [], "language": "unknown",
-                "duration_s": 0, "transcription_time_s": 0, "engine": "none"}
+                "duration_s": 0, "transcription_time_s": 0, "engine": "none",
+                "timestamps_available": False}
 
     try:
         from services.model_manager import _gpu_pool
@@ -1175,7 +1285,11 @@ async def _transcribe_buffer_full(
         def _run():
             backend = get_capture_asr_backend(skip_sherpa=skip_sherpa)
             t0 = time.perf_counter()
-            result = backend.transcribe(tmp, word_timestamps=False)
+            hint = {}
+            if dictation:
+                from api.routers.dictation import dictation_transcribe_kwargs
+                hint = dictation_transcribe_kwargs(backend)
+            result = backend.transcribe(tmp, word_timestamps=False, **hint)
             elapsed = round(time.perf_counter() - t0, 2)
 
             segments = result.get("segments", [])
@@ -1187,25 +1301,36 @@ async def _transcribe_buffer_full(
             from services.refinement import collapse_repetitive_artifacts
             full_text = collapse_repetitive_artifacts(full_text)
 
-            duration = max((s.get("end", 0) for s in segments), default=0.0)
+            # end=None means the engine could not determine the timing — this
+            # module writes exactly that in its own streaming payloads, and
+            # sherpa's _sherpa_result does too when the sample rate yields no
+            # duration. Measure only real numbers, and pass the nulls through
+            # rather than rounding them (#1904).
+            ends = [e for e in (s.get("end") for s in segments) if isinstance(e, (int, float))]
+            duration = max(ends) if ends else 0.0
 
+            out_segments = [
+                {"start": _timing(s.get("start", 0)),
+                 "end": _timing(s.get("end", 0)),
+                 "text": s.get("text", "").strip()}
+                for s in segments
+            ]
+            from services.asr_backend import has_recognition_timestamps
             return {
                 "text": full_text,
-                "segments": [
-                    {"start": round(s.get("start", 0), 2),
-                     "end": round(s.get("end", 0), 2),
-                     "text": s.get("text", "").strip()}
-                    for s in segments
-                ],
+                "segments": out_segments,
+                "timestamps_available": has_recognition_timestamps(result, segments=out_segments),
                 "language": result.get("language", "unknown"),
                 "duration_s": round(duration, 2),
                 "transcription_time_s": elapsed,
                 "engine": backend.id,
             }
 
-        # Bounded + pool-resetting on timeout (#730), same rationale as the
-        # partial path above.
-        return await run_transcribe_guarded(_gpu_pool, _run, what="Dictation")
+        # Same bounded request and native-worker accounting as the partial path.
+        return await run_transcribe_guarded(
+            _gpu_pool, _run, what="Dictation",
+            **({"duration_s": sum(map(len, chunks)) / (pcm_sr * 2)} if pcm_sr else {"audio_path": tmp}),
+        )
     finally:
         try:
             os.unlink(tmp)
@@ -1238,11 +1363,11 @@ def _chunks_to_wav(chunks: list[bytes]) -> str | None:
     tmp_out.close()
 
     try:
-        from services.ffmpeg_utils import find_ffmpeg
+        from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
         import subprocess
         subprocess.run(
-            [find_ffmpeg(), "-y", "-i", tmp_in.name,
-             "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out.name],
+            local_inputs_only([find_ffmpeg(), "-y", "-i", tmp_in.name,
+             "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out.name]),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,

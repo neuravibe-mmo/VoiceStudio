@@ -35,7 +35,8 @@ import sys
 from dataclasses import dataclass
 from typing import Literal
 
-DeviceFamily = Literal["cuda", "rocm", "mps", "xpu", "cpu"]
+DeviceFamily = Literal["cuda", "rocm", "mps", "xpu", "npu", "cpu"]
+ACCELERATOR_PRIORITY = ("cuda", "rocm", "xpu", "npu", "mps")
 
 # Stable substring stamped onto notes that represent a real kernel-launch risk
 # (arch/driver mismatch) — as opposed to advisory notes (multi-GPU, VRAM query
@@ -48,7 +49,30 @@ KERNEL_RISK_MARKER = "may fail at kernel launch"
 # router reads this marker to explain the neutral badge instead of "no GPU".
 DIRECTML_MARKER = "DirectML device present"
 
-# NOTE: the NVIDIA driver-version check (min R555 for the bundled CUDA runtime)
+# Stamped onto the note for a host whose OS reports a discrete GPU that the
+# installed PyTorch build cannot drive (an AMD card + the NVIDIA-CUDA wheel,
+# an NVIDIA card + a CPU wheel). ``engine_routing`` reads it so such a host's
+# GPU-capable engines say "cpu_fallback, and here is why" instead of the
+# neutral "cpu_only" a GPU-less machine gets - a Radeon owner must not be told
+# their machine simply has no GPU.
+UNUSABLE_GPU_MARKER = "present but PyTorch cannot use it"
+
+
+def cuda_forced() -> bool:
+    """``OMNIVOICE_FORCE_CUDA`` asks for CUDA even when the installed wheel has
+    no kernels for the card (#3067).
+
+    Shared by the routing badge (``services.engine_routing``) and the GPU
+    report. ``services.model_manager.get_best_device`` reads the same flag
+    with the same truthy values through its ``_env_flag`` helper (kept
+    separate to avoid an import cycle); tests/test_engine_routing.py checks
+    the two agree."""
+    return os.environ.get("OMNIVOICE_FORCE_CUDA", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# NOTE: the NVIDIA driver-version check (CUDA 12.x minor-compat floor: R525.60.13 Linux / R528.33 Windows)
 # is intentionally NOT done here — it requires shelling to ``nvidia-smi``, which
 # would put a subprocess on the cold-start probe path. That check stays in
 # ``wizard._detect_gpu`` (preflight), which already runs it. The probe only
@@ -58,25 +82,107 @@ DIRECTML_MARKER = "DirectML device present"
 # AMD GPUs on ROCm present through ``torch.cuda`` but some consumer parts have
 # GFX IDs the installed ROCm build wasn't compiled for. Setting
 # ``HSA_OVERRIDE_GFX_VERSION`` runs them on the closest supported architecture.
-# Applied (with side effects) by ``model_manager._configure_rocm_if_needed``;
+# Applied (with side effects) by ``apply_rocm_override_before_init`` and
+# ``model_manager._configure_rocm_if_needed``;
 # read here so ``arch_unsupported()`` doesn't flag a GPU we know how to remap.
 #
-# Values are the TARGET gfx name, not the HSA version string, so callers can
-# check whether the installed wheel actually contains that target before
-# treating the remap as a solution (``hsa_override_for`` derives the env-var
-# form). Remapping onto an architecture the build doesn't ship is not a fix —
-# it just moves the failure from "no kernel for gfx1151" to "no kernel for
-# gfx1100".
-ROCM_GFX_OVERRIDES = {
-    # RDNA 3.5 (Strix Point / Strix Halo APUs) — override to gfx1100
-    "gfx1150": "gfx1100", "gfx1151": "gfx1100",
-    # RDNA 3 (RX 7000 series) — override to gfx1100
-    "gfx1101": "gfx1100", "gfx1102": "gfx1100", "gfx1103": "gfx1100",
-    # RDNA 2 (RX 6000 series) — override to gfx1030
-    "gfx1031": "gfx1030", "gfx1032": "gfx1030", "gfx1034": "gfx1030",
-    # Vega (RX Vega / Radeon VII) — override to gfx900 / gfx906
-    "gfx902": "gfx900", "gfx906": "gfx906",
-}
+# The target is DERIVED from the installed wheel's own arch list
+# (``rocm_override_target``), never looked up in a hand-kept table: a table
+# lags every new part (gfx1152, gfx1035, a gfx1201 on a wheel that only ships
+# gfx1200 ...), and a card missing from it silently ran on the CPU (#3418).
+# Remapping onto an architecture the build doesn't ship is not a fix — it just
+# moves the failure — so only targets the wheel lists are ever chosen.
+
+
+def _gfx_parts(gfx: str) -> tuple[str, str, str] | None:
+    """``"gfx1151"`` → ``("11", "5", "1")``; ``"gfx90c"`` → ``("9", "0", "c")``.
+
+    Major / minor / stepping, as LLVM names AMDGPU processors. ``None`` for
+    anything that is not a gfx name."""
+    digits = _normalize_arch(gfx).removeprefix("gfx")
+    if not _normalize_arch(gfx).startswith("gfx") or len(digits) < 3:
+        return None
+    major, minor, step = digits[:-2], digits[-2], digits[-1]
+    if not major.isdigit() or not minor.isdigit() or not step.isalnum():
+        return None
+    return major, minor, step
+
+
+# gfx9 holds three ISAs that cannot run each other's kernels: Vega (the
+# ``gfx9-generic`` family below), CDNA1/2 (gfx908, gfx90a) and CDNA3 (gfx94x,
+# gfx950). Only Vega parts remap, and only onto Vega.
+_GFX9_GENERIC = frozenset({"gfx900", "gfx902", "gfx904", "gfx906", "gfx909", "gfx90c"})
+
+
+def rocm_override_target(gfx: str, arch_list) -> str | None:
+    """The architecture in ``arch_list`` a card missing from it can be remapped
+    onto with ``HSA_OVERRIDE_GFX_VERSION``, or ``None`` when none can work.
+
+    Rules (the same families LLVM's ``gfxN-generic`` targets group):
+
+    * never across an ISA generation — gfx12 (RDNA4) cannot run gfx11 kernels;
+    * within gfx9, Vega only — CDNA parts (gfx908, gfx90a, gfx942) never remap
+      onto Vega, and Vega never onto CDNA;
+    * within gfx10, the same minor revision only — RDNA1 (gfx101x) and RDNA2
+      (gfx103x) are different ISAs;
+    * never onto a NEWER minor revision — gfx1012 (RDNA1) is not gfx1030
+      (RDNA2), but gfx1151 (RDNA3.5) does run gfx1100 (RDNA3) code;
+    * the target must be expressible as an HSA version (digits only);
+    * closest first: the same minor revision, then the lowest stepping.
+
+    ``None`` when the card is natively in ``arch_list`` (nothing to remap) or
+    the list is empty (unknown build: never remap on a guess).
+    """
+    device = _gfx_parts(gfx)
+    if device is None:
+        return None
+    native = _normalize_arch(gfx)
+    build = {_normalize_arch(a) for a in arch_list or ()}
+    if not build or native in build:
+        return None
+    major, minor, _step = device
+    if major == "9" and native not in _GFX9_GENERIC:
+        return None
+    candidates = []
+    for arch in build:
+        parts = _gfx_parts(arch)
+        if parts is None or not arch.removeprefix("gfx").isdigit():
+            continue
+        t_major, t_minor, t_step = parts
+        if major == "9" and _normalize_arch(arch) not in _GFX9_GENERIC:
+            continue
+        if major == "10" and t_minor != minor:
+            continue
+        if t_major == major and int(t_minor) <= int(minor):
+            candidates.append(((t_minor != minor, int(t_minor), int(t_step)), arch))
+    return min(candidates)[1] if candidates else None
+
+
+def gfx_generation(gfx: str) -> str:
+    """``"gfx1201"`` → ``"12"``, ``"gfx1030"`` → ``"10"``, ``"gfx906"`` → ``"9"``.
+
+    The major ISA family. ``HSA_OVERRIDE_GFX_VERSION`` can only ever make a card
+    run kernels built for a sibling in the same family; across families the
+    instruction set differs. Empty string for anything that isn't a gfx name.
+    """
+    digits = _normalize_arch(gfx).removeprefix("gfx")
+    if len(digits) < 3 or not digits[:-2].isdigit():
+        return ""
+    return digits[:-2]
+
+
+def same_generation_targets(gfx: str, arch_list) -> tuple[str, ...]:
+    """Architectures in ``arch_list`` that share ``gfx``'s ISA family, i.e. the
+    only targets an ``HSA_OVERRIDE_GFX_VERSION`` remap could plausibly use.
+    Empty for an RDNA4 card on a build that predates gfx12."""
+    family = gfx_generation(gfx)
+    if not family:
+        return ()
+    native = _normalize_arch(gfx)
+    return tuple(dict.fromkeys(
+        a for a in (_normalize_arch(x) for x in arch_list or ())
+        if a != native and gfx_generation(a) == family
+    ))
 
 
 def hsa_override_for(target_gfx: str) -> str:
@@ -96,6 +202,25 @@ def _normalize_arch(tag: str) -> str:
     return str(tag).split(":")[0].strip().lower()
 
 
+def _installed_rocm_arches(version: str) -> set[str]:
+    """TheRock wheels list targets even when their kernel packages are absent."""
+    from importlib import metadata
+
+    result = set()
+    for dist in metadata.distributions():
+        name = str(dist.metadata.get("Name", "")).lower().replace("_", "-")
+        prefix = "amd-torch-device-gfx"
+        if not name.startswith(prefix) or dist.version != version:
+            continue
+        arch = "gfx" + name[len(prefix):]
+        try:
+            if metadata.version(f"rocm-sdk-device-{arch}") == "10.0.0":
+                result.add(arch)
+        except metadata.PackageNotFoundError:
+            continue  # A Torch device wheel alone does not provide the SDK kernels.
+    return result
+
+
 def build_arch_list(torch) -> list[str]:
     """This torch build's compiled architecture list, or ``[]`` if unknown.
 
@@ -106,13 +231,121 @@ def build_arch_list(torch) -> list[str]:
         fn = getattr(torch.cuda, name, None)
         if callable(fn):
             try:
-                return [str(a) for a in (fn() or [])]
+                arches = [str(a) for a in (fn() or [])]
             except Exception:
                 return []
+            version = str(getattr(torch, "__version__", ""))
+            if sys.platform == "win32" and version == "2.13.0+rocm10.0.0":
+                try:
+                    installed = _installed_rocm_arches(version)
+                except Exception:  # noqa: BLE001 - unknown kernel packages must not authorize the GPU
+                    installed = set()
+                # A nonempty sentinel makes absence fail closed in arch_unsupported.
+                return [a for a in arches if _normalize_arch(a) in installed] or ["no-installed-kernels"]
+            return arches
     return []
 
 
+# KFD's view of the GPUs. Unlike torch.cuda, reading it does not initialise HIP.
+_KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _gfx_from_target_version(version: int) -> str | None:
+    """KFD's ``100304`` → ``"gfx1034"``: major*10000 + minor*100 + step, and LLVM
+    spells the step in hex (``90010`` → ``"gfx90a"``). ``None`` for a CPU node."""
+    major, rest = divmod(version, 10000)
+    minor, step = divmod(rest, 100)
+    if not major or minor > 9 or step > 15:
+        return None
+    return f"gfx{major}{minor}{step:x}"
+
+
+def _kfd_gpu_architectures() -> set[str]:
+    """Every GPU architecture the kernel lists; empty when KFD is absent."""
+    found: set[str] = set()
+    try:
+        nodes = os.listdir(_KFD_NODES)
+    except OSError:
+        return found
+    for node in nodes:
+        try:
+            with open(os.path.join(_KFD_NODES, node, "properties"), encoding="ascii") as f:
+                for line in f:
+                    name, _, value = line.partition(" ")
+                    if name == "gfx_target_version":
+                        gfx = _gfx_from_target_version(int(value))
+                        if gfx:
+                            found.add(gfx)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def apply_rocm_override_before_init(torch) -> str | None:
+    """Set ``HSA_OVERRIDE_GFX_VERSION`` while it can still take effect (#3804).
+
+    HSA reads the variable once, when HIP initialises, and any
+    ``torch.cuda.is_available()`` initialises it; ``torch.cuda.get_arch_list()``
+    calls that too. So this reads the card from KFD and the wheel's targets from
+    the compiled flags, and must run before the first ``torch.cuda`` call. Returns
+    the value it set. Never raises, and changes nothing unless a remap is certain:
+    ``model_manager._configure_rocm_if_needed`` still covers anything left, for the
+    sidecars this process starts.
+    """
+    if not sys.platform.startswith("linux") or os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        return None
+    try:
+        if not getattr(getattr(torch, "version", None), "hip", None):
+            return None
+        architectures = _kfd_gpu_architectures()
+        if len(architectures) != 1:
+            return None  # One process-wide override cannot describe two different cards.
+        flags = torch._C._cuda_getArchFlags()
+        arch_list = {_normalize_arch(a) for a in (flags or "").split()}
+        gfx = architectures.pop()
+        if not arch_list or gfx in arch_list:
+            return None
+        target = rocm_override_target(gfx, arch_list)
+        if not target:
+            return None
+        override = hsa_override_for(target)
+    except Exception:  # noqa: BLE001 - a private torch API; the late path still runs
+        return None
+    os.environ["HSA_OVERRIDE_GFX_VERSION"] = override
+    return override
+
+
 _CUDA_ARCH_TAG = re.compile(r"^(sm|compute)_(\d+)([a-z]?)$")
+
+# Stamped onto the English advice for a pre-Volta NVIDIA card (Maxwell sm_5x,
+# Pascal sm_6x). No PyTorch CUDA build we ship can cover it, so a "reinstall a
+# cu128 build" remedy is wrong for it; callers key their wording off this.
+LEGACY_NVIDIA_MARKER = "no longer supports this GPU generation"
+
+
+def is_legacy_nvidia_arch(tag: str) -> bool:
+    """True for a CUDA ``sm_XY`` tag of a pre-Volta card (compute capability < 7.0).
+
+    Only an ``sm_`` tag qualifies: ROCm ``gfx`` names never match, and a card
+    of capability 7.0+ with a mismatched build is helped by a matching build.
+    """
+    m = _CUDA_ARCH_TAG.match(str(tag).strip().split(" ")[0])
+    if not m or m.group(1) != "sm":
+        return False
+    try:
+        return int(m.group(2)) // 10 < 7
+    except ValueError:
+        return False
+
+
+def legacy_nvidia_advice(device_name: str, device_arch: str) -> str:
+    """The accurate reason + next step for a pre-Volta NVIDIA card (no cu128 advice)."""
+    return (
+        f"{device_name} ({device_arch}) is an older NVIDIA GPU: this PyTorch build "
+        f"{LEGACY_NVIDIA_MARKER}, so PyTorch engines run on the CPU. Installing "
+        "another CUDA build will not help. The Vulkan engines (e.g. audio.cpp, "
+        "CosyVoice GGUF, OmniVoice GGUF) can use this GPU."
+    )
 
 
 def cuda_build_covers(arch_list, major: int, minor: int) -> bool:
@@ -196,7 +429,24 @@ def _rocm_requires_dxg_detection(version: object) -> bool:
         return True
 
 
-def why_no_gpu(torch) -> tuple[str, ...]:
+def _unusable_gpu_note(torch, gpus) -> str | None:
+    """Note for the commonest silent-CPU host: hardware the torch build cannot
+    drive. ``None`` when no discrete GPU is known or torch can drive it."""
+    from core.gpu_inventory import pick_for_build
+
+    try:
+        hip = getattr(torch.version, "hip", None)
+        cuda = getattr(torch.version, "cuda", None)
+    except Exception:  # noqa: BLE001
+        hip = cuda = None
+    gpu = pick_for_build(tuple(gpus or ()), "rocm" if hip else "cuda" if cuda else "cpu")
+    if gpu is None:
+        return None
+    build = f"ROCm {hip}" if hip else (f"CUDA {cuda}" if cuda else "CPU-only")
+    return f"{gpu.name} ({gpu.vendor.upper()}) {UNUSABLE_GPU_MARKER}: this is a {build} PyTorch build"
+
+
+def why_no_gpu(torch, gpus=None) -> tuple[str, ...]:
     """Why ``torch.cuda.is_available()`` said no, as user-facing advisories.
 
     This branch used to produce **nothing** (#1274/#1228). A host with a GPU
@@ -307,8 +557,16 @@ def why_no_gpu(torch) -> tuple[str, ...]:
             # #1274 reporter saw. Their card (gfx1151) is natively supported
             # by the ROCm this image ships, so the override they set is very
             # likely what hid it.
+            if sys.platform == "win32":
+                return (
+                    f"ROCm {hip} is installed on Windows, but no GPU was enumerated "
+                    f"while HSA_OVERRIDE_GFX_VERSION={override} is set. Remove that "
+                    "override and verify AMD's supported Windows GPU/driver/wheel "
+                    "matrix; VoiceStudio does not remap Windows GPU architectures",
+                )
+            location = " and the device nodes are reachable"
             return (
-                f"ROCm {hip} is installed and the device nodes are reachable, "
+                f"ROCm {hip} is installed{location}, "
                 f"but no GPU was enumerated while HSA_OVERRIDE_GFX_VERSION="
                 f"{override} is set. Try removing that override first — this "
                 "ROCm supports most current cards natively, and remapping one "
@@ -316,12 +574,48 @@ def why_no_gpu(torch) -> tuple[str, ...]:
                 "device. VoiceStudio sets the override itself when a card "
                 "genuinely needs it",
             )
+        if sys.platform == "win32":
+            return (
+                f"ROCm {hip} is installed on Windows but no GPU was enumerated — "
+                "verify that the installed Windows wheels, AMD driver and supported GPU "
+                "match AMD's compatibility matrix. A HIP SDK on PATH alone does not "
+                "prove PyTorch can use this card",
+            )
         return (
             f"ROCm {hip} is installed and the device nodes are reachable, but "
             "no GPU was enumerated — most often a card newer than this "
             "build's ROCm. Check `rocminfo` on the host",
         )
 
+    # A CUDA wheel on a machine whose only discrete GPU is not NVIDIA is not a
+    # driver problem - blaming the NVIDIA driver sent Radeon owners hunting for
+    # a driver they do not have. ``gpus`` is None -> read the OS inventory
+    # (registry/sysfs, no subprocess).
+    if gpus is None:
+        try:
+            from core.gpu_inventory import detect_host_gpus
+
+            gpus = detect_host_gpus()
+        except Exception:  # noqa: BLE001
+            gpus = ()
+    if gpus and not any(g.vendor == "nvidia" for g in gpus):
+        note = _unusable_gpu_note(torch, gpus)
+        if note:
+            return (
+                f"{note}. A CUDA build only drives NVIDIA GPUs; this machine "
+                "has none, so PyTorch engines run on the CPU",
+            )
+        # Only GPUs not worth a marker (a plain Intel iGPU): still not a
+        # driver problem, so name the hardware instead of sending the user
+        # after an NVIDIA driver (#2620). No UNUSABLE_GPU_MARKER — routing for
+        # such a host stays the benign ``cpu_only``.
+        names = ", ".join(dict.fromkeys(g.name for g in gpus if g.name))
+        return (
+            f"this is a CUDA {cuda} build but no CUDA device was found — this "
+            f"machine has no NVIDIA GPU (installed graphics: {names or 'none'}). "
+            "A CUDA build only drives NVIDIA GPUs, so PyTorch engines run on "
+            "the CPU",
+        )
     return (
         f"this is a CUDA {cuda} build but no CUDA device was found — the "
         "NVIDIA driver is missing or too old, or (in Docker) the container "
@@ -381,8 +675,7 @@ def arch_unsupported(torch) -> tuple[str, tuple[str, ...]] | None:
             # target before any kernel launches — but only counts as a fix if
             # the build actually SHIPS that target. Remapping gfx1151 onto
             # gfx1100 in a wheel that has neither just relocates the failure.
-            target = ROCM_GFX_OVERRIDES.get(gfx)
-            if target and _normalize_arch(target) in build:
+            if sys.platform != "win32" and rocm_override_target(gfx, arch_list):
                 return None
             return gfx, tuple(arch_list)
 
@@ -430,6 +723,11 @@ class HostCaps:
     ``family`` reflects what was actually honored: an override that names a
     family this host doesn't have is noted and ignored, never obeyed blindly."""
 
+    gpu_probe_skipped: bool = False
+    """``True`` when the user chose CPU, so no GPU runtime was probed: the
+    host's accelerators are unknown, not absent. Reports must say the user
+    chose CPU, never that a GPU failed (#4006)."""
+
 
 #: Every value the compute-device override accepts. "auto" = today's
 #: priority pick; "cpu" is always honorable (invariant: cpu is always
@@ -453,9 +751,30 @@ def requested_device_override() -> str:
     return val if val in DEVICE_OVERRIDE_CHOICES else "auto"
 
 
+#: Note on a host pinned to CPU, where no accelerator is probed.
+CPU_PINNED_NOTE = (
+    "compute device pinned to 'cpu' by user override; GPUs were not probed "
+    "(choose Auto in Settings → Performance & Device to detect them again)"
+)
+
+
 def _probe() -> HostCaps:
     """Run the probe once. Enumerates every failure branch from the spec's
     degradation contract; never raises."""
+    # An explicit CPU choice is honoured before anything touches a GPU: it is
+    # the recovery after a graphics driver crash (#4002, Restart on CPU), and
+    # initialising CUDA or opening DirectML here could hit that driver again.
+    # It also stops every caller of the cached caps (routing, /health, the
+    # loader) from probing an accelerator afterwards.
+    if requested_device_override() == "cpu":
+        return HostCaps(
+            family="cpu",
+            available_families=("cpu",),
+            notes=(CPU_PINNED_NOTE,),
+            probe_ok=True,
+            requested_family="cpu",
+            gpu_probe_skipped=True,
+        )
     try:
         import torch
     except Exception:
@@ -466,6 +785,8 @@ def _probe() -> HostCaps:
             probe_ok=False,
             requested_family=requested_device_override(),
         )
+
+    apply_rocm_override_before_init(torch)
 
     notes: list[str] = []
     # Probe EVERY accelerator independently into this list (don't short-circuit
@@ -533,9 +854,13 @@ def _probe() -> HostCaps:
         # is the whole truth in that case (CodeRabbit, #1425).
         notes.extend(why_no_gpu(torch))
 
-    # ── Intel XPU via IPEX ───────────────────────────────────────────────
+    # Older builds register XPU through IPEX; modern torch exposes it directly.
     try:
         import intel_extension_for_pytorch  # noqa: F401
+    except Exception:
+        # Optional IPEX may be absent or incompatible; still probe native torch XPU.
+        pass
+    try:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             detected.append("xpu")
             if not device_name:
@@ -546,7 +871,23 @@ def _probe() -> HostCaps:
                     pass
             notes.append("XPU VRAM not queried (unreliable across IPEX versions)")
     except Exception:
-        # IPEX absent or XPU probe failed — no XPU on this host.
+        # XPU probe failed — no usable XPU on this host.
+        pass
+
+    # Vendor extensions may register an NPU with torch. Probe only an already
+    # registered backend; never install or import an optional vendor package.
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            detected.append("npu")
+            if not device_name:
+                try:
+                    device_name = torch.npu.get_device_name(0)
+                except Exception:
+                    # An unavailable display name does not invalidate a usable NPU.
+                    pass
+            notes.append("NPU VRAM not queried")
+    except Exception:
+        # Missing or broken vendor backends mean no usable NPU; continue probing.
         pass
 
     # ── Apple Silicon MPS ────────────────────────────────────────────────
@@ -577,9 +918,22 @@ def _probe() -> HostCaps:
         # torch_directml absent (the common case) — no DirectML on this host.
         pass
 
+    # Hardware the OS can see but this torch build cannot drive. Only when
+    # nothing accelerated was detected: with a working GPU, an extra unused
+    # iGPU is noise. (Windows AMD + the shipped CUDA wheel lands here.)
+    if not detected and not any(UNUSABLE_GPU_MARKER in n for n in notes):
+        try:
+            from core.gpu_inventory import detect_host_gpus
+
+            unusable = _unusable_gpu_note(torch, detect_host_gpus())
+        except Exception:  # noqa: BLE001 - advisory only
+            unusable = None
+        if unusable:
+            notes.append(unusable)
+
     # Preferred family by priority; cpu when nothing accelerated was detected.
     family: DeviceFamily = "cpu"
-    for pref in ("cuda", "rocm", "xpu", "mps"):
+    for pref in ACCELERATOR_PRIORITY:
         if pref in detected:
             family = pref  # type: ignore[assignment]
             break
@@ -628,11 +982,47 @@ def detect_host_caps() -> HostCaps:
     return _probe()
 
 
+def gpu_probe_skipped() -> bool:
+    """Whether this process runs on an explicit CPU choice and must not touch a
+    GPU runtime: background checks (pool sizing, compatibility notices, cache
+    release) ask this instead of ``torch.cuda.is_available()``, which would
+    initialise the driver the choice is avoiding. Frozen per process like the
+    caps it reads. Never raises."""
+    try:
+        return bool(getattr(detect_host_caps(), "gpu_probe_skipped", False))
+    except Exception:  # noqa: BLE001 - a status question must never fail its caller
+        return False
+
+
 def refresh() -> HostCaps:
     """Clear the cache and re-probe. **TEST-ONLY** — nothing in the running app
     calls this (host caps are immutable per process)."""
     detect_host_caps.cache_clear()
     return detect_host_caps()
+
+
+# ── CPU-host precision + Windows-on-ARM detection ───────────────────────────
+
+# ── Windows-on-ARM detection ─────────────────────────────────────────────────
+
+
+def is_windows_on_arm() -> bool:
+    """True on a Windows-on-ARM machine, including an x64 interpreter running
+    under its Prism emulation layer (the only supported runtime there).
+
+    ``platform.machine()`` reports ``AMD64`` inside the emulated interpreter, so
+    it cannot tell a Snapdragon laptop from an ordinary x64 PC. Windows sets
+    ``PROCESSOR_ARCHITEW6432=ARM64`` for emulated processes; a native ARM64
+    process reports ``PROCESSOR_ARCHITECTURE=ARM64`` instead (also treated as
+    ARM — the answer to "is this an ARM Windows machine", not "is Python
+    native"). Never raises; always False off Windows.
+    """
+    if sys.platform != "win32":
+        return False
+    for key in ("PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"):
+        if os.environ.get(key, "").strip().upper() == "ARM64":
+            return True
+    return _platform.machine().strip().upper() == "ARM64"
 
 
 def mlx_supported() -> tuple[bool, str]:
@@ -675,11 +1065,19 @@ __all__ = [
     "detect_host_caps",
     "refresh",
     "mlx_supported",
+    "is_windows_on_arm",
     "arch_unsupported",
     "gfx_for_hsa_override",
+    "gfx_generation",
+    "rocm_override_target",
     "hsa_override_for",
+    "same_generation_targets",
     "build_arch_list",
-    "ROCM_GFX_OVERRIDES",
     "KERNEL_RISK_MARKER",
+    "LEGACY_NVIDIA_MARKER",
+    "is_legacy_nvidia_arch",
+    "legacy_nvidia_advice",
     "DIRECTML_MARKER",
+    "UNUSABLE_GPU_MARKER",
+    "cuda_forced",
 ]

@@ -1,149 +1,445 @@
-# Releasing — self-updating builds for mac / linux / windows
+# Releasing VoiceStudio
 
-This doc covers the release workflow after the auto-updater wiring landed. Read top-to-bottom the first time. After that, cutting a release is the three commands in §5.
+Electron is the only maintained desktop distribution. Tauri ended at v0.5.3;
+its signed updater feeds and installers are immutable compatibility assets.
 
-## 1. One-time repo setup
+Shared store inputs and platform handoffs are defined in
+[`STORE-PUBLISHING.md`](STORE-PUBLISHING.md). Microsoft Store, Snap Store and
+Mac App Store are not maintained release channels until each has completed its
+first verified production publication.
 
-The signing key was generated locally at `~/.tauri/omnivoice-updater.key` (private) and `~/.tauri/omnivoice-updater.key.pub` (public). The public key is already embedded in `frontend/src-tauri/tauri.conf.json` — that's what shipping clients use to verify updates.
+Snap Store packaging runs through `.github/workflows/snap-store.yml`. Each
+`v*` tag builds the strict Snap and uploads it to the Store's `candidate`
+channel using `SNAPCRAFT_STORE_CREDENTIALS` from the `snap-store` environment.
+Stable is never automatic: after the runbook checks, the repository owner
+dispatches the workflow with `promote_revision`. Follow the
+[`Snap Store runbook`](store-publishing/snap-store.md) for confinement checks,
+candidate verification, evidence and rollback. Do not add a Snap to the
+maintained-channel table below until its stable listing is independently
+install-verified.
 
-The private key needs to live in **GitHub Actions Secrets** so CI can sign each release:
+Microsoft Store EXE preparation uses the owner-dispatched
+`microsoft-store.yml` workflow and the
+[`Microsoft Store runbook`](store/microsoft-store.md). It builds a distinct
+Store installer without changing direct-download artifacts. Staging its
+immutable versioned URL requires owner approval; Partner Center submission and
+publication remain manual owner actions.
 
-1. Read the private key contents:
-   ```
-   cat ~/.tauri/omnivoice-updater.key
-   ```
-2. GitHub → Settings → Secrets and variables → Actions → **New repository secret** (on `debpalash/VoiceStudio`, which is where the updater endpoint points):
-   - Name: `TAURI_SIGNING_PRIVATE_KEY`
-   - Value: paste the full contents (including the `untrusted comment:` header line)
-3. Add a second secret:
-   - Name: `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-   - Value: leave blank (the key was generated without a password)
+Mac App Store preparation uses the manual, private `mac-app-store.yml` workflow
+and the [`Mac App Store runbook`](../store/mac-app-store.md). The workflow cannot
+build while the bundled-runtime compliance gate is unresolved and never uploads
+to App Store Connect. MAS packages use App Store updates; direct macOS packages
+keep the existing application updater and Developer ID notarization path.
 
-**Back the key up.** Copy `~/.tauri/omnivoice-updater.key` to a password manager or encrypted vault. If you lose it, you can never ship an update for any client that has the current public key — they'll be stranded and need a manual reinstall.
+## Credentials
 
-## 2. One-time account setup (you)
+Electron publication uses these GitHub Actions secrets:
 
-**Rotate the leaked GH token** (the `ghp_...` in `origin` remote). See the session transcript — already flagged. Do this before anything else.
+- `ELECTRON_MACOS_CSC_LINK` and `ELECTRON_MACOS_CSC_KEY_PASSWORD` for the
+  Developer ID Application `.p12` certificate and its password.
+- `ELECTRON_MAC_APP_STORE_CSC_LINK`,
+  `ELECTRON_MAC_APP_STORE_CSC_KEY_PASSWORD`,
+  `ELECTRON_MAC_APP_STORE_INSTALLER_LINK`,
+  `ELECTRON_MAC_APP_STORE_INSTALLER_KEY_PASSWORD` and
+  `ELECTRON_MAC_APP_STORE_PROVISIONING_PROFILE` for private MAS packaging.
+  These are separate from Developer ID credentials and do not authorize upload
+  or publication.
+- `APPLE_API_KEY` (raw `.p8` PEM text), `APPLE_API_KEY_ID` and
+  `APPLE_API_ISSUER` for macOS notarization and stapling. Use an App Store
+  Connect team key with Developer access. The packaging step writes the key
+  into a private temporary file and removes it on success or failure. Apple
+  ID passwords are not used by this workflow.
+- `ELECTRON_WINDOWS_CSC_LINK` and `ELECTRON_WINDOWS_CSC_KEY_PASSWORD` for
+  Windows Authenticode signing. The macOS certificate cannot sign Windows apps.
+- `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID` and
+  `APP_STORE_CONNECT_API_KEY` in the `app-store-connect` environment for the
+  iOS TestFlight upload ([`mobile.md`](mobile.md#testflight-maintainers)).
+  TestFlight is not a release channel.
+- `ANDROID_UPLOAD_KEYSTORE`, `ANDROID_UPLOAD_KEYSTORE_PASSWORD`,
+  `ANDROID_UPLOAD_KEY_ALIAS`, `ANDROID_UPLOAD_KEY_PASSWORD` and
+  `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` in the `google-play` environment for the
+  Play internal testing upload ([`mobile.md`](mobile.md#play-internal-testing-maintainers)).
+  Play internal testing is not a release channel either.
+- The repository `GITHUB_TOKEN` for draft creation and asset uploads.
+- `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for the Docker Hub mirror.
+- No analytics secret is needed: the destination is the public Supermetry site
+  id in `config/analytics.json`. Analytics still sends nothing without a yes at
+  the first-run consent prompt.
 
-No Apple Developer / Windows signing certs needed for v1. Apps ship unsigned; first-launch shows "unverified developer" warnings that users bypass with right-click → Open (mac) or "Run anyway" (Windows SmartScreen). Self-update still works — Tauri's updater verifies via its own signing key, independent of OS code signing.
+The archived `TAURI_SIGNING_PRIVATE_KEY*` secrets are retained only so the final
+Tauri release can be audited. The Tauri release workflow has been removed; every
+new version ships through `electron-release.yml`. `TAURI_SUNSET_TAG` must continue to identify v0.5.3 so Electron releases
+can copy the final signed `latest.json` and `latest-user.json` feeds unchanged.
+Those feeds must always point to immutable v0.5.3 Tauri assets; old Tauri clients
+must never receive an Electron installer.
 
-## 3. What the updater does
+## Versioning
 
-On every app launch, the webview:
-1. Fetches `https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json`
-2. Compares the version in `latest.json` to the running app's version (from `tauri.conf.json`)
-3. If newer, shows a native dialog: *"A new version (x.y.z) is available. Download and install now?"*
-4. If user accepts, downloads the signed update bundle, verifies the minisign signature against the embedded pubkey, replaces the app in place, relaunches.
+The root `package.json` is the single source of truth for the maintained app
+version. Electron Builder reads it directly. Keep these active mirrors equal:
 
-Failures (no network, 404, signature mismatch) are silent — the app continues to launch normally. Check the frontend devtools console for `Updater check failed` messages if you're debugging.
-
-## 4. Version bumps
-
-`frontend/package.json` is the **single source of truth** for the app version
-(hard rule, owner-set 2026-06-16 — full rationale in CLAUDE.md → Conventions →
-Versioning). Vite injects `__APP_VERSION__` from it, and
-`frontend/src-tauri/tauri.conf.json` derives its bundle version from it
-(`"version": "../package.json"` — never hand-edit a literal back in). Three
-toolchain-required mirrors are bumped in lockstep:
-
-- `frontend/src-tauri/Cargo.toml`
 - `pyproject.toml`
 - `backend/core/version.py` (`_FALLBACK_VERSION`)
 
-Lockstep is guarded by `tests/test_app_version.py`. With `AUTO_VERSION_BUMP`
-off (the current owner setting), `main` holds at the released version between
-releases; the post-release bump to `X.Y.(Z+1)` happens only when the owner
-asks. Keep bumps monotonic — the updater uses semver comparison, so `v0.2.0`
-does not update clients already on `v0.2.1`.
+The archived Tauri manifests stay frozen at their final release. Do not bump or
+rebuild them. `tests/test_app_version.py` enforces the active version contract.
+Version bumps are manual and require owner approval. Until a bump is requested,
+`main` may remain at the latest released version. For a release, bump the
+canonical version and both maintained mirrors together, then tag that exact
+version only after validation.
 
-## 5. Cutting a release
+## Before tagging
 
-1. **CHANGELOG first (hard rule):** make sure `CHANGELOG.md` has a complete,
-   user-facing `## [X.Y.Z] — DATE` section (rename `## [Unreleased]`).
-   `release.yml` extracts that section verbatim as the GitHub Release body —
-   a missing section ships a bare release.
-2. Verify the version files match the tag you're about to cut:
-   `uv run pytest tests/test_app_version.py -q`.
-3. Tag and push:
+1. Merge only after required CI and review are green.
+2. Run the artifact-only Electron build, `.github/workflows/electron-build.yml`,
+   and inspect all five outputs: Linux x64, Windows x64, Windows ARM64, macOS
+   arm64, macOS x64. Windows ARM64 is experimental: a failed leg does not block
+   the other four.
+   It first checks the setup screen, then installs and starts the managed Python
+   runtime in a separate temporary profile on Linux, Windows and Apple Silicon.
+   Intel Macs retain packaging/setup checks under their existing
+   [UI/remote-only contract](install/macos.md). The local-runtime test downloads
+   runtime packages, keeps model downloads disabled, verifies the live backend
+   connection and clean shutdown, and removes the test profile. A setup-screen
+   check alone is not evidence that runtime installation works.
+3. Verify a packaged launch and managed backend startup on the changed platforms.
+4. Fold the `changelog.d/` fragments into `## [Unreleased]` (`scripts/release.py` does this and deletes them; by hand: `uv run python scripts/changelog_fragments.py`), then rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] — YYYY-MM-DD`.
+   Open the section with its **Highlights** (3–5 bullets, the largest user-visible
+   change first; the workflow puts the Download table above them),
+   include migration steps and real screenshots when relevant, and verify human
+   contributors and bug reporters from the tag comparison and included PRs. The
+   release workflow adds a `### Contributors` block to the GitHub Release notes
+   by itself: everyone who committed since the latest stable release, plus the
+   authors of PRs merged in that span (ranked by commits; bots, AI agents and
+   unlinked placeholders are never listed). A second or later beta first lists
+   who is new since the previous beta, then that full list. It does **not** find bug reporters,
+   and it skips the block when the changelog section already has a
+   `### Contributors` heading, so write one by hand when you want roles or
+   reporters credited.
+   In `docs/install/issue-tracker.md`, change `Fixed on main` rows to `Fixed in release` and update the release named at the top.
+5. Run `uv run pytest tests/test_app_version.py tests/test_changelog_style.py -q`.
+6. Audit contributor agreements: `git fetch origin cla-signatures`, then
+   `GH_TOKEN=... python scripts/cla_audit.py`. Follow up with each unsigned
+   contributor it lists, asking them to sign `.github/CLA-1.0.md` (or their
+   employer the Corporate CLA). This step applies once the CLA workflow and
+   `scripts/cla_audit.py` are on `main`. The audit aborts if Git cannot read
+   any file’s history; restore access to missing objects and rerun before
+   treating its contributor list as complete.
+   The unsigned count includes only contributors required to sign by the existing
+   checker. Exempt account IDs attributed through tool/placeholder commits keep
+   a separate provenance-review row; no signature is invented for them. JSON
+   reports `signature_present`, `signing_required` and
+   `provenance_review_required`; legacy `signed` means actual signature-store
+   presence only. Review other unsigned and unresolved identities independently.
+   A successful audit exit means the inventory completed, not that every
+   signature or provenance question is resolved.
+7. Confirm the version matches the intended tag.
+8. [Rehearse the release](#rehearse-a-release) from the commit you will tag.
+
+## Rehearse a release
+
+Run the real release workflow without a tag before every tag, and whenever a
+release workflow change needs proof:
+
+```bash
+gh workflow run electron-release.yml --ref <branch> -f rehearsal=true
+```
+
+It builds the dispatched commit exactly as a tag would: every desktop package
+(Linux x64, Windows x64 and ARM64, macOS arm64 and x64), the CLI bundle inside
+them, the `omnivoice-tts` runtimes, the Android APK/AAB and the unsigned iPhone
+IPA, and the packaged smoke tests. The release job then collects every asset and
+runs `prepare_electron_release.py --rehearsal` against the version in
+`package.json` (it must be `X.Y.Z` or `X.Y.Z-beta.N`, and `CHANGELOG.md` must have
+its section), the updater feed checksum and channel checks, the Tauri sunset
+feeds for Stable, and the signing table. The notes, `SHA256SUMS.txt` and the
+installers stay on the workflow run for 3 days. When some build legs fail, the
+rehearsal still verifies the ones that built, then fails and lists the missing
+legs in the run summary; a release still stops at the first failed leg.
+
+It never publishes: no tag, no GitHub Release or draft, no feed upload, no
+Docker or Android repository dispatch. `publish`, `release_tag` and
+`allow_unsigned` are refused with `rehearsal`. macOS builds are signed and
+notarized when the Apple secrets exist, like a release. Phone builds skip the
+protected `mobile-release` environment, so the APK/AAB are unsigned. SignPath is
+skipped unless you add `-f signpath_policy=test-signing`, which signs the Windows
+installers with the project's test certificate; the release policy is never used.
+
+It does not prove the publishing steps themselves, the Android repository update,
+release-signed Android or App Store builds, SignPath release approval, or Docker
+images (`docker.yml` builds those on `main`).
+
+## Build a release draft
 
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-The `Desktop Release` workflow fires on tag push. It builds four targets in parallel on GitHub Actions runners:
+The tag starts `.github/workflows/electron-release.yml`. It builds the same five
+targets (a failed experimental Windows ARM64 leg does not block the others, and
+its feed is checked only when it was published), validates packaged startup and updater metadata, creates or
+updates a draft, and uploads:
 
-| Target | Runner | Artifact |
+- Electron installers named `VoiceStudio-<version>-<os>-<arch>.<ext>` (releases up to
+  v0.5.7-beta.3 used `VoiceStudio-Electron-*`) and platform-specific
+  `electron-stable-*.yml` feeds; feed file names never change, and each feed names
+  its own installer, so older clients update across the rename
+- per-platform `store-artifact-manifest-*.json` provenance records
+- `SHA256SUMS.txt`
+- authored CHANGELOG release notes
+- immutable copies of the final Tauri updater feeds for old clients
+
+Tag pushes never publish the Electron GitHub Release, and they do not build
+Docker images (the Snap workflow above uploads tags to `candidate` only). Inspect the
+draft and downloaded installers first.
+
+If the workflow itself needs a fix after tagging, keep the tag immutable. Merge
+and validate the workflow fix on `main`, then dispatch `electron-release.yml`
+from `main` with `release_tag=vX.Y.Z`. Every build still checks out the exact tag;
+only the workflow definition comes from `main`.
+
+## Publish
+
+Dispatch `electron-release.yml` for the exact tag with `publish=true`. Signing
+and notarization are required by default. The owner may explicitly set
+`allow_unsigned=true`. Never select that exception without the owner's decision.
+Every build, published or not, verifies what each platform leg actually ships
+and the release notes open with one **Download** table: every desktop and phone
+download with its signing, built from those checks (✅ signed and notarized, ⚠️
+unsigned or ad hoc, with what users will see). The changelog section follows
+it, starting with its **Highlights**, so it needs no download table of its own. A macOS bundle with an invalid signature always fails, and a platform
+whose signing credentials are configured fails if its installers are not signed
+with them, even with `allow_unsigned=true`.
+In particular, configured macOS releases still run the Gatekeeper assessment
+when the unsigned exception is needed for Windows; that exception does not
+skip macOS signature or notarization verification.
+The owner can delegate it: accounts listed in the `UNSIGNED_RELEASE_PUBLISHERS`
+Actions variable (comma-separated logins, Settings → Secrets and variables →
+Actions → Variables; only admins can edit it) may also dispatch or re-run an
+unsigned publish. Remove a login to revoke it; an empty variable means owner only.
+
+Publishing the GitHub Release triggers the Docker workflow for that tag. Docker
+release tags are never built from a tag push, and `:latest` only ever tracks
+`main`; a release does not move it.
+
+After publication, verify each maintained channel:
+
+| Channel             | Workflow                           | Verification                                                                                                                                                 |
+| ------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GitHub Release      | `electron-release.yml`             | Linux x64, Windows x64 (+ ARM64 when its leg passed), macOS arm64 and x64 installers, updater feeds, checksums, CHANGELOG notes, retained v0.5.3 Tauri feeds |
+| Phone downloads     | `electron-release.yml` → `mobile-release.yml` | Signed Android APK/AAB and unsigned iOS sideload IPA from the same tag |
+| GHCR CUDA           | `docker.yml` (release published)   | `:X.Y.Z`, `:X.Y`, `:stable` manifests                                                                                                                        |
+| GHCR ROCm           | `docker.yml` (release published)   | `:X.Y.Z-rocm`, `:X.Y-rocm`, `:stable-rocm` manifests                                                                                                         |
+| GHCR CUDA arm64     | `docker.yml` (release published)   | `:X.Y.Z-cuda-arm64`, `:X.Y-cuda-arm64`, `:stable-cuda-arm64` manifests (`linux/arm64`)                                                                       |
+| Docker Hub          | `docker.yml` (release published)   | Matching CUDA/ROCm/CUDA arm64 tags                                                                                                                           |
+| Docker Hub overview | `dockerhub-description.yml`                       | Read the `Update Docker Hub description` step log; the step may continue after a 403                                                                         |
+| Rolling containers  | `docker.yml` on `main` pushes only | `:latest`, `:main`, `:rocm` and `:cuda-arm64` timestamps move; a release never moves them                                                                    |
+
+For the Homebrew installation method, update
+[`Casks/voicestudio.rb` in the official tap](https://github.com/debpalash/homebrew-tap/blob/main/Casks/voicestudio.rb)
+after publishing a stable release: set its version and both architecture-specific
+DMG SHA-256 values from that release’s `SHA256SUMS.txt`. Validate with
+`brew style --cask debpalash/tap/voicestudio`,
+`brew audit --cask --online debpalash/tap/voicestudio` and
+`brew fetch --cask --all-platforms debpalash/tap/voicestudio` before merging the tap
+update. Keep prereleases out of this stable cask.
+
+A missing channel is a release bug. There are no RC tags; the one prerelease is
+the opt-in **Beta** channel (below). Previews between betas are builds from
+`main` (the `electron-build.yml` artifacts or Docker `:latest`), never a side
+branch. No Tauri build is maintained.
+
+## Release helper
+
+`make release` (or `uv run python scripts/release.py`) cuts a release from any
+branch. It shows the last release and the version on `main`, then asks **stable
+or beta** and suggests the new tag (`v0.5.7`, or `v0.5.7-beta.1`, `-beta.2`, ...
+for a beta; the beta suffix is always `-beta.N`). If `package.json` already names
+the upcoming release it uses that version; if that version is already tagged it
+moves to the next patch. Choices are arrow-key menus (up/down or `j`/`k`,
+Enter; Esc cancels) that fall back to typed answers when there is no terminal.
+It then asks **draft or publish**, prints the plan
+(including switching to `main` and fast-forwarding it), and only proceeds when you
+type the tag name.
+
+- **Two runs, because `main` only changes through pull requests.** The first
+  run bumps the three version files in lockstep, runs `uv lock`, writes the
+  `CHANGELOG.md` section from `[Unreleased]` (a stable release renames it; a
+  beta copies it, pointing its download links at the beta's own release files), runs the version guards, commits on `release/vX.Y.Z[-beta.N]`
+  and opens its pull request. Once that merges, run the helper again with the
+  same version: `main` already has it, so it changes nothing and only tags.
+- **Draft:** the tag push builds a draft release; nothing is public.
+- **Publish:** the tag push, then dispatches `electron-release.yml` with
+  `publish=true`. It lists which platforms have signing secrets (macOS needs the
+  Developer ID and notarization set, Windows needs `ELECTRON_WINDOWS_CSC_LINK` and
+  its password) and, for any platform without them, stops unless you explicitly
+  accept shipping that platform unsigned. The dispatch's `allow_unsigned` flag
+  only accepts platforms without credentials: a platform with signing configured
+  must still produce signed installers, and the notes' **Download**
+  table shows each platform's measured result.
+- `--publish vX.Y.Z[-beta.N]` (`make release-publish TAG=…`) publishes an existing
+  draft build later.
+- `--dry-run` (`make release-dry`) prints the plan and changes nothing.
+
+It does not replace the post-release verification below; run it every time.
+
+## Mobile apps
+
+Phone apps build from the same `vX.Y.Z` or `vX.Y.Z-beta.N` tag as desktop.
+`electron-release.yml` calls `mobile-release.yml` and waits for the signed
+Android APK/AAB and unsigned iOS sideload IPA before creating or publishing the
+GitHub Release. All downloads share its version and `SHA256SUMS.txt`. A failed
+phone build blocks publication; do not publish a desktop-only release manually.
+Docker CUDA, ROCm and CUDA arm64 builds are dispatched for that same tag after
+publication; verify their completion before calling the release complete.
+
+App Store signing and store promotion remain separate from GitHub downloads.
+The unsigned IPA requires signing with the user's own Apple ID to sideload; it
+is not a TestFlight build. Apple certificate availability cannot suppress this
+artifact. Manual `mobile-release` runs can set `release_ref` to an existing tag
+and `signed_ios=false` to recover phone artifacts without changing the tag.
+Legacy `mobile-v*` tags remain supported only for historical standalone builds.
+
+
+## Beta channel
+
+Beta is a second release channel cut from `main`, for testers who opt in under
+**Settings → Updates → Update channel** ([user guide](update-channels.md)). It
+has no soak period, no side branch and no cherry-picks.
+
+| | Stable | Beta |
 |---|---|---|
-| macOS Apple Silicon | macos-14 | `.dmg` + updater `.app.tar.gz` |
-| macOS Intel | macos-13 | `.dmg` + updater `.app.tar.gz` |
-| Windows x64 | windows-2022 | `.msi` + `.exe` + updater `.nsis.zip` |
-| Linux x64 | ubuntu-22.04 | `.AppImage` + `.deb` + updater `.AppImage.tar.gz` |
+| Tag and `package.json` version | `vX.Y.Z` | `vX.Y.Z-beta.N` |
+| GitHub Release | full release, becomes `latest` | **prerelease**, never `latest` |
+| Update feed | `electron-stable-<os>-<arch>` | `electron-beta-<os>-<arch>` |
+| Docker | `:X.Y.Z`, `:X.Y`, `:stable` (and `-rocm`, `-cuda-arm64`) | `:beta`, `:X.Y.Z-beta.N` (and `-rocm`, `-cuda-arm64`) |
+| Snap / Microsoft Store / Mac App Store | yes | no (Stable-only) |
+| Tauri sunset feeds | copied into the release | not copied |
 
-Each runner signs the updater payload with the stored `TAURI_SIGNING_PRIVATE_KEY`, merges into a single `latest.json`, and attaches everything to the draft release.
+Cutting a beta: with owner approval of the version, bump `package.json`,
+`pyproject.toml` and `_FALLBACK_VERSION` to `X.Y.Z-beta.N` together, run `uv lock`
+(it records the PEP 440 form `X.Y.ZbN`; the lockstep test compares versions, not
+strings), add a
+`## [X.Y.Z-beta.N]` section to `CHANGELOG.md`, tag from `main`, then run
+`electron-release.yml` with `publish`. The workflow derives the channel from
+the version (`prepare_electron_release.py --print-channel`), stamps it into every
+platform feed, publishes with `--prerelease --latest=false`, and dispatches
+Docker with `promote_stable=false`. Any other prerelease shape (`-rc`, `-alpha`)
+is rejected. The release is refused if it carries another channel's update
+feed (a stable `electron-stable-*` or `latest*` feed on a beta, a beta feed on
+stable), and after publishing the workflow checks that `releases/latest` still
+points at the newest stable.
 
-Workflow runtime: **~20-40 minutes** (PyInstaller + four platform builds). Follow progress at:
-`https://github.com/debpalash/VoiceStudio/actions`
+Promoting to Stable is a normal `vX.Y.Z` release from `main`. Beta users roll
+onto it automatically because the updater compares semver (`X.Y.Z-beta.N` sorts
+below `X.Y.Z`). The verification table above applies to Stable; for a beta also
+confirm the GitHub Release is flagged *Pre-release*, `releases/latest` still
+points at the last stable, and `:stable` and `:X.Y` did not move.
 
-When it finishes, the draft release needs manual publishing — GitHub → Releases → **Edit** the draft → **Publish release**. Once published, existing clients detect the update on their next launch.
+## Package requirements
 
-## 5b. Deployment channels — all must ship (hard rule, owner-set 2026-07-16)
+Linux packages must carry the native helper's non-glibc libraries under
+`resources/native/lib`. Packaging checks reject missing or host-resolved
+libraries. AppImages use the static runtime, which needs no host libfuse2; test
+the downloaded image on a clean host because build-runner libraries can hide
+relocation errors.
 
-A version bump is not "released" until **every** channel below carries it.
-Verify each one after the workflows finish — a missing channel is a release
-bug to fix immediately, not backlog.
+Every direct desktop installer except Intel macOS ships the OmniVoice GGUF
+runtime under `resources/bin/` (#2780). `electron-release.yml` and the
+packaging rehearsal call `build-omnivoice-tts.yml` (`desktop: true`) and stage
+each platform's artifact into `electron/build/omnivoice-tts/`; Windows ARM64
+ships the x64 build. Each platform ships `tts-server-<platform>` (the opt-in resident server,
+#3654) next to `omnivoice-tts-<platform>`; the build, the staging step and
+`packaging-contract.mjs` all fail if it is missing or absent from the manifest.
+Signing rewrites the binaries, so the build refreshes
+`bin/checksums.sha256` after signing (`electron/omnivoice-tts-bundle.mjs`; on
+macOS before the bundle is sealed). `packaging-contract.mjs` fails a release
+whose installer lacks the runtime, whose manifest no longer matches the shipped
+bytes, or (macOS) whose runtime is unsigned. A failed runtime build fails the
+release; there is no fallback that ships without it.
 
-| Channel | Source | Produced by | How to verify |
-|---|---|---|---|
-| GitHub Release: installers + signed `latest.json` (**Stable** updater channel) | the `vX.Y.Z` tag | `release.yml` on tag push | Release page has dmg (arm+intel), msi/exe, AppImage/deb, `latest.json`; body = the CHANGELOG section (not the auto-generated fallback), followed by per-platform checksums and a **Contributors** avatar strip (owner + every PR author for the tag — the `contributors-strip` job) |
-| **Preview** updater channel (rolling `preview` prerelease) | **`main` only** | `release.yml` nightly cron / manual dispatch | preview `latest.json` uses main's version when it is ahead; otherwise it advances the stable patch, then appends `-N` so it semver-sorts above stable |
-| GHCR CUDA image: `:X.Y.Z`, `:X.Y`, `:stable` | the tag | `docker.yml` on tag push | `docker manifest inspect ghcr.io/debpalash/omnivoice-studio:X.Y.Z` |
-| GHCR ROCm image: `:X.Y.Z-rocm`, `:X.Y-rocm`, `:stable-rocm` | the tag | `docker.yml` on tag push | same, with `-rocm` suffix |
-| Docker Hub mirror of **all** the above tags | the tag | `docker.yml` (gated on `DOCKERHUB_*` secrets) | tag list at hub.docker.com/r/palashdeb/omnivoice-studio/tags |
-| Docker Hub **overview page** | `deploy/dockerhub-overview.md` @ main | `docker.yml` on main pushes | **read the step log, not the job status** — the step is `continue-on-error` and 403s silently when `DOCKERHUB_TOKEN` lacks description-edit scope |
-| Rolling Docker previews: `:latest`, `:main`, `:rocm` | **`main` only** | `docker.yml` on every main push | tag timestamps move with main |
+Linux release AppImages include `gh-releases-zsync` update information and a
+versioned `.AppImage.zsync` asset for AppImageUpdate/AppImageLauncher. Release
+images follow the latest stable GitHub release. The build uses `readelf` and
+`zsyncmake` (Ubuntu package `zsync`) to embed this information before
+regenerating electron-updater's blockmap and checksums; the existing in-app
+updater still uses its separate channel manifest. Images up to v0.5.7-beta.3 look
+for `VoiceStudio-Electron-*-linux-x64.AppImage.zsync`, so AppImageUpdate cannot
+move them to a renamed release; they update through the in-app updater. Verify both update paths
+against the final downloaded artifact, not the pre-publish build.
 
-**Preview/RC policy:** there are no RC tags (beta cadence — see CLAUDE.md).
-The preview channel *is* the release candidate, and it **always builds from
-`main`** — the preview-gate in `release.yml` refuses `publish_preview` from
-any other branch, and the rolling Docker tags track `main` by construction.
-To get users testing a fix: merge to `main`, then cut a preview. Never a
-side-branch build.
+Windows ROCm RDNA 2 GPU speech uses the in-repo HIP CTranslate2 pinned in
+`rocm10.ctranslate2` of `scripts/windows-rocm-recipe.json` (release
+`ct2-rocm-4.8.4-78b1e17`). It is a dependency asset, not part of a release:
+releases reuse it unchanged. To rebuild (new upstream source or targets), edit the workflow's source pins
+(`CT2_BASE`, `CT2_TARGETS`, `CT2_TREE`, `CT2_VERSION`) and the recipe's target
+list, and set a new `RELEASE_TAG` in `.github/workflows/ct2-rocm-windows.yml`
+(the publish job fails if the tag already exists, since the recipe pins its
+bytes and `gh release create` would otherwise reuse the old tag). Add the new
+archive URL to `_SOURCES` in `backend/core/windows_rocm/ct2_recipe.py`, run the
+**CTranslate2 ROCm (Windows)** workflow, verify the downloaded archive's size and
+SHA-256 independently, then copy the run's printed pins (`pins.json`) into the
+recipe and update the exact-pin test in `tests/test_windows_rocm_rocm10.py`.
 
-## 6. Expect-to-fail-first-time on Windows and Linux
+Electron update manifests use platform and architecture channels. Confirm every
+manifest names an uploaded installer, reports the tagged version, and matches the
+artifact bytes. Exercise at least one installed update hop before publication.
 
-mac-ARM is tested locally. The other three platforms will likely hit PyInstaller issues on their first CI run because neither dependency set nor platform quirks have been exercised. Common failures to expect:
+Signed Electron macOS releases require a paid Apple Developer identity and the
+secrets above. A draft build without credentials can remain unsigned; a normal
+publish refuses missing signing/notarization credentials and verifies both the
+signature and stapled ticket. Do not accept `allow_unsigned` merely to close a
+signing report. Tauri signing keys cannot sign Electron packages. Existing
+artifact names, app IDs, data paths, and updater channels are compatibility
+contracts.
 
-- **Windows**: `mlx_whisper` is mac-only — need to conditional-guard the import in `backend.spec`. `demucs`'s CUDA autodetect may pull wheels we don't want. Long-path limits during the PyInstaller bundle.
-- **Linux**: `libasound` / `libwebkit2gtk` dev headers vs runtime confusion. AppImage FUSE assumptions on the runner.
-- **mac-Intel**: should work, but torch wheels for x86_64 differ — watch for `nvidia-*` wheels sneaking in via the default torch.
+Windows installers can instead be signed through SignPath Foundation: set the
+`SIGNPATH_API_TOKEN` secret and the `SIGNPATH_ORGANIZATION_ID`,
+`SIGNPATH_PROJECT_SLUG` and `SIGNPATH_SIGNING_POLICY_SLUG` variables, and leave
+`ELECTRON_WINDOWS_CSC_LINK` unset. The Windows build leg then signs the installer,
+and `electron/scripts/apply-signed-windows.mjs` regenerates the blockmap and the
+feed's sha512/size before upload. Policy and owner checklist:
+[code-signing-policy.md](code-signing-policy.md).
 
-When a target fails, either fix the root cause in the spec / workflow, or comment that matrix row out temporarily and keep the working targets shipping. The `fail-fast: false` setting means one failure doesn't kill the others.
+## Retry and rollback
 
-## 7. Testing the updater locally (before shipping a tag)
+Re-run failed jobs in the same workflow run when possible. The release job
+replaces only the current draft's Electron assets. It refuses to overwrite a
+published release.
 
-Two options:
+Clients only accept newer versions. To roll back, fix or revert the code, choose
+a higher patch version with owner approval, test it, and publish that version.
+Do not move or recreate an existing tag.
 
-**Option A — dry run the manifest:**
-After a release is published, hit the updater URL manually:
-```
-curl -L https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json | jq
-```
-You should see platform-keyed download URLs + minisign signatures. If that JSON looks right, clients will pick it up.
+## Merge queue (maintainers)
 
-**Option B — full end-to-end:**
-1. Install v0.1.0 on a fresh machine (or clean-installed Applications).
-2. Cut v0.2.0 (bump, tag, push, wait for CI, publish draft).
-3. Launch the installed v0.1.0. Within seconds, the dialog should appear.
-4. Accept → app downloads, verifies, replaces, relaunches as v0.2.0.
+[GitHub's merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue) is available only to repositories owned by an organization. This repository is owned by a user account, so the queue cannot be turned on. The current setup instead:
 
-If step 3 silently does nothing, DevTools console in the app webview has the `Updater check failed:` log.
+- The `main` ruleset requires branches to be up to date before merging. Merge current `main` into a stale PR and wait for its checks again; green checks against an older base do not prove the combined result.
+- **Auto-merge** is on: `gh pr merge N --auto --merge` merges a PR once its required checks pass.
+- The required aggregate CI status is **Tests (backend + frontend)**, which waits for every job in `ci.yml` (Python tests, platform smokes, Electron tests, renderer smokes, UI crawler, Desktop UI, Linux native package, installer contracts and the release smoke). A failure in any of them blocks the merge without listing each job in the ruleset. **CLA gate**, **Commit identities**, **CLA** and **Commit identity policy** are also required.
+- A PR's CI tests it merged with `main` as `main` stood when the run started. The up-to-date requirement prevents accepting that result after the base changes. After every merge, wait for that exact `main` commit's post-merge workflows; when a run fails, fixing `main` comes before the next merge.
 
-## 8. Rolling back
+Moving the repository to an organization would make the queue available, and the workflow support for it stays in place. The workflows are ready: `ci.yml` runs on `merge_group`, and `merge-queue-checks.yml` reports the PR-level required checks ("CLA gate", "Commit identities", "CLA", "Commit identity policy") on the queue's commit, because they cannot run there. `tests/test_merge_queue.py` keeps those names equal to the ruleset's required list; change both together.
 
-There's no "revert update" flow for clients — they'll only see a *newer* version. To roll back:
-1. Delete the broken release from GitHub Releases (or mark it as pre-release).
-2. Re-tag the previous good commit with a higher version (e.g., if you shipped bad `v0.2.0`, tag `v0.2.1` on the old `v0.1.0` commit).
-3. Clients auto-update to the "new" v0.2.1 which is actually the old code.
+On the queue commit, `ci.yml` compares the commit with its base to decide the documentation-only and Electron scopes, as it does for a pull request. The pass cache (see `.github/CONTRIBUTING.md` → Quality gates) lets a queued job skip when its inputs match a green run on `main`, so jobs whose inputs the queued pull requests did not touch do not run again. Pushes to `main` always run in full.
 
-Ugly but it works. Better plan: test with Option B above before publishing the draft.
+To turn it on once the repository belongs to an organization (Settings → Rules → Rulesets → `main`):
+
+1. Add **Require merge queue**: method *Merge commit*, build concurrency 1–3, minimum group size 1, wait time 0–5 minutes, status check timeout 60 minutes.
+2. Under **Require status checks to pass**, keep **Require branches to be up to date before merging** unticked; the queue makes it unnecessary.
+3. Merge PRs with **Merge when ready** (the queue button) instead of **Merge**. `gh pr merge N --merge` joins the queue once it is on.
+
+Try it on one PR first. If a queued PR stalls, a required check name in the ruleset no longer matches a job or status the queue commit reports: compare the ruleset with `tests/test_merge_queue.py`.
+
+### Fork container publishing
+
+The Docker workflow publishes canonical `voicestudio`, compatibility
+`omnivoice-studio`, and `voicestudio-buildcache` packages under the lowercase
+repository owner on GHCR. Forks publish only into their own GHCR namespace;
+upstream remains under `ghcr.io/debpalash`. CUDA, ROCm and CUDA arm64 share this
+namespace rule, including registry layer caches and manual release backfills.
+Docker Hub publishing still requires its existing explicit credentials and
+retains its configured image coordinate. Publishing a preview from a fork does
+not publish an upstream application release.

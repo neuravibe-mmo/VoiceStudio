@@ -4,18 +4,23 @@ VoiceStudio dictation records from the system-wide shortcut, transcribes
 locally, and—where the desktop permits it—inserts the result into the app where
 the shortcut was pressed. The pill never needs keyboard focus.
 
-The same flow is available to other applications through the bundled Rust
-control sidecar. Herdr actions, editor extensions, agent hooks, and scripts can
-start or stop VoiceStudio's capture over loopback HTTP/JSON-RPC or stream their
-own microphone audio to the versioned WebSocket API. See the
+Editor extensions, agent hooks, and scripts can stream their own microphone
+audio to the versioned WebSocket API or transcribe files over HTTP. See the
 [local speech platform](../speech-platform.md) for the protocol and examples.
 
 ## Use it
 
-1. Choose an installed dictation model in the Model Catalogue.
+1. Install a dictation model from the Model Catalogue, then pick it in **Settings → Voice** or from the top-bar Engines menu (**Transcription → Sherpa-ONNX dictation → Dictation model**). The same choice is what the Sherpa-ONNX engine loads for dubbing and batch transcription.
 2. Set the shortcut and hold/toggle behavior in **Settings → Hotkey**.
 3. Put the cursor in a text field, press the shortcut, speak, then release or
    press again.
+
+The Transcriptions page opens this recorder with one **Start dictation** action.
+Before you have any transcripts, this action is in the empty state; after the
+first transcript, it appears in the page header. On desktop, the action wakes
+the recorder window, waits for its acknowledgement, and confirms success only
+after the microphone start is accepted. The page reports when dictation is
+disabled, the request is rejected or times out, or the recorder fails to start.
 
 Whisper Tiny is the recommended default on macOS, Windows, and Linux. It
 auto-detects more than 90 languages. Parakeet TDT v3 remains available for its
@@ -27,6 +32,10 @@ ready for a normal paste. VoiceStudio retries a speech-level empty Sherpa decode
 only through another ASR model whose weights are already installed; when that
 fallback confirms the audio contains words, the silent model is demoted. This
 recovery never starts a download.
+
+Final transcript cleanup respects Arabic question marks, Urdu full stops, and
+Indic single/double danda as complete sentences, including before closing
+quotes. It does not append an extra Latin period to these marks.
 
 ## Destination and clipboard safety
 
@@ -49,6 +58,11 @@ attempting a lossy restore.
 
 ## Platform behavior
 
+On macOS, native keyboard creation, layout lookup, paste and live typing run on
+the main thread in both desktop shells. Session and clipboard work stays on its
+existing worker path, and paste keeps the active keyboard layout's Command-V
+mapping rather than assuming a physical QWERTY key.
+
 | Platform | Automatic insertion |
 | --- | --- |
 | macOS | Reactivates the captured application and sends Command-V. Without Accessibility permission, the result stays copied. |
@@ -67,3 +81,13 @@ changes. `dotool` needs direct write access to `/dev/uinput`; `ydotool` 1.0+
 needs a running `ydotoold` with that access and a user-readable socket.
 VoiceStudio checks these prerequisites before selection. Tray-started Wayland
 dictation always stays copy-only.
+
+### Transcriptions model setup
+
+Transcriptions checks the active dictation model before enabling **Start dictation**. If weights are missing, the page lists every dictation model, grouped by the trade-off you are choosing between — best accuracy (offline, transcribes after you stop) versus lowest latency (streaming, live text while you speak) — with languages and download size on each row, so you install the one that fits your work rather than only the recommended default. A model already on disk can be switched to without a download. The chosen model's name, download size, and installation progress are shown. Downloads require an explicit click. Failed downloads can be retried, and model state refreshes when returning from Settings. Once installation is verified, Start dictation becomes available; recording never starts automatically. Existing transcription history remains accessible during setup.
+
+### Floating recording controls
+
+The recording bubble includes **Pause / Resume**, **Stop**, and **Close**. Pause disables microphone tracks, stops sending new audio, and freezes the elapsed recording timer while preserving the session. Resume continues the same session. Stop (or the recording shortcut) finishes and transcribes, including when paused. Close cancels pending recording/transcription and releases the microphone; text already delivered to another app cannot be retracted. Pausing is manual, not triggered by silence or desktop inactivity.
+
+The Transcriptions page displays the effective recording shortcut and the platform paste shortcut. The floating bubble places its live transcript below the controls in a multiline preview, so controls cannot squeeze the text into a few characters.

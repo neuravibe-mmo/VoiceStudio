@@ -29,6 +29,9 @@ import pytest
 
 from services import asr_backend as ab
 
+# Selection must not depend on the machine running the suite (#3549).
+pytestmark = pytest.mark.usefixtures("neutral_asr_host")
+
 
 @pytest.fixture(autouse=True)
 def _clear_align_cache(monkeypatch):
@@ -140,6 +143,42 @@ def test_alignment_retries_on_cpu_before_giving_up_on_timing(monkeypatch):
     assert out == aligned  # timing preserved
 
 
+def test_alignment_retries_on_cpu_when_the_mps_aligner_fails_to_load(monkeypatch):
+    """#2570: a model that cannot LOAD on MPS is a device failure, not a
+    language without an aligner; the CPU must still get its turn."""
+    loaded: list[str] = []
+    aligned_on: list[str] = []
+    aligned = [{"text": "hi", "start": 0.0, "end": 1.0, "words": [{"word": "hi", "start": 0.0}]}]
+
+    def load(lang, dev):
+        loaded.append(dev)
+        return None if dev == "mps" else ("model", "meta")
+
+    def align(segs, model, meta, audio, device, **kw):
+        aligned_on.append(device)
+        return {"segments": aligned}
+
+    monkeypatch.delenv(ab._ALIGN_DEVICE_ENV, raising=False)
+    monkeypatch.setattr(ab, "_mps_available", lambda: True)
+    monkeypatch.setattr(ab, "load_align_model", load)
+    fake = type("W", (), {"align": staticmethod(align)})
+    monkeypatch.setitem(__import__("sys").modules, "whisperx", fake)
+
+    out = ab.forced_align([{"text": "hi", "start": 0.0, "end": 1.0}], object(), "en")
+    assert (loaded, aligned_on) == (["mps", "cpu"], ["cpu"])
+    assert out == aligned
+
+
+def test_a_language_with_no_aligner_on_any_device_keeps_native_timestamps(monkeypatch):
+    segments = [{"text": "x", "start": 0.0, "end": 1.0, "words": [{"word": "x", "start": 0.0}]}]
+    loaded: list[str] = []
+    monkeypatch.delenv(ab._ALIGN_DEVICE_ENV, raising=False)
+    monkeypatch.setattr(ab, "_mps_available", lambda: True)
+    monkeypatch.setattr(ab, "load_align_model", lambda lang, dev: loaded.append(dev))
+    assert ab.forced_align(segments, object(), "yue") == segments
+    assert loaded == ["mps", "cpu"]
+
+
 def test_a_language_with_no_aligner_keeps_its_native_timestamps(monkeypatch):
     """~20 languages have wav2vec2 aligners. The other 626 must still transcribe."""
     segments = [{"text": "x", "start": 0.0, "end": 1.0, "words": [{"word": "x", "start": 0.0}]}]
@@ -246,7 +285,7 @@ def test_env_pinned_parakeet_model_bypasses_language_gate(_fresh_capture_singlet
 def test_installing_parakeet_mid_session_rebuilds_capture_singleton(
         _fresh_capture_singleton, monkeypatch):
     """The warm-singleton cache key includes the parakeet gate, so installing
-    the model from Model Catalogue → Models takes effect on the next utterance —
+    the model from the engine's Weights list in Model Catalogue takes effect on the next utterance —
     not after an app restart (the stale-singleton regression)."""
     monkeypatch.setattr(ab.ParakeetMLXBackend, "is_available",
                         classmethod(lambda cls: (True, "ready")))
@@ -257,7 +296,7 @@ def test_installing_parakeet_mid_session_rebuilds_capture_singleton(
     assert isinstance(b1, ab.MLXWhisperBackend)
     # Warm reuse while nothing changed.
     assert ab.get_capture_asr_backend() is b1
-    installed["v"] = True  # user installs parakeet from Model Catalogue → Models
+    installed["v"] = True  # user installs parakeet from the engine's Weights list in Model Catalogue
     b2 = ab.get_capture_asr_backend()
     assert isinstance(b2, ab.ParakeetMLXBackend)
 

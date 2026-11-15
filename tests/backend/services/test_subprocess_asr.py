@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch  # noqa: F401 — front-load torch during collection (matches
@@ -59,11 +60,30 @@ def test_transcribe_round_trip(asr):
     assert result["segments"][0]["text"] == "echo:/tmp/clip.wav"
 
 
+def test_transcribe_exposes_chunks_from_segments(asr):
+    # Dub reads only `chunks`; a sidecar reply with just `segments` used to
+    # produce "Transcription produced no segments" (#2786).
+    result = asr.transcribe("/tmp/clip.wav", word_timestamps=False)
+    seg = result["segments"][0]
+    assert result["chunks"] == [
+        {"text": seg["text"], "timestamp": (seg.get("start"), seg.get("end"))}
+    ]
+
+
 def test_two_calls_reuse_one_sidecar(asr):
     asr.transcribe("/a.wav")
     proc1 = asr._proc.pid
     asr.transcribe("/b.wav")
     assert asr._proc.pid == proc1  # long-lived sidecar, not respawned per call
+
+
+def test_shared_loader_contract_starts_and_reuses_sidecar(asr):
+    """load_active_asr_backend calls ensure_loaded before transcribe."""
+    asr.ensure_loaded()
+    proc = asr._proc.pid
+    result = asr.transcribe("/after-preflight.wav")
+    assert asr._proc.pid == proc
+    assert result["segments"][0]["text"] == "echo:/after-preflight.wav"
 
 
 def test_crash_mid_transcribe_fails_then_respawns(monkeypatch, asr):
@@ -113,7 +133,8 @@ def test_isolated_backend_listed_in_settings_with_explanatory_hint():
         assert entry["reason"]  # unavailable must always say why
     # Wraps the same CTranslate2 engine as faster-whisper → same device support
     # (the registry default ("cpu",) would dishonestly hide CUDA routing).
-    assert entry["gpu_compat"] == ["cuda", "cpu"]
+    # Lists and tuples serialise to the same JSON array; compare the contents.
+    assert list(entry["gpu_compat"]) == ["cuda", "cpu"]
 
 
 def test_get_active_asr_backend_caches_isolated_singleton(monkeypatch):
@@ -139,3 +160,31 @@ def test_get_active_asr_backend_caches_isolated_singleton(monkeypatch):
 def test_generate_is_not_supported(asr):
     with pytest.raises(NotImplementedError):
         asr.generate("text")
+
+
+def test_sidecar_accepts_max_profile_decode_width(monkeypatch):
+    """The global Max preset sends beam_size/best_of=8 to this child."""
+    from engines._asr_sidecar import main as sidecar
+
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, path, **options):
+            calls.append((path, options))
+            segments = [SimpleNamespace(start=0, end=1, text="heard", words=[])]
+            return segments, SimpleNamespace(language="en")
+
+    monkeypatch.setattr(sidecar, "_get_model", lambda: FakeModel())
+    result = sidecar._transcribe(
+        "/max.wav",
+        False,
+        {"beam_size": 8, "best_of": 8},
+    )
+    assert calls == [
+        (
+            "/max.wav",
+            {"word_timestamps": False, "condition_on_previous_text": False,
+             "beam_size": 8, "best_of": 8},
+        )
+    ]
+    assert result["text"] == "heard"

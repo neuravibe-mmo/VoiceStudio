@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence
 
+from services.dub_qc import _NO_SPACE_SCRIPT
+
 
 MIN_DUR = 1.5         # seconds — below this, a segment must merge
 MIN_CHARS = 12        # characters — below this, a segment must merge (Latin-ish)
@@ -129,7 +131,7 @@ def _merge_segment_extra(target: Segment, incoming: Segment, *, prepend: bool) -
         )
 
     def joined(left: object, right: object) -> str:
-        return _clean(f"{left or ''} {right or ''}")
+        return _join_text((left, right))
 
     target_original = target.extra.get("text_original")
     incoming_original = incoming.extra.get("text_original")
@@ -165,6 +167,25 @@ def _merge_segment_extra(target: Segment, incoming: Segment, *, prepend: bool) -
 
 def _clean(text: str) -> str:
     return _WS.sub(" ", (text or "").strip())
+
+
+# Scripts written without spaces between words (CJK, kana, Thai, ...), plus
+# CJK and full-width punctuation. ASR returns their words unspaced, so joining
+# them with " " would print "word word word" into the transcript and the TTS.
+_UNSPACED = re.compile(f"[{_NO_SPACE_SCRIPT}\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65\uffe0-\uffe6]")
+
+
+def _join_text(parts: Iterable[object]) -> str:
+    """Join word or segment texts, with a space only where the script uses one."""
+    out = ""
+    for part in parts:
+        piece = _clean(str(part or ""))
+        if not piece:
+            continue
+        if out and not (_UNSPACED.match(out[-1]) and _UNSPACED.match(piece[0])):
+            out += " "
+        out += piece
+    return out
 
 
 def _best_boundary(text: str, ideal_pos: int) -> int:
@@ -203,39 +224,65 @@ def _best_boundary(text: str, ideal_pos: int) -> int:
     return length
 
 
-def _words_from_whisper(result: dict) -> List[Word]:
-    """Extract word-level timing if available, otherwise fall back to chunk-level."""
+def _spread_words(text: str, s: float, e: float) -> List[Word]:
+    """Split ``text`` into tokens spread evenly over ``[s, e]`` (no per-word
+    timing known). Empty text or a non-positive span yields nothing."""
+    text = _clean(text)
+    if not text or e <= s:
+        return []
+    tokens = text.split(" ")
+    dur = (e - s) / max(len(tokens), 1)
+    return [Word(start=s + k * dur, end=s + (k + 1) * dur, text=tok)
+            for k, tok in enumerate(tokens)]
+
+
+def _timed_words(seg: dict) -> List[Word]:
     words: List[Word] = []
+    for w in seg.get("words", []) or []:
+        wt = (w.get("word") or w.get("text") or "").strip()
+        if not wt:
+            continue
+        ws = float(w.get("start", seg.get("start", 0.0)))
+        we = float(w.get("end", seg.get("end", ws + 0.1)))
+        if we <= ws:
+            we = ws + 0.05
+        words.append(Word(start=ws, end=we, text=wt))
+    return words
+
+
+def _words_from_whisper(result: dict) -> List[Word]:
+    """Extract word-level timing if available, otherwise fall back to chunk-level.
+
+    When only SOME segments carry word timings (forced alignment can skip a
+    segment it cannot align), the others keep their speech: their text is
+    spread over their own segment span. Dropping them silently removed that
+    speech from the dub (#2572).
+    """
     segs = result.get("segments") if isinstance(result, dict) else None
     if segs:
-        for seg in segs:
-            for w in seg.get("words", []) or []:
-                wt = (w.get("word") or w.get("text") or "").strip()
-                if not wt:
+        per_segment = [_timed_words(seg) for seg in segs]
+        if any(per_segment):
+            words: List[Word] = []
+            for seg, timed in zip(segs, per_segment):
+                if timed:
+                    words.extend(timed)
                     continue
-                ws = float(w.get("start", seg.get("start", 0.0)))
-                we = float(w.get("end", seg.get("end", ws + 0.1)))
-                if we <= ws:
-                    we = ws + 0.05
-                words.append(Word(start=ws, end=we, text=wt))
-        if words:
+                try:
+                    start = float(seg.get("start"))
+                    end = float(seg.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                words.extend(_spread_words(seg.get("text", ""), start, end))
             return words
 
     # Fallback: chunk-level timings (no per-word granularity)
+    words = []
     for chunk in result.get("chunks", []) or []:
         ts = chunk.get("timestamp") or (0.0, 0.0)
         s = float(ts[0] or 0.0)
         e = float(ts[1] or s + 0.1)
-        text = _clean(chunk.get("text", ""))
-        if not text or e <= s:
-            continue
         # Distribute time evenly across the tokens inside the chunk
-        tokens = text.split(" ")
-        dur = (e - s) / max(len(tokens), 1)
-        t = s
-        for tok in tokens:
-            words.append(Word(start=t, end=t + dur, text=tok))
-            t += dur
+        words.extend(_spread_words(chunk.get("text", ""), s, e))
     return words
 
 
@@ -252,7 +299,7 @@ def _build_segments_from_words(words: Sequence[Word]) -> List[Segment]:
         nonlocal buf, buf_start
         if not buf:
             return
-        text = _clean(" ".join(w.text for w in buf))
+        text = _join_text(w.text for w in buf)
         if not text:
             buf = []
             return
@@ -316,7 +363,7 @@ def _build_segments_from_words(words: Sequence[Word]) -> List[Segment]:
                 segments.append(Segment(
                     start=buf_start,
                     end=left_buf[-1].end,
-                    text=_clean(" ".join(x.text for x in left_buf)),
+                    text=_join_text(x.text for x in left_buf),
                     extra={"words": _serialize_words(left_buf)},
                 ))
                 buf = list(right_buf)
@@ -377,24 +424,23 @@ def _merge_short(segments: List[Segment]) -> List[Segment]:
                     target = prev if prev_gap <= next_gap else nxt
                 else:
                     target = prev or nxt
-            elif prev:
-                target = prev
-            elif nxt:
-                target = nxt
+            # A genuine short turn with no same-speaker neighbour must stay
+            # attributed to its speaker; only ultra-short stray tokens above
+            # have permission to cross a known speaker boundary.
 
             if target is None:
                 i += 1
                 continue
             if target is prev:
                 _merge_segment_extra(prev, s, prepend=False)
-                prev.text = _clean(prev.text + " " + s.text)
+                prev.text = _join_text((prev.text, s.text))
                 prev.end = max(prev.end, s.end)
                 segments.pop(i)
                 did_merge = True
                 continue
             if target is nxt:
                 _merge_segment_extra(nxt, s, prepend=True)
-                nxt.text = _clean(s.text + " " + nxt.text)
+                nxt.text = _join_text((s.text, nxt.text))
                 nxt.start = min(nxt.start, s.start)
                 segments.pop(i)
                 did_merge = True
@@ -432,7 +478,7 @@ def _stitch_adjacent_shorts(segments: List[Segment]) -> List[Segment]:
                 and combined_dur <= MAX_DUR
             ):
                 _merge_segment_extra(a, b, prepend=False)
-                a.text = _clean(a.text + " " + b.text)
+                a.text = _join_text((a.text, b.text))
                 a.end = b.end
                 segments.pop(i + 1)
                 did = True
@@ -491,6 +537,35 @@ def _apply_scene_cuts(segments: List[Segment], scene_cuts: Iterable[float]) -> L
             dur_total = remaining.duration
             if dur_total <= 0:
                 break
+            words = remaining.extra.get("words")
+            if isinstance(words, list) and words:
+                # A camera cut is not a word boundary. Character-proportional
+                # splitting assigned words seconds away from their real speech.
+                candidates = [
+                    i for i in range(1, len(words))
+                    if float(words[i - 1]["end"]) <= float(words[i]["start"])
+                    and abs(float(words[i]["start"]) - cut) <= 0.25
+                ]
+                if not candidates:
+                    continue
+                split = min(candidates, key=lambda i: abs(float(words[i]["start"]) - cut))
+                left, right = words[:split], words[split:]
+                left_text = _join_text(w.get("text", w.get("word", "")) for w in left)
+                right_text = _join_text(w.get("text", w.get("word", "")) for w in right)
+                left_end, right_start = float(left[-1]["end"]), float(right[0]["start"])
+                if (len(left_text) < MIN_CHARS or len(right_text) < MIN_CHARS
+                        or left_end - remaining.start < MIN_DUR
+                        or remaining.end - right_start < MIN_DUR):
+                    continue
+                out.append(Segment(
+                    start=remaining.start, end=left_end, text=left_text,
+                    speaker_id=remaining.speaker_id, extra={**remaining.extra, "words": left},
+                ))
+                remaining = Segment(
+                    start=right_start, end=remaining.end, text=right_text,
+                    speaker_id=remaining.speaker_id, extra={**remaining.extra, "words": right},
+                )
+                continue
             ratio = (cut - remaining.start) / dur_total
             tentative_split = int(len(remaining.text) * ratio)
             pos = _best_boundary(remaining.text, tentative_split)
@@ -551,36 +626,79 @@ def segment_transcript(
     return [s.to_dict() for s in segments]
 
 
+def _overlap_by_label(start: float, end: float, turns: Sequence[tuple]) -> dict:
+    """Seconds of ``[start, end]`` covered by each speaker's turns."""
+    acc: dict = {}
+    for ts, te, label in turns:
+        left = max(start, ts)
+        right = min(end, te)
+        if right > left:
+            acc[label] = acc.get(label, 0.0) + (right - left)
+    return acc
+
+
+def _nearest_turn_label(
+    start: float, end: float, turns: Sequence[tuple], max_gap: float = float("inf"),
+) -> Optional[str]:
+    """Label of the turn closest in time to ``[start, end]`` (ties: earlier
+    turn), or None when no turn lies within ``max_gap`` seconds."""
+    best, best_gap = None, None
+    for ts, te, label in turns:
+        gap = max(ts - end, start - te, 0.0)
+        if gap <= max_gap and (best_gap is None or gap < best_gap):
+            best, best_gap = label, gap
+    return best
+
+
+def _label_from_turns(start: float, end: float, turns: Sequence[tuple]) -> Optional[str]:
+    """Speaker for a span: most overlap, then midpoint membership, then the
+    nearest turn (#3419).
+
+    Diarizers leave gaps between turns and drop very short utterances, so a
+    short line can sit wholly outside every turn. Before the nearest-turn
+    step such a line kept the label it had before diarization: the
+    silence-gap estimate on the streaming path, ``Speaker 1`` elsewhere. That
+    label belongs to a different numbering, so it could name a speaker the
+    diarizer never found or attribute the line to the wrong person.
+    """
+    overlap = _overlap_by_label(start, end, turns)
+    if overlap:
+        return max(overlap.items(), key=lambda kv: kv[1])[0]
+    mid = (start + end) / 2.0
+    for ts, te, label in turns:
+        if ts <= mid <= te:
+            return label
+    return _nearest_turn_label(start, end, turns)
+
+
+def _assign_from_turn_tuples(segments: List[dict], turns: Sequence[tuple]) -> List[dict]:
+    for s in segments:
+        label = _label_from_turns(s["start"], s["end"], turns)
+        if label is not None:
+            s["speaker_id"] = label
+    return segments
+
+
 def assign_speakers_from_diarization(
     segments: List[dict],
     diarization,
 ) -> List[dict]:
     """Replace speaker_id based on a pyannote diarization result (overlap-weighted)."""
-    for s in segments:
-        start, end = s["start"], s["end"]
-        mid = (start + end) / 2.0
-        overlap: dict[str, float] = {}
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            left = max(start, turn.start)
-            right = min(end, turn.end)
-            if right > left:
-                overlap[speaker] = overlap.get(speaker, 0.0) + (right - left)
-        if overlap:
-            winner = max(overlap.items(), key=lambda kv: kv[1])[0]
-        else:
-            # fall back to midpoint membership
-            winner = None
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                if turn.start <= mid <= turn.end:
-                    winner = speaker
-                    break
-        if winner is not None:
-            try:
-                idx = int(winner.split("_")[-1]) + 1
-                s["speaker_id"] = f"Speaker {idx}"
-            except ValueError:
-                s["speaker_id"] = winner
-    return segments
+    turns = [
+        (turn.start, turn.end, _diar_speaker_label(spk))
+        for turn, _, spk in diarization.itertracks(yield_label=True)
+    ]
+    return _assign_from_turn_tuples(segments, turns)
+
+
+def _normalise_turn_dicts(turns) -> List[tuple]:
+    return [
+        (t["start"], t["end"], t["speaker"])
+        for t in (turns or [])
+        if t.get("speaker") is not None
+        and t.get("start") is not None
+        and t.get("end") is not None
+    ]
 
 
 def assign_speakers_from_turns(
@@ -591,34 +709,15 @@ def assign_speakers_from_turns(
     turns produced by an ASR backend that diarizes inline (e.g. FunASR's cam++).
 
     Mirrors :func:`assign_speakers_from_diarization`'s overlap-weighting (winner
-    = most-overlapping speaker; midpoint membership as fallback) without a
-    pyannote object. ``speaker`` is used verbatim — FunASR already labels its
-    speakers ``"Speaker N"``. Falls back to the silence-gap heuristic when no
-    usable turns are supplied.
+    = most-overlapping speaker; midpoint membership, then nearest turn, as
+    fallbacks) without a pyannote object. ``speaker`` is used verbatim — FunASR
+    already labels its speakers ``"Speaker N"``. Falls back to the silence-gap
+    heuristic when no usable turns are supplied.
     """
-    clean = [
-        t for t in (turns or [])
-        if t.get("speaker") is not None and t.get("start") is not None and t.get("end") is not None
-    ]
+    clean = _normalise_turn_dicts(turns)
     if not clean:
         return assign_speakers_heuristic(segments)
-    for s in segments:
-        start, end = s["start"], s["end"]
-        mid = (start + end) / 2.0
-        overlap: dict = {}
-        for t in clean:
-            left = max(start, t["start"])
-            right = min(end, t["end"])
-            if right > left:
-                overlap[t["speaker"]] = overlap.get(t["speaker"], 0.0) + (right - left)
-        if overlap:
-            s["speaker_id"] = max(overlap.items(), key=lambda kv: kv[1])[0]
-        else:
-            for t in clean:
-                if t["start"] <= mid <= t["end"]:
-                    s["speaker_id"] = t["speaker"]
-                    break
-    return segments
+    return _assign_from_turn_tuples(segments, clean)
 
 
 def assign_speakers_heuristic(
@@ -672,28 +771,54 @@ def assign_speakers_heuristic(
 # words all map to ONE speaker is returned byte-for-byte unchanged — same dict,
 # id, text, start, end — so single-speaker dubs and their timing never move.
 
-def _word_speaker(w: "Word", turns: Sequence[tuple]) -> Optional[str]:
-    """Majority-overlap speaker label for a word; midpoint membership as a
-    fallback; ``None`` when the word has no diarization coverage at all."""
-    acc: dict = {}
-    for ts, te, label in turns:
-        left = max(w.start, ts)
-        right = min(w.end, te)
-        if right > left:
-            acc[label] = acc.get(label, 0.0) + (right - left)
+#: A word outside every turn takes the nearest turn's speaker when that turn
+#: is at most this far away; farther words inherit a neighbouring word's label.
+NEAREST_WORD_TURN_S = 0.5
+
+
+def _word_attribution(w: "Word", turns: Sequence[tuple]) -> tuple:
+    """``(label, exclusive)`` for a word.
+
+    ``label`` is the majority-overlap speaker, then midpoint membership, then
+    the nearest turn within NEAREST_WORD_TURN_S, else None. ``exclusive`` is
+    True only when turns of exactly one speaker cover at least half the word:
+    acoustic evidence strong enough to keep a one-word turn (see
+    :func:`_fill_and_smooth`).
+    """
+    acc = _overlap_by_label(w.start, w.end, turns)
     if acc:
-        return max(acc.items(), key=lambda kv: kv[1])[0]
+        label = max(acc.items(), key=lambda kv: kv[1])[0]
+        dur = max(w.end - w.start, 1e-6)
+        return label, len(acc) == 1 and acc[label] >= 0.5 * dur
     mid = (w.start + w.end) / 2.0
     for ts, te, label in turns:
         if ts <= mid <= te:
-            return label
-    return None
+            return label, False
+    return _nearest_turn_label(w.start, w.end, turns, NEAREST_WORD_TURN_S), False
 
 
-def _fill_and_smooth(labels: List[Optional[str]]) -> List[Optional[str]]:
+def _word_speaker(w: "Word", turns: Sequence[tuple]) -> Optional[str]:
+    """Speaker label for a word (see :func:`_word_attribution`)."""
+    return _word_attribution(w, turns)[0]
+
+
+def _keeps_one_word_turn(words: Sequence["Word"], i: int, exclusive: Sequence[bool]) -> bool:
+    """A one-word run between two runs of another speaker is a real reply
+    ("How are you? Fine. Good to hear."), not diarization noise, when only its
+    speaker's turn covers it and it is a sentence of its own: the word before
+    it ends a sentence, or the word itself does (#3419)."""
+    if not exclusive[i]:
+        return False
+    return bool(_SENTENCE_END.search(words[i - 1].text) or _SENTENCE_END.search(words[i].text))
+
+
+def _fill_and_smooth(
+    labels: List[Optional[str]], keep: Optional[Sequence[bool]] = None,
+) -> List[Optional[str]]:
     """Forward/back-fill gaps (words with no coverage inherit a neighbor) and
     smooth single-word flips, so one mis-attributed word inside a speaker's run
-    (diarization noise) doesn't trigger a spurious split."""
+    (diarization noise) doesn't trigger a spurious split. ``keep[i]`` marks a
+    one-word flip that is a genuine turn and must not be smoothed."""
     out = list(labels)
     n = len(out)
     last = None
@@ -710,6 +835,8 @@ def _fill_and_smooth(labels: List[Optional[str]]) -> List[Optional[str]]:
             nxt = out[i]
     for i in range(1, n - 1):
         if out[i] != out[i - 1] and out[i - 1] == out[i + 1]:
+            if keep is not None and keep[i]:
+                continue
             out[i] = out[i - 1]
     return out
 
@@ -730,11 +857,21 @@ def _resplit_core(
     out: List[dict] = []
     for seg in segments:
         s0, s1 = seg["start"], seg["end"]
-        seg_words = [w for w in ordered if min(w.end, s1) - max(w.start, s0) > 1e-6]
+        # Segment bounds are rounded to 0.01s (Segment.to_dict) while word
+        # times are not, so a neighbouring segment's boundary word can overlap
+        # this span by up to 5ms. Such a word's midpoint lies outside this
+        # span; a tiny word fully inside it is still this segment's word.
+        seg_words = [w for w in ordered if s0 < (w.start + w.end) / 2 < s1]
         if len(seg_words) < 2:
             out.append(seg)
             continue
-        labels = _fill_and_smooth([_word_speaker(w, turns) for w in seg_words])
+        attributed = [_word_attribution(w, turns) for w in seg_words]
+        exclusive = [a[1] for a in attributed]
+        keep = [
+            0 < i < len(seg_words) - 1 and _keeps_one_word_turn(seg_words, i, exclusive)
+            for i in range(len(seg_words))
+        ]
+        labels = _fill_and_smooth([a[0] for a in attributed], keep)
         if len({l for l in labels if l is not None}) <= 1:
             out.append(seg)  # single speaker (or unknown) → byte-for-byte unchanged
             continue
@@ -747,7 +884,7 @@ def _resplit_core(
         n_runs = len(runs)
         piece_no = 0
         for k, (label, ws) in enumerate(runs):
-            text = _clean(" ".join(w.text for w in ws))
+            text = _join_text(w.text for w in ws)
             if not text:
                 continue
             piece = dict(seg)
@@ -790,6 +927,20 @@ def resplit_segments_by_diarization(
     return _resplit_core(segments, words, turns)
 
 
+def label_segments_by_diarization(
+    segments: List[dict], words: Sequence["Word"], diarization,
+) -> List[dict]:
+    """Label segments from a diarization result, then split any segment whose
+    words span more than one speaker (#486, #3419).
+
+    The single entry point every transcription path uses, so no path can label
+    a two-speaker segment with its majority speaker and stop there — that left
+    the second speaker's turn merged into the first one's line.
+    """
+    assigned = assign_speakers_from_diarization(segments, diarization)
+    return resplit_segments_by_diarization(assigned, words, diarization)
+
+
 def resplit_segments_by_turns(
     segments: List[dict], words: Sequence["Word"], turns: Sequence[dict],
 ) -> List[dict]:
@@ -797,11 +948,75 @@ def resplit_segments_by_turns(
 
     ``speaker`` is used verbatim (FunASR already labels ``"Speaker N"``), matching
     :func:`assign_speakers_from_turns`."""
-    norm = [
-        (t["start"], t["end"], t["speaker"])
-        for t in (turns or [])
-        if t.get("speaker") is not None
-        and t.get("start") is not None
-        and t.get("end") is not None
-    ]
-    return _resplit_core(segments, words, norm)
+    return _resplit_core(segments, words, _normalise_turn_dicts(turns))
+
+
+def deduplicate_chunk_segments(segments: list[dict]) -> list[dict]:
+    """Remove repeated ASR context only when matching words share timestamps.
+
+    Preserve different speakers and genuine repeated speech at different times.
+    Input order retains chunk provenance even when a later chunk starts earlier.
+    """
+    import re
+
+    def token(word):
+        return re.sub(r'[^\w]', '', str(word.get('text', word.get('word', ''))).casefold())
+
+    def timed_words(segment):
+        words = segment.get('words') or []
+        return words if words and all(isinstance(w, dict) and isinstance(w.get('start'), (int, float))
+                                     and isinstance(w.get('end'), (int, float)) for w in words) else []
+
+    result = []
+    for segment in segments:
+        words = timed_words(segment)
+        matches = []
+        if words and segment.get("speaker_id"):
+            prior_words = [w for previous in result
+                           if previous.get('speaker_id') == segment.get('speaker_id')
+                           for w in timed_words(previous)
+                           if w['end'] >= words[0]['start'] - .35 and w['start'] <= words[-1]['end'] + .35]
+            for index, word in enumerate(words):
+                if token(word) and any(token(word) == token(prior)
+                                      and abs((word['start'] + word['end']) / 2 - (prior['start'] + prior['end']) / 2) <= .35
+                                      for prior in prior_words):
+                    matches.append(index)
+        # Require a substantial matching prefix; isolated common words cannot
+        # authorize deleting speech. No timing-only truncation is performed.
+        if len(matches) >= 3 and len(matches) / (matches[-1] + 1) >= .6:
+            cutoff = max((w['end'] for w in prior_words), default=0)
+            remaining = [w for w in words[matches[-1] + 1:] if w['start'] >= cutoff - .05]
+            if not remaining:
+                continue
+            text = _clean(' '.join(str(w.get('text', w.get('word', ''))) for w in remaining))
+            segment = {**segment, 'start': remaining[0]['start'], 'end': remaining[-1]['end'],
+                       'text': text, 'text_original': text, 'words': remaining}
+        result.append(segment)
+    def bounds(row):
+        words = timed_words(row)
+        if not words:
+            return None
+        if any(a['start'] > b['start'] for a, b in zip(words, words[1:])):
+            # Older chunk stitching can attach an earlier word to a later
+            # line. Never invert an interval or move it backwards over speech.
+            inside = [w for w in words if row['start'] <= w['start'] <= w['end'] <= row['end']]
+            if len(inside) < .6 * len(words):
+                return None
+            words = inside
+        start, end = min(w['start'] for w in words), max(w['end'] for w in words)
+        return (start, end) if end > start else None
+
+    # Repair stale camera-cut bounds only when timed words prove the two
+    # spoken intervals are disjoint. Genuine overlapping speech stays intact.
+    adjust = set()
+    ordered = sorted(enumerate(result), key=lambda item: item[1]['start'])
+    for position, (left_index, left) in enumerate(ordered):
+        for right_index, right in ordered[position + 1:]:
+            if right['start'] >= left['end']:
+                break
+            a, b = bounds(left), bounds(right)
+            if a and b and (a[1] <= b[0] or b[1] <= a[0]):
+                adjust.update((left_index, right_index))
+    result = [{**row, 'start': bounds(row)[0], 'end': bounds(row)[1]}
+              if index in adjust else row for index, row in enumerate(result)]
+    return result

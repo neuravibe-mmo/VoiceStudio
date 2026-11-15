@@ -91,7 +91,7 @@ def test_demoted_sherpa_query_keeps_pcm_transport_for_legacy_fallback(
     monkeypatch.setattr(sd, "is_demoted", lambda mid: mid == model_id)
     sample_rates = []
 
-    async def fallback(_chunks, *, pcm_sr=None):
+    async def fallback(_chunks, *, pcm_sr=None, **_ignored):
         sample_rates.append(pcm_sr)
         return {
             "text": "legacy fallback heard pcm",
@@ -254,10 +254,13 @@ def test_capture_preload_defaults_on(monkeypatch):
     import main
     monkeypatch.delenv("OMNIVOICE_PRELOAD_CAPTURE_ASR", raising=False)
     assert main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=True)
-    monkeypatch.setenv("OMNIVOICE_PRELOAD_CAPTURE_ASR", "0")
-    assert not main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=True)
-    monkeypatch.setenv("OMNIVOICE_PRELOAD_CAPTURE_ASR", "1")
-    assert main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=True)
+    assert not main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=False)
+    for value in ("1", " true ", "TRUE", "yes", "on"):
+        monkeypatch.setenv("OMNIVOICE_PRELOAD_CAPTURE_ASR", value)
+        assert main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=False)
+    for value in ("", "0", "false", "disabled", "garbage"):
+        monkeypatch.setenv("OMNIVOICE_PRELOAD_CAPTURE_ASR", value)
+        assert not main._env_flag("OMNIVOICE_PRELOAD_CAPTURE_ASR", default=True)
 
 
 def test_capture_preload_delay_default_and_override(monkeypatch):
@@ -287,3 +290,54 @@ def test_capture_preload_ram_guard(monkeypatch):
         raise RuntimeError("no vm info")
     monkeypatch.setattr(psutil, "virtual_memory", _boom)
     assert main._capture_preload_ram_ok()
+
+
+def test_pause_outlasts_silence_timeout_and_resume_keeps_audio(client, monkeypatch):
+    from api.routers import capture_ws as cw
+    monkeypatch.setattr(cw, 'SILENCE_TIMEOUT_S', 0.05)
+    monkeypatch.setattr(cw, 'PARTIAL_INTERVAL_S', 0.01)
+    sizes = []
+
+    async def final(chunks, **kwargs):
+        sizes.append(sum(map(len, chunks)))
+        return {'text': 'kept both parts', 'segments': [], 'language': 'en', 'engine': 'stub'}
+
+    monkeypatch.setattr(cw, '_transcribe_buffer_full', final)
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.send_bytes(_audio_chunk())
+        ws.send_text('PAUSE')
+        time.sleep(0.15)
+        ws.send_text('RESUME')
+        ws.send_bytes(_audio_chunk())
+        ws.send_text('EOF')
+        while ws.receive_json().get('type') != 'final':
+            pass
+    assert sizes == [40_000]
+
+
+@pytest.mark.parametrize("origin", ["app://voicestudio", "app://voicestudio.evil", "app://other-app"])
+def test_electron_stream_origin_and_final_delivery(client, monkeypatch, origin):
+    from starlette.websockets import WebSocketDisconnect
+    monkeypatch.delenv("OMNIVOICE_ALLOWED_ORIGINS", raising=False)
+    if origin != "app://voicestudio":
+        with pytest.raises(WebSocketDisconnect) as error:
+            with client.websocket_connect("/ws/transcribe", headers={"origin": origin}):
+                pass
+        assert error.value.code == 1008
+        return
+    with client.websocket_connect("/ws/transcribe", headers={"origin": origin}) as ws:
+        ws.send_bytes(_audio_chunk())
+        ws.send_text("EOF")
+        while True:
+            message = ws.receive_json()
+            if message["type"] == "final":
+                assert message["text"] == "Hello world."
+                break
+
+
+def test_electron_http_preflight_uses_the_same_desktop_origin(client):
+    response = client.options("/system/info", headers={
+        "origin": "app://voicestudio", "access-control-request-method": "GET",
+    })
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "app://voicestudio"

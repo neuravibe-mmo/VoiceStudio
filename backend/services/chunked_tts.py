@@ -19,6 +19,8 @@ callers keep their unchanged single-shot fast path.
 from __future__ import annotations
 
 import logging
+
+from core.render_trace import timed as _render_timed
 import re
 from typing import List
 
@@ -37,6 +39,15 @@ _ABBREVIATIONS = frozenset({
     "inc", "ltd", "corp", "dept", "est", "approx", "vs", "etc",
     "e.g", "i.e", "a.m", "p.m", "u.s", "u.s.a", "u.k",
 })
+
+# Non-Latin sentence enders: Arabic full stop (Urdu "khatma"), Arabic question
+# mark, Devanagari danda / double danda. Without them an Urdu, Persian, Arabic
+# or Hindi script over the chunk limit was cut at an arbitrary space
+# mid-sentence. They never mark abbreviations or decimals, and are matched
+# with or without a following space.
+_SCRIPT_SENTENCE_ENDERS = "\u06d4\u061f\u0964\u0965"
+# Arabic comma and semicolon — the clause-boundary fallback for those scripts.
+_SCRIPT_CLAUSE_MARKS = "\u060c\u061b"
 
 # Inline bracket tags (paralinguistic tags like [laugh]; our own
 # [pause 300ms] markers). The splitter must never cut inside one.
@@ -83,12 +94,54 @@ def _effective_max_chars(text: str, max_chars: int) -> int:
     return max_chars
 
 
+DEFAULT_TRIM_THRESHOLD_DB = -40.0
+DEFAULT_TRIM_KEEP_MS = 40
+
+_PARAGRAPH_BREAK = re.compile(r"\r?\n[ \t\r]*\n(?:[ \t\r]*\n)*")
+
+
+def trim_edge_silence(audio, sample_rate, *, threshold_db=DEFAULT_TRIM_THRESHOLD_DB,
+                      keep_ms=DEFAULT_TRIM_KEEP_MS):
+    """Cut the quiet lead-in and tail an engine adds around a render.
+
+    Works on the last axis of a 1-D or (channels, samples) tensor. A short
+    margin (``keep_ms``) of quiet audio is left on each side so the speech does
+    not start or stop abruptly. Silent or empty input comes back untouched, and
+    so does audio with nothing to cut (the same object).
+    """
+    if audio is None or audio.shape[-1] == 0:
+        return audio
+    level = 10 ** (threshold_db / 20)
+    magnitude = audio.abs()
+    if magnitude.dim() > 1:
+        magnitude = magnitude.reshape(-1, magnitude.shape[-1]).amax(dim=0)
+    loud = (magnitude > level).nonzero()
+    if loud.numel() == 0:
+        return audio
+    margin = int(sample_rate * keep_ms / 1000)
+    total = audio.shape[-1]
+    start = max(0, int(loud[0].item()) - margin)
+    end = min(total, int(loud[-1].item()) + 1 + margin)
+    if start == 0 and end == total:
+        return audio
+    return audio[..., start:end]
+
+
+def split_paragraphs(text) -> List[str]:
+    """Break text into paragraphs at blank lines; a lone newline stays inside."""
+    if not text:
+        return []
+    parts = (p.strip() for p in _PARAGRAPH_BREAK.split(text))
+    return [p for p in parts if p]
+
+
 def split_text_into_chunks(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> List[str]:
     """Split *text* at natural boundaries into chunks of at most *max_chars*.
 
     Priority: sentence-end (``.!?`` not after an abbreviation/decimal and not
-    inside brackets, plus fullwidth equivalents) -> clause boundary
-    (``;:,`` / em dash) -> whitespace -> hard cut that avoids splitting a
+    inside brackets, plus fullwidth CJK, Arabic-script and Devanagari enders)
+    -> clause boundary (``;:,`` / em dash / Arabic comma and semicolon)
+    -> whitespace -> hard cut that avoids splitting a
     ``[tag]``.
     """
     text = text.strip()
@@ -112,10 +165,19 @@ def split_text_into_chunks(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) 
             break
 
         segment = remaining[:max_chars]
+        # #3062: boundary detection must see one character PAST the window.
+        # The punctuation regexes accept end-of-string as "followed by
+        # whitespace", so judged on the window alone, a window that happened to
+        # end inside "3,5" (decimal comma), "e.g.", "site.com" or "..." looked
+        # like a clause/sentence end and the token was cut in two — each half
+        # then spoken on its own at the chunk boundary ("tres" + "cinco"
+        # instead of "tres virgula cinco"). With the lookahead, the end of the
+        # window is never a boundary unless the original text agrees.
+        window = remaining[: max_chars + 1]
 
-        split_pos = _find_last_sentence_end(segment)
+        split_pos = _find_last_sentence_end(window, limit=max_chars)
         if split_pos == -1:
-            split_pos = _find_last_clause_boundary(segment)
+            split_pos = _find_last_clause_boundary(window, limit=max_chars)
         if split_pos == -1:
             split_pos = segment.rfind(" ")
         if split_pos == -1:
@@ -213,16 +275,26 @@ def _merge_unspeakable(chunks: List[str], max_chars: int = 0) -> List[str]:
     return out
 
 
-def _find_last_sentence_end(text: str) -> int:
+def _find_last_sentence_end(text: str, limit: int | None = None) -> int:
     """Index of the last sentence-ending punctuation, or -1.
 
     Skips periods after common abbreviations and decimals, anything inside
     a bracket tag, and also recognizes fullwidth sentence punctuation
-    (ideographic full stop / fullwidth ! and ?) for no-space scripts.
+    (ideographic full stop / fullwidth ! and ?) and the Arabic-script /
+    Devanagari enders in ``_SCRIPT_SENTENCE_ENDERS``, with or without a
+    following space.
+
+    ``limit`` — only positions ``< limit`` count. Callers pass a window one
+    character longer than the chunk so the character after a candidate is the
+    real next character, not an artificial end-of-string (#3062).
     """
+    if limit is None:
+        limit = len(text)
     best = -1
     for m in re.finditer(r"[.!?](?:\s|$)", text):
         pos = m.start()
+        if pos >= limit:
+            continue
         if text[pos] == ".":
             word_start = pos - 1
             while word_start >= 0 and text[word_start].isalpha():
@@ -235,17 +307,27 @@ def _find_last_sentence_end(text: str) -> int:
         if _inside_bracket_tag(text, pos):
             continue
         best = pos
-    # Fullwidth sentence enders (ideographic full stop, fullwidth !, ?)
-    # written as escapes to keep the repo's no-literal-CJK gate clean.
-    for m in re.finditer("[\u3002\uff01\uff1f]", text):
-        if m.start() > best:
+    # Script-specific sentence enders that need no following space (writers
+    # often omit it): fullwidth CJK (written as escapes to keep the repo's
+    # no-literal-CJK gate clean), plus _SCRIPT_SENTENCE_ENDERS.
+    for m in re.finditer("[\u3002\uff01\uff1f" + _SCRIPT_SENTENCE_ENDERS + "]", text):
+        if best < m.start() < limit and not _inside_bracket_tag(text, m.start()):
             best = m.start()
     return best
 
 
-def _find_last_clause_boundary(text: str) -> int:
+def _find_last_clause_boundary(text: str, limit: int | None = None) -> int:
+    """Index of the last clause punctuation (``;:,`` / em dash / Arabic
+    comma and semicolon), or -1.
+
+    ``limit`` as in :func:`_find_last_sentence_end`.
+    """
+    if limit is None:
+        limit = len(text)
     best = -1
-    for m in re.finditer(r"[;:,—](?:\s|$)", text):
+    for m in re.finditer(r"[;:,—](?:\s|$)|[" + _SCRIPT_CLAUSE_MARKS + "]", text):
+        if m.start() >= limit:
+            continue
         if _inside_bracket_tag(text, m.start()):
             continue
         best = m.start()
@@ -318,7 +400,13 @@ def report_dropped_chunks(dropped: list, total: int, texts=None, sink=None) -> N
                 pass
         detail = ""
         if named:
-            detail = " — no audio for: " + "; ".join(repr(t[:80]) for t in named)
+            # The log is user-shareable diagnostics: scrub the whole sentence
+            # before truncating so a cut cannot split a secret past the
+            # scrubber. The sink keeps the raw text for the user's own view.
+            from core.scrub import scrub_text
+
+            detail = " — no audio for: " + "; ".join(
+                repr(scrub_text(t)[:80]) for t in named)
         logger.warning(
             "Dropped %d of %d rendered chunk(s): the engine returned no audio "
             "for them, so the output is missing that text%s. This is silent in "
@@ -337,7 +425,7 @@ def report_dropped_chunks(dropped: list, total: int, texts=None, sink=None) -> N
 
 def join_rendered_chunks(rendered: list, sample_rate: int, *,
                          crossfade_ms: int = DEFAULT_CROSSFADE_MS,
-                         texts=None, sink=None):
+                         texts=None, sink=None, trim_edges: bool = False):
     """Join what a multi-chunk render produced, reporting whatever it lost.
 
     ``None`` when nothing rendered — the caller's dead-render handling owns
@@ -350,9 +438,16 @@ def join_rendered_chunks(rendered: list, sample_rate: int, *,
     silent-truncation bug (#1330) one branch over. Keeping the decision in one
     function means there is one place that can be wrong, and it is testable.
     """
-    dropped = [i for i, r in enumerate(rendered)
-               if r is None or getattr(r, "shape", (0,))[-1] == 0]
-    kept = [r for i, r in enumerate(rendered) if i not in set(dropped)]
+    def _is_empty(item) -> bool:
+        shape = getattr(item, "shape", None)
+        return item is None or shape is None or shape[-1] == 0
+
+    # One pass to find the empties, one lookup set built once, one pass to keep.
+    dropped = [i for i, item in enumerate(rendered) if _is_empty(item)]
+    empty_idx = set(dropped)
+    kept = [item for i, item in enumerate(rendered) if i not in empty_idx]
+    if trim_edges:
+        kept = [trim_edge_silence(r, sample_rate) for r in kept]
     if not kept:
         if dropped:
             report_dropped_chunks(dropped, len(rendered), texts, sink)
@@ -363,11 +458,13 @@ def join_rendered_chunks(rendered: list, sample_rate: int, *,
         if dropped:
             report_dropped_chunks(dropped, len(rendered), texts, sink)
         return kept[0]
-    return concatenate_audio_chunks(rendered, sample_rate,
-                                    crossfade_ms=crossfade_ms, texts=texts,
-                                    sink=sink)
+    if dropped:
+        report_dropped_chunks(dropped, len(rendered), texts, sink)
+    return concatenate_audio_chunks(kept, sample_rate,
+                                    crossfade_ms=crossfade_ms)
 
 
+@_render_timed('join')
 def concatenate_audio_chunks(chunks: list, sample_rate: int,
                              crossfade_ms: int = DEFAULT_CROSSFADE_MS,
                              texts=None, sink=None):
@@ -407,17 +504,29 @@ def concatenate_audio_chunks(chunks: list, sample_rate: int,
     chunks = _normalize_chunk_shapes(chunks)
 
     crossfade_samples = int(sample_rate * crossfade_ms / 1000)
-    result = chunks[0]
 
+    # Plan from lengths alone: how much each chunk overlaps what is already
+    # joined, and where it starts in the output.
+    overlaps = []
+    starts = []
+    joined = chunks[0].shape[-1]
     for chunk in chunks[1:]:
-        chunk = chunk.to(device=result.device, dtype=result.dtype)
-        overlap = min(crossfade_samples, result.shape[-1], chunk.shape[-1])
-        if overlap > 0:
-            fade_out = torch.linspace(1.0, 0.0, overlap, dtype=result.dtype, device=result.device)
-            fade_in = torch.linspace(0.0, 1.0, overlap, dtype=result.dtype, device=result.device)
-            blended = result[..., -overlap:] * fade_out + chunk[..., :overlap] * fade_in
-            result = torch.cat([result[..., :-overlap], blended, chunk[..., overlap:]], dim=-1)
-        else:
-            result = torch.cat([result, chunk], dim=-1)
+        n = chunk.shape[-1]
+        ov = max(0, min(crossfade_samples, joined, n))
+        overlaps.append(ov)
+        starts.append(joined - ov)
+        joined += n - ov
 
-    return result
+    first = chunks[0]
+    out = torch.empty((*first.shape[:-1], joined), dtype=first.dtype, device=first.device)
+    out[..., : first.shape[-1]] = first
+    for chunk, ov, start in zip(chunks[1:], overlaps, starts):
+        chunk = chunk.to(device=out.device, dtype=out.dtype)
+        if ov > 0:
+            fade_out = torch.linspace(1, 0, ov, device=out.device, dtype=out.dtype)
+            fade_in = torch.linspace(0, 1, ov, device=out.device, dtype=out.dtype)
+            out[..., start : start + ov] = (
+                out[..., start : start + ov] * fade_out + chunk[..., :ov] * fade_in
+            )
+        out[..., start + ov : start + chunk.shape[-1]] = chunk[..., ov:]
+    return out

@@ -24,6 +24,7 @@ def _resolve_active_csrf_module():
 def _clean_origin_environment(monkeypatch):
     monkeypatch.delenv("OMNIVOICE_ALLOWED_ORIGINS", raising=False)
     monkeypatch.delenv("OMNIVOICE_UI_PORT", raising=False)
+    monkeypatch.delenv("VOICESTUDIO_UI_PORT", raising=False)
 
 
 def _connection(
@@ -97,9 +98,30 @@ def test_explicit_allowed_origin_is_exact_and_port_bound(monkeypatch):
     assert origin_allowed(_connection(origin="https://ui.test.evil")) is False
 
 
-def test_default_tauri_origins_are_allowed():
-    assert origin_allowed(_connection(origin="tauri://localhost")) is True
-    assert origin_allowed(_connection(origin="http://tauri.localhost")) is True
+def test_default_desktop_origin_is_allowed_and_retired_tauri_origins_are_not():
+    assert origin_allowed(_connection(origin="app://voicestudio")) is True
+    # Final Tauri installs talk to the backend they bundle, never this one.
+    assert origin_allowed(_connection(origin="tauri://localhost")) is False
+    assert origin_allowed(_connection(origin="http://tauri.localhost")) is False
+
+
+@pytest.mark.parametrize("name", ["OMNIVOICE_UI_PORT", "VOICESTUDIO_UI_PORT"])
+def test_ui_port_accepts_the_canonical_name_and_its_alias(monkeypatch, name):
+    monkeypatch.delenv("OMNIVOICE_UI_PORT", raising=False)
+    monkeypatch.delenv("VOICESTUDIO_UI_PORT", raising=False)
+    monkeypatch.delenv("OMNIVOICE_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv(name, "4100")
+
+    assert origin_allowed(_connection(origin="http://localhost:4100")) is True
+    assert origin_allowed(_connection(origin="http://localhost:3901")) is False
+
+
+def test_canonical_ui_port_wins_over_the_alias(monkeypatch):
+    ui_port = importlib.import_module("core.csrf").ui_port
+
+    monkeypatch.setenv("OMNIVOICE_UI_PORT", "4100")
+    monkeypatch.setenv("VOICESTUDIO_UI_PORT", "4200")
+    assert ui_port() == 4100
 
 
 def test_invalid_ui_port_falls_back_to_the_default_allowlist(monkeypatch):
@@ -192,3 +214,10 @@ def test_side_effectful_get_accepts_all_three_browser_proofs():
     connection = _connection(method="GET", fetch_site="same-origin")
 
     assert cookie_csrf_allowed(connection, side_effectful_get=True) is True
+
+def test_electron_origin_is_exact_and_respects_explicit_allowlists(monkeypatch):
+    assert origin_allowed(_connection(origin="app://voicestudio")) is True
+    for origin in ("app://evil", "app://voicestudio.evil", "app://voicestudio:3900", "app://user@voicestudio", "app://voicestudio/path"):
+        assert origin_allowed(_connection(origin=origin)) is False
+    monkeypatch.setenv("OMNIVOICE_ALLOWED_ORIGINS", "https://ui.test")
+    assert origin_allowed(_connection(origin="app://voicestudio")) is False

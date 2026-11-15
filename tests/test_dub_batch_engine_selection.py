@@ -1,5 +1,5 @@
 """Issue #312 class — dub generation and batch TTS must honor the active
-engine selection (Model Catalogue → Engines) instead of silently falling back to
+engine selection (Model Catalogue) instead of silently falling back to
 OmniVoice via services.model_manager.get_model(), and must refuse — with an
 actionable error naming alternatives — instead of mis-cloning when the
 active engine can't do reference-audio voice cloning.
@@ -71,7 +71,7 @@ def _make_fake_engine(engine_id, *, supports_cloning=True, available=True,
 
         def generate(self, text, **kw) -> torch.Tensor:
             type(self).calls.append((text, kw))
-            return torch.zeros(1, 24000)
+            return torch.full((1, 24000), 0.25)
 
     return _FakeEngine
 
@@ -308,7 +308,7 @@ def batch_job_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(b, "DATA_DIR", str(tmp_path))
 
-    async def _fake_run_transcribe_guarded(pool, fn, what=None):
+    async def _fake_run_transcribe_guarded(pool, fn, what=None, **kwargs):
         # Bypass real ASR entirely — the engine-selection gate under test
         # runs right after transcription, before translate/generate.
         return (
@@ -374,6 +374,17 @@ def test_batch_pinned_voice_fails_fast_on_noncloning_engine(
     b, make_job = batch_job_env
     fake = fake_registry("fake-batch-nonclone2", supports_cloning=False)
     monkeypatch.setenv("OMNIVOICE_TTS_BACKEND", "fake-batch-nonclone2")
+    monkeypatch.setattr(
+        b,
+        "_batch_voice",
+        lambda _voice_id: {
+            "ref_audio": "reference.wav",
+            "ref_text": "reference",
+            "instruct": "",
+            "seed": None,
+            "requires_cloning": True,
+        },
+    )
 
     job = make_job("jobB", voice_id="some-voice-id")
     with pytest.raises(ValueError) as exc_info:
@@ -404,3 +415,53 @@ def test_batch_respects_applies_own_mastering(
 
     assert len(fake.calls) == 1
     assert mastering_calls == []
+
+
+def test_batch_engine_contention_fails_instead_of_exporting_silence(
+    batch_job_env, fake_registry, no_omnivoice_model_manager, monkeypatch,
+):
+    from services.model_manager import GpuPoolBusyError
+
+    b, make_job = batch_job_env
+    fake = fake_registry("fake-batch-busy")
+    monkeypatch.setenv("OMNIVOICE_TTS_BACKEND", fake.id)
+    monkeypatch.setattr("services.model_manager.generate_timeout_s", lambda *a, **k: 0.05)
+    monkeypatch.setattr(b, "_BUSY_BACKOFF_S", (0.01,))
+
+    def busy(self, text, **kwargs):
+        raise GpuPoolBusyError("MLX-Audio is already generating speech.", retry_after=1)
+
+    monkeypatch.setattr(fake, "generate", busy)
+    job = make_job("busy-job")
+    with pytest.raises(RuntimeError, match="silent gap.*already generating speech"):
+        asyncio.run(b._run_batch_pipeline("busy-job", job))
+
+    assert not job.get("outputs")
+    assert not job.get("warnings")
+
+
+def test_batch_segment_waits_for_busy_engine_then_succeeds(
+    batch_job_env, fake_registry, no_omnivoice_model_manager, monkeypatch,
+):
+    from services.model_manager import GpuPoolBusyError
+
+    b, make_job = batch_job_env
+    fake = fake_registry("fake-batch-busy-then-free")
+    monkeypatch.setenv("OMNIVOICE_TTS_BACKEND", fake.id)
+    monkeypatch.setattr(b, "_BUSY_BACKOFF_S", (0.01,))
+    real_generate = fake.generate
+    attempts = []
+
+    def flaky(self, text, **kwargs):
+        attempts.append(text)
+        if len(attempts) < 3:
+            raise GpuPoolBusyError("MLX-Audio is already generating speech.", retry_after=1)
+        return real_generate(self, text, **kwargs)
+
+    monkeypatch.setattr(fake, "generate", flaky)
+    job = make_job("busy-then-free")
+    asyncio.run(b._run_batch_pipeline("busy-then-free", job))
+
+    assert len(attempts) == 3
+    assert not job.get("warnings")
+    assert job.get("outputs")

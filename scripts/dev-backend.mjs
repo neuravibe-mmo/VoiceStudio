@@ -21,31 +21,69 @@
 // the Windows CreateProcess PATH search — no shell needed).
 // ──────────────────────────────────────────────────────────────────────────
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_BACKEND_PORT } from "../config/app-config.mjs";
+import { asciiSafePthFilesSync } from "../electron/scripts/pth-ascii.mjs";
+
+export { DEFAULT_BACKEND_PORT };
+
+/** The port Vite proxies to (OMNIVOICE_PORT or config/app.json). */
+export function backendPort(env = process.env) {
+  const port = Number.parseInt(String(env.OMNIVOICE_PORT ?? "").trim(), 10);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BACKEND_PORT;
+}
+
+/**
+ * Loopback by default, like backend/main.py: the API ships unauthenticated on
+ * loopback, so `dev:api` must not publish it to the LAN. OMNIVOICE_BIND_HOST
+ * opts in to another interface, the same knob the backend honours.
+ */
+export function bindHost(env = process.env) {
+  return String(env.OMNIVOICE_BIND_HOST ?? "").trim() || "127.0.0.1";
+}
 
 // The wrapper owns Python source reloads so uvicorn's reload parent cannot stay
 // alive after its server worker dies (#1690).
-export const UVICORN_ARGS = [
-  "run",
-  "uvicorn",
-  "main:app",
-  "--app-dir",
-  "backend",
-  "--host",
-  "0.0.0.0",
-  "--port",
-  "3900",
-];
+export function uvicornArgs(env = process.env) {
+  return [
+    "run",
+    "uvicorn",
+    "main:app",
+    "--app-dir",
+    "backend",
+    "--host",
+    bindHost(env),
+    "--port",
+    String(backendPort(env)),
+  ];
+}
 
 export const CRASH_RESTART_DELAY_MS = 1_000;
 export const CRASH_RESTART_LIMIT = 3;
 export const CRASH_RESTART_WINDOW_MS = 60_000;
 export const SOURCE_RELOAD_DEBOUNCE_MS = 250;
+
+export function killProcessTree(
+  child,
+  sig,
+  { platform = process.platform, run = spawnSync } = {},
+) {
+  if (platform === "win32") {
+    const taskkillArgs = ["/pid", `${child.pid}`, "/T", "/F"];
+    const attempt = run("taskkill", taskkillArgs, { stdio: "ignore" });
+    const treeWasStopped = attempt != null && attempt.error == null && attempt.status === 0;
+    if (treeWasStopped) return "taskkill";
+    child.kill(sig);
+    return "fallback";
+  }
+  child.kill(sig);
+  return "signal";
+}
 
 export function isBackendSourceChange(filename) {
   return typeof filename === "string" && filename.toLowerCase().endsWith(".py");
@@ -106,13 +144,13 @@ export function buildExitBanner({ code, signal, logTail, logPath, platform = pro
   return lines.join("\n");
 }
 
-// `uv run` re-syncs the venv to uv.lock before launching — which would undo
-// the opt-in ROCm torch swap `scripts/setup.py` just performed (the lock pins
-// the CUDA build). `bun run setup:api` already did the sync, so skip it here
-// whenever the ROCm variant is requested (#1665).
+// Setup is explicit and chooses the CPU/CUDA wheel graph. Never let launch or
+// restart silently restore the default CUDA group (or undo a ROCm swap).
+
+/** `uv run` argv for launching the backend: same as uvicornArgs, minus any dependency re-sync. */
 export function uvRunArgs(env = process.env) {
-  const rocm = (env.OMNIVOICE_TORCH_VARIANT || "").trim().toLowerCase() === "rocm";
-  return rocm ? [UVICORN_ARGS[0], "--no-sync", ...UVICORN_ARGS.slice(1)] : UVICORN_ARGS;
+  const args = uvicornArgs(env);
+  return [args[0], "--no-sync", ...args.slice(1)];
 }
 
 /**
@@ -121,8 +159,12 @@ export function uvRunArgs(env = process.env) {
  */
 export function createBackendSupervisor({
   spawnBackend = () => spawn("uv", uvRunArgs(), { stdio: "inherit" }),
+  // A manual `uv sync` rewrites the editable .pth with the checkout path, which
+  // a non-ASCII folder on a non-UTF-8 Windows code page cannot start (#1783).
+  healPthFiles = () => asciiSafePthFilesSync(path.resolve(".venv")),
   watchBackend = (onChange) =>
     watch("backend", { recursive: true }, (_event, filename) => onChange(filename?.toString())),
+  killBackend = (proc, sig) => killProcessTree(proc, sig),
   schedule = setTimeout,
   cancelSchedule = clearTimeout,
   now = Date.now,
@@ -135,6 +177,7 @@ export function createBackendSupervisor({
   let restartTimer = null;
   let reloadTimer = null;
   let reloadRequested = false;
+  let forcedReloadKill = false;
   let watcher = null;
   let crashTimes = [];
   let requestedExitCode = null;
@@ -165,7 +208,7 @@ export function createBackendSupervisor({
       return;
     }
     try {
-      child.kill(sig);
+      killBackend(child, sig);
     } catch {
       exit(requestedExitCode ?? 0);
     }
@@ -180,9 +223,10 @@ export function createBackendSupervisor({
       reloadRequested = true;
       report(`[dev-backend] ${filename} changed; reloading backend…`);
       try {
-        child.kill("SIGTERM");
+        forcedReloadKill = killBackend(child, "SIGTERM") === "taskkill";
       } catch {
         reloadRequested = false;
+        forcedReloadKill = false;
       }
     }, SOURCE_RELOAD_DEBOUNCE_MS);
   }
@@ -203,6 +247,12 @@ export function createBackendSupervisor({
         report(`[dev-backend] backend source watcher failed: ${err.message}`);
         stop("SIGTERM", 1);
       });
+    }
+
+    try {
+      healPthFiles();
+    } catch {
+      // Best effort: the launch below reports a Python that still cannot start.
     }
 
     let current;
@@ -236,7 +286,8 @@ export function createBackendSupervisor({
 
       if (reloadRequested) {
         reloadRequested = false;
-        const expectedReloadExit = code === 0 || signal === "SIGTERM";
+        const expectedReloadExit = code === 0 || signal === "SIGTERM" || forcedReloadKill;
+        forcedReloadKill = false;
         if (expectedReloadExit) {
           start();
           return;

@@ -24,12 +24,14 @@ import os
 import re
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
+from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from services import director, speech_rate, incremental
 from services.ffmpeg_utils import find_ffprobe, spawn_subprocess
-from api.dependencies import require_native_access
+from api.dependencies import require_admin, require_native_access
 from core.path_security import UnsafePath, resolve_within
 
 logger = logging.getLogger("omnivoice.tools")
@@ -84,6 +86,9 @@ class IncrementalReq(BaseModel):
     # scoped to that language (pass that language's stored hashes alongside);
     # omitted → legacy language-agnostic hashing, kept for old callers.
     lang: Optional[str] = None
+    # Match DubRequest.language when speech language differs from the track
+    # code (for example Auto speech stored in an en track).
+    language: Optional[str] = None
     # Voice-identity mode the client will generate with (DubRequest.voice_match).
     # Only "consistent" changes the hash (per_line/omitted == legacy), so
     # flipping the Voice-match toggle marks every segment stale — the audio
@@ -93,8 +98,18 @@ class IncrementalReq(BaseModel):
 
 @router.post("/tools/incremental")
 def plan_incremental(req: IncrementalReq):
+    from services.pronunciation import speech_text_preparer
+
+    prepare_text = speech_text_preparer()
+    segments = [
+        {**seg, "text": prepare_text(
+            seg.get("text") or "", seg.get("target_lang") or req.language or req.lang,
+            profile_id=seg.get("profile_id"),
+        )}
+        for seg in req.segments
+    ]
     return incremental.plan_incremental(
-        req.segments,
+        segments,
         stored_hashes=req.stored_hashes or {},
         track_lang=req.lang,
         voice_match=req.voice_match,
@@ -108,7 +123,7 @@ class DirectionReq(BaseModel):
     text: str = Field(..., description="Natural-language direction, e.g. 'urgent and surprised'")
 
 
-@router.post("/tools/direction")
+@router.post("/tools/direction", dependencies=[Depends(require_admin)])
 def parse_direction(req: DirectionReq):
     d = director.parse(req.text)
     return {
@@ -132,7 +147,7 @@ class RateFitReq(BaseModel):
     source_text: Optional[str] = None
 
 
-@router.post("/tools/rate-fit")
+@router.post("/tools/rate-fit", dependencies=[Depends(require_admin)])
 def rate_fit(req: RateFitReq):
     return speech_rate.adjust_for_slot(
         req.text,
@@ -165,7 +180,7 @@ def list_tts_plugins():
 # ── Video context analysis ─────────────────────────────────────────────────
 
 
-@router.post("/tools/video-context/{job_id}")
+@router.post("/tools/video-context/{job_id}", dependencies=[Depends(require_admin)])
 async def analyse_video_context(job_id: str):
     """Analyse the source video's visual context for dubbing decisions.
 
@@ -200,3 +215,54 @@ async def analyse_video_context(job_id: str):
     segments = job.get("segments") or []
     ctx = await analyse_video(str(video_path), segments)
     return ctx.to_dict()
+
+
+# Workflow audio is already synthetic. Re-mark after processing through the
+# existing chokepoint rather than routing it through human mic cleanup.
+def _decode_workflow_audio(data: bytes):
+    import io
+    import numpy as np
+    import soundfile as sf
+    import torch
+
+    try:
+        with sf.SoundFile(io.BytesIO(data)) as source:
+            if source.format != "WAV" or source.channels not in (1, 2):
+                raise ValueError("Expected mono or stereo WAV")
+            if source.frames < 1 or source.frames * source.channels > 16_000_000:
+                raise ValueError("Audio exceeds the processing limit")
+            audio = source.read(dtype="float32", always_2d=True)
+            rate = source.samplerate
+        if not np.isfinite(audio).all():
+            raise ValueError("Invalid audio samples")
+        return torch.from_numpy(audio.T.copy()), rate
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail="Provide a valid WAV within the audio size limit.") from exc
+
+
+def _encode_workflow_audio(audio, rate: int) -> bytes:
+    import io
+    from services.audio_io import _safe_soundfile_write
+
+    output = io.BytesIO()
+    _safe_soundfile_write(output, audio.detach().cpu().numpy().T, rate, format="WAV", subtype="PCM_16")
+    return output.getvalue()
+
+
+@router.post("/tools/normalize-speech", dependencies=[Depends(require_admin)])
+async def normalize_workflow_speech(
+    audio: UploadFile = File(...),
+    target_dbfs: float = Form(-2.0, ge=-24.0, le=-1.0),
+):
+    """Peak-normalize synthetic speech; bounded and entirely local."""
+    from services.audio_dsp import normalize_audio
+    from services.watermark import mark_synthetic_async
+
+    data = await audio.read(64 * 1024 * 1024 + 1)
+    if len(data) > 64 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio exceeds 64 MiB.")
+    waveform, rate = await run_in_threadpool(_decode_workflow_audio, data)
+    waveform = await run_in_threadpool(normalize_audio, waveform, target_dBFS=target_dbfs)
+    waveform = await mark_synthetic_async(waveform, rate, context="workflow.normalize")
+    encoded = await run_in_threadpool(_encode_workflow_audio, waveform, rate)
+    return Response(encoded, media_type="audio/wav")

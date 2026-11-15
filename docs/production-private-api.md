@@ -9,11 +9,10 @@ internet.
 ```yaml
 services:
   voicestudio:
-    image: ghcr.io/debpalash/omnivoice-studio:0.5.2
+    image: ghcr.io/debpalash/voicestudio:0.5.6
     restart: unless-stopped
     environment:
       OMNIVOICE_API_KEY: ${OMNIVOICE_API_KEY:?set a long random key}
-      OMNIVOICE_BIND_HOST: 0.0.0.0
       OMNIVOICE_DATA_DIR: /app/omnivoice_data
     ports:
       - "127.0.0.1:3900:3900"
@@ -37,14 +36,14 @@ Generate `OMNIVOICE_API_KEY` with a password manager or
 deployment platform's secret store, not in the Compose file or source control.
 Send it from InterviewAce as `Authorization: Bearer <key>`.
 
-`OMNIVOICE_BIND_HOST=0.0.0.0` is required inside the container; the host-side
+The image binds `0.0.0.0` inside the container on its own; the host-side
 `127.0.0.1` port binding still prevents LAN or public access.
 `OMNIVOICE_DATA_DIR=/app/omnivoice_data` keeps application state on the named
 volume across container recreation.
 
 Pin an exact release tag. `:latest` and `:main` are rolling previews;
 `:stable` moves whenever a stable release is published. AMD hosts use the
-matching `:0.5.2-rocm` image and the device mapping documented in
+matching `:0.5.6-rocm` image and the device mapping documented in
 [Docker installation](install/docker.md#pull-and-run-amd-gpu--rocm).
 
 ## Network boundary
@@ -155,4 +154,4 @@ trusted-network, admin-route, and CORS behavior is in
 Deploying VoiceStudio does not settle the licenses of optional engines or model
 weights. Record the exact engine, model revision, and accepted terms alongside
 the deployment, and review generated-output restrictions for that combination.
-See [Engine licences](engines/index.md) before enabling an engine.
+See the [engine guides](engines/README.md) and the [model licence inventory](licensing/model-inventory.md) before enabling an engine.

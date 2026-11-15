@@ -244,12 +244,17 @@ def test_every_multi_part_render_loop_reports_progress():
             f = n.func
             if isinstance(f, ast.Name) and f.id in {"_gen", "gen_span"}:
                 return True
+            if (isinstance(f, ast.Name) and f.id == "trace_call"
+                    and len(n.args) > 1):
+                f = n.args[1]  # instrumentation still calls the same generator
             if isinstance(f, ast.Attribute) and f.attr == "generate":
                 return True
         return False
 
     loops = [n for n in ast.walk(tree) if isinstance(n, ast.For) and _renders_inline(n)]
-    assert len(loops) == 3, f"expected the three inline render loops, found {len(loops)}"
+    # Native chunks, adapter chunks, pause spans, and the sentence chunks of a
+    # long pause span (#3021).
+    assert len(loops) == 4, f"expected the four inline render loops, found {len(loops)}"
     for loop in loops:
         assert _calls_progress(loop), (
             f"the render loop at line {loop.lineno} appends parts without "

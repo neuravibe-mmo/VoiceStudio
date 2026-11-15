@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Literal, Optional
 
 from services.audio_dsp import EFFECT_PRESETS
@@ -31,6 +31,10 @@ class DubSegment(BaseModel):
     # fingerprint (#281).
     direction: Optional[str] = None
     effect_preset: str = "broadcast"   # NEW: DSP preset id (default: broadcast)
+    # Echo of the segment's imported caption source id (`webvtt_source.id` /
+    # `srt_source.id`) while its text is still that import's text. Without
+    # it the job forgets the imported cue markup (#2295).
+    cue_source_id: Optional[str] = None
 
     @field_validator("effect_preset")
     @classmethod
@@ -49,18 +53,25 @@ class FitOptions(BaseModel):
     defaults (services.fit_planner.FitParams) so old clients and sparse
     payloads behave identically to a fully-populated default payload.
     """
-    max_audio_only_rate: Optional[float] = None  # default 1.2
-    audio_rate_cap: Optional[float] = None       # default 1.5
-    video_slow_cap: Optional[float] = None       # default 2.0
-    gap_guard_s: Optional[float] = None          # default 0.05
+    max_audio_only_rate: Optional[float] = Field(default=None, ge=1, allow_inf_nan=False)  # default 1.2
+    audio_rate_cap: Optional[float] = Field(default=None, ge=1, allow_inf_nan=False)       # default 1.5
+    video_slow_cap: Optional[float] = Field(default=None, ge=1, allow_inf_nan=False)       # default 2.0
+    gap_guard_s: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)          # default 0.05
+    # Floor for slowing a short line toward its slot; 1.0 turns the fill off.
+    # Default is the server's OMNIVOICE_UNDERRUN_MIN_RATE (0.85).
+    min_audio_rate: Optional[float] = Field(default=None, ge=0.5, le=1.0, allow_inf_nan=False)
     allow_video_retime: Optional[bool] = None    # default True
 
 class DubRequest(BaseModel):
-    segments: List[DubSegment]
+    # An empty request has no speech to render; publishing it would replace
+    # the language's track with silence.
+    segments: List[DubSegment] = Field(min_length=1)
     language: str = "Auto"
     language_code: str = "und"  # ISO 639-1 for ffmpeg metadata (e.g. "es", "fr", "de")
     instruct: str = ""
-    num_step: int = 16
+    # None means "use the shared performance profile". An explicit value is
+    # still authoritative for Production overrides and existing API clients.
+    num_step: Optional[int] = None
     guidance_scale: float = 2.0
     speed: float = 1.0
     # Phase 4.1 — partial regen. Parallel lists by index with `segments`.
@@ -71,7 +82,8 @@ class DubRequest(BaseModel):
     regen_only: Optional[List[str]] = None
     # Fast-preview mode for interactive edits. When true, TTS runs at
     # num_step=8 (~2× faster, ~10-20% quality drop). Client is responsible
-    # for re-rendering preview segs at full quality before final export.
+    # for re-rendering preview segs with the explicit override or shared
+    # performance profile before final export.
     preview: Optional[bool] = False
     # How to handle segs whose TTS audio is longer than its slot (the
     # "ghost lang" overlap bug otherwise). Options:
@@ -86,9 +98,9 @@ class DubRequest(BaseModel):
     # (Bengali, Hindi, Arabic…). Three modes:
     #   "concise"       — never compress TTS audio. Trim text up-front via
     #                     speech_rate so it fits naturally; if it still
-    #                     overflows, hard-trim at slot with a short fade and
-    #                     surface fit_status="overflows" so the UI can prompt
-    #                     the user to shorten the segment. DEFAULT.
+    #                     overflows, fail without replacing the current track;
+    #                     the user must shorten it or choose another fit mode.
+    #                     DEFAULT.
     #   "stretch_video" — never compress TTS audio. Re-lay the timeline so
     #                     each segment's video portion is stretched (via
     #                     ffmpeg setpts) to fit the natural-rate dub audio.
@@ -97,13 +109,13 @@ class DubRequest(BaseModel):
     #                     mild pitch-preserving audio speed-up (≤1.2× alone,
     #                     ≤1.5× in hybrid) and a mild per-segment video
     #                     slow-down (≤2.0×), per services/fit_planner.py.
-    #                     Residual overflow is trimmed and surfaced.
-    #   "strict_slot"   — legacy: keep `slot_fit` semantics (atempo squeeze
-    #                     when audio > slot). Kept for back-compat.
+    #                     Residual overflow fails without discarding words.
+    #   "strict_slot"   — pitch-preserving fit of the complete speech to
+    #                     the original start/end; may sound faster or slower.
     timing_strategy: Optional[Literal["concise", "stretch_video", "strict_slot", "smart_fit"]] = "concise"
 
-    # Per-job slip budget for "concise" mode. Hard-trim only kicks in once
-    # gap absorption + this much extra time has been consumed.
+    # Per-job slip budget for "concise" mode. Overflow fails once gap
+    # absorption + this much extra time has been consumed.
     overflow_budget_s: Optional[float] = 0.0
 
     # Knob overrides for `smart_fit` (ignored by other strategies). Omitted
@@ -150,7 +162,7 @@ class TranslateRequest(BaseModel):
     provider: Optional[str] = None
     source_lang: Optional[str] = None  # ISO 639-1; overrides job detection
     job_id: Optional[str] = None  # Dub job id, used to resolve detected source_lang
-    quality: Optional[str] = "fast"  # "fast" (one-shot) | "cinematic" (reflect→adapt) | "autofit" (cinematic + strict fit-to-slot)
+    quality: Optional[str] = "fast"  # fast | cinematic | autofit | agent (measured render/rewrite loop)
     glossary: Optional[List[dict]] = None  # [{"source": "...", "target": "...", "note": "..."}]
     # Optional regional dialect (BCP-47, e.g. "es-AR", "pt-BR") — #280 item 2.
     # Applied by LLM-backed paths (provider="openai" or quality="cinematic"):
@@ -158,6 +170,7 @@ class TranslateRequest(BaseModel):
     # voseo: "vos sos" instead of "tú eres"). Non-LLM providers (Argos, NLLB,
     # Google) can't honor it; the response then carries dialect_applied=false.
     dialect: Optional[str] = None
+    translation_instructions: Optional[str] = Field(default=None, max_length=5000)
     # Two-stage LLM translation quality (provider="openai" only; MT engines
     # ignore both). None = default ON for the LLM engine.
     #   auto_glossary — one up-front LLM pass over the full transcript extracts
@@ -174,6 +187,88 @@ class TranslateRequest(BaseModel):
     # per-segment suggestion the user applies manually, never auto-applied.
     # No LLM configured / LLM failure → silently no suggestion.
     condense: Optional[bool] = False
+
+
+class AgentFitSegment(BaseModel):
+    """One rendered translation and its measured timing evidence."""
+
+    id: str
+    text: str
+    source_text: Optional[str] = None
+    context_before: Optional[str] = None
+    context_after: Optional[str] = None
+    slot_seconds: float
+    measured_seconds: float
+
+
+class AgentFitRequest(BaseModel):
+    """Revise only rendered lines that missed their exact timeline slot."""
+
+    translation_instructions: Optional[str] = Field(default=None, max_length=5000)
+    segments: List[AgentFitSegment]
+    target_lang: str
+
+class ProsodyMirrorSegment(BaseModel):
+    """One timed source line to measure for the prosody mirror."""
+
+    id: str = Field(min_length=1, max_length=128)
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(ge=0, allow_inf_nan=False)
+    speaker_id: Optional[str] = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _end_after_start(self):
+        if self.end <= self.start:
+            raise ValueError("segment end must be later than its start")
+        return self
+
+
+
+class TranscriptSegment(BaseModel):
+    id: Optional[str] = Field(default=None, max_length=200)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    text: str = Field(max_length=20000)
+    # Source-language line when ``text`` is an unspoken translation, so dual
+    # subtitles still stack the original under it.
+    text_original: Optional[str] = Field(default=None, max_length=20000)
+    # Same echo as DubSegment.cue_source_id: imported cue markup survives
+    # only while the line is still that import's text (#2295).
+    cue_source_id: Optional[str] = Field(default=None, max_length=200)
+
+
+class TranscriptSyncRequest(BaseModel):
+    """The editor's transcript, stored before any dub exists so exports of
+    the original audio with subtitles use the edited lines (#3393)."""
+
+    segments: List[TranscriptSegment] = Field(min_length=1, max_length=20000)
+
+
+class CleanupSegmentsRequest(BaseModel):
+    """The editor's current segments; without them the stored copy is cleaned."""
+
+    segments: List[dict] = Field(max_length=20000)
+
+    @field_validator("segments")
+    @classmethod
+    def _segments_have_timing_and_text(cls, value):
+        for segment in value:
+            missing = [key for key in ("start", "end", "text") if key not in segment]
+            if missing:
+                raise ValueError("each segment needs start, end and text")
+        return value
+
+
+class ProsodyMirrorRequest(BaseModel):
+    segments: List[ProsodyMirrorSegment] = Field(min_length=1, max_length=20000)
+
+    @field_validator("segments")
+    @classmethod
+    def _unique_ids(cls, value):
+        ids = [segment.id for segment in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("segment ids must be unique")
+        return value
 
 class ParseSubtitleTextRequest(BaseModel):
     """Raw pasted subtitle text (SRT/VTT-ish) to be parsed into timed cues.

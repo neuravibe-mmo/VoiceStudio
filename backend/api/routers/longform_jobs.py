@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from api.dependencies import require_loopback
 from core import job_store
 
 logger = logging.getLogger("omnivoice.longform_jobs")
@@ -29,6 +31,24 @@ router = APIRouter()
 #: Job types this library surfaces. Both flow through the shared longform
 #: renderer (``_render_longform_sse``) and emit the same ``done`` event shape.
 _LONGFORM_TYPES = ("audiobook", "story")
+
+
+@router.delete("/longform/jobs/{job_id}", dependencies=[Depends(require_loopback)])
+def delete_longform_job(job_id: str) -> dict:
+    """Remove a finished library record and its events, preserving render audio."""
+    with job_store.db_conn() as conn:
+        # Take the write lock before checking status, so it cannot change between
+        # validation and deletion. Never remove live jobs or another job type.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT type, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is not None:
+            if row["type"] not in _LONGFORM_TYPES:
+                raise HTTPException(404, "Longform render not found")
+            if row["status"] != "done":
+                raise HTTPException(409, "Only completed renders can be removed")
+            conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    return {"deleted": job_id}
 
 
 def _done_payload_from_events(events: list[dict]) -> Optional[dict]:
@@ -55,15 +75,69 @@ def _done_payload_from_events(events: list[dict]) -> Optional[dict]:
 def _coerce_int(value, default: int = 0) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _coerce_float(value, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _clean_summary(raw) -> Optional[dict]:
+    """Reduce a stored render summary to a fixed, safe shape.
+
+    The summary lives in a persisted event, so nothing in it is trusted:
+    anything of the wrong type is dropped rather than passed to the client.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def text(value) -> str:
+        # Only scalars become text; a dict or list would reach the client as its repr.
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return ""
+        return str(value) if value else ""
+
+    voices = []
+    if isinstance(raw.get("voices"), list):
+        for v in raw["voices"]:
+            if isinstance(v, dict):
+                voices.append({"id": text(v.get("id")), "name": text(v.get("name"))})
+
+    speeds = []
+    if isinstance(raw.get("speeds"), list):
+        for v in raw["speeds"]:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            try:
+                number = float(v)
+            except OverflowError:
+                continue
+            if math.isfinite(number):
+                speeds.append(round(number, 2))
+
+    options = {}
+    if isinstance(raw.get("options"), dict):
+        for key, v in raw["options"].items():
+            if isinstance(v, (str, int, bool)) or (isinstance(v, float) and math.isfinite(v)):
+                options[str(key)] = v
+
+    titles = raw.get("chapter_titles")
+    return {
+        "engine": text(raw.get("engine")),
+        "voices": voices,
+        "language": text(raw.get("language")),
+        "format": text(raw.get("format")),
+        "lines": _coerce_int(raw.get("lines")),
+        "words": _coerce_int(raw.get("words")),
+        "speeds": speeds,
+        "options": options,
+        "chapter_titles": [t for t in titles if isinstance(t, str)] if isinstance(titles, list) else [],
+    }
 
 
 def build_longform_library(
@@ -76,19 +150,19 @@ def build_longform_library(
 
     Pure over the two job-store callables so tests can pass them directly:
 
-    * ``list_jobs(status="done", limit=...)`` → all done jobs, newest-first.
+    * ``list_jobs(status="done", types=(...), limit=...)`` → done longform jobs, newest-first.
     * ``events_since(job_id)`` → that job's persisted SSE events.
 
     Returns ``[{job_id, type, title?, output, duration_s, chapters,
-    created_at}]``. Jobs that aren't a longform type, or whose ``done`` event /
+    created_at, summary?}]``. Jobs that aren't a longform type, or whose ``done`` event /
     output filename can't be recovered, are silently skipped — the library only
     ever lists things the user can actually re-download.
     """
     limit = max(1, min(_coerce_int(limit, 50), 500))
     try:
-        # Over-fetch: non-longform done jobs (dub, etc.) get filtered out below,
-        # so ask for more rows than the caller's limit to still fill the page.
-        rows = list_jobs(status="done", limit=limit * 4)
+        # Filter types before limiting so newer dub jobs cannot hide finished
+        # books. Over-fetch still allows for missing or malformed done events.
+        rows = list_jobs(status="done", types=tuple(_LONGFORM_TYPES), limit=limit * 4)
     except Exception:
         # The route deliberately never 500s, but an unreadable job store is a
         # real failure, not an empty library — log it loudly (error + stack),
@@ -142,6 +216,9 @@ def build_longform_library(
                         title = None
             if title:
                 item["title"] = title
+            summary = _clean_summary(done.get("summary"))
+            if summary is not None:
+                item["summary"] = summary
             out.append(item)
         except Exception:
             # Per-row isolation: one bad row never sinks the whole list.
@@ -159,7 +236,8 @@ def longform_jobs(limit: int = Query(50, ge=1, le=500)) -> dict:
     backend hiccup it returns an empty list rather than an error.
 
     ``job_store`` is bound at module import (top of file), NOT re-imported
-    here at call time. A call-time ``from core import job_store`` re-resolves
+    here at call time. A call-time ``from api.dependencies import require_loopback
+from core import job_store`` re-resolves
     through ``sys.modules`` on every request — and several test suites purge
     and re-import the whole ``core``/``services`` namespace under a
     temporary OMNIVOICE_DATA_DIR (the ``isolated_db`` pattern,

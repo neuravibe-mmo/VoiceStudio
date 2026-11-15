@@ -17,7 +17,6 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
-import sys
 from typing import Optional
 
 logger = logging.getLogger("omnivoice.engine_env")
@@ -28,6 +27,33 @@ _TORCH_COMPILE_KEY = "perf.torch_compile_disabled"
 # when the GPU's compute capability is not in this PyTorch build's arch list
 # (e.g. a brand-new architecture running through PTX forward-compat).
 _FORCE_COMPILE_ENV = "OMNIVOICE_FORCE_TORCH_COMPILE"
+
+_COMPILE_OPT_OUT_VARIABLES = (
+    "TORCH_COMPILE_DISABLE",
+    "TORCHDYNAMO_DISABLE",
+    "TORCHINDUCTOR_DISABLE",
+)
+_OPT_OUT_VALUES = {"yes", "true", "on", "1"}
+
+
+def compile_opt_out_name() -> Optional[str]:
+    """Name the first parent-process switch requesting eager execution."""
+    for variable in _COMPILE_OPT_OUT_VARIABLES:
+        setting = os.getenv(variable)
+        if setting is not None and setting.strip().casefold() in _OPT_OUT_VALUES:
+            return variable
+    return None
+
+
+def _settings_db_path() -> str:
+    """Produce a privacy-filtered identifier for the settings store."""
+    try:
+        from core.config import DB_PATH
+        from core.scrub import scrub_text
+
+        return scrub_text(str(DB_PATH))
+    except Exception:
+        return "<unknown>"
 
 # #278: set (with a reason) the first time torch.compile — or *running* the
 # compiled model — fails at runtime in this process. Once set, every later
@@ -153,14 +179,14 @@ def mark_flashinfer_runtime_failure(reason: str) -> None:
 def _cuda_arch_supported_for_compile() -> "tuple[bool, str]":
     """Check the GPU's architecture against this torch build's arch list.
 
-    New GPU architectures (e.g. Blackwell sm_120, issue #278) routinely break
-    torch.compile/Triton before upstream support lands: the eager model runs
-    via PTX forward-compat, but Inductor/Triton kernel compilation targets the
-    new arch directly and fails mid-generation. If the device's arch tag is
-    absent from this build's arch list we treat compile as unsupported and use
-    eager. The comparison is delegated to ``core.device_caps.arch_unsupported``
-    so it stays CUDA/ROCm-aware — a ROCm build lists ``gfx…`` names, and the
-    old ``sm_`` comparison here disabled compile on every AMD host (#1228).
+    The probe asks ``core.device_caps.arch_unsupported`` whether the device's
+    arch tag appears in the arch list of the torch build that is running. That
+    helper understands both CUDA (``sm_NN``) and ROCm (``gfx...``) naming; a
+    plain ``sm_`` comparison once switched compile off on AMD hosts (#1228).
+    When the arch is missing from the list, compile is reported unsupported and
+    eager execution is used. An arch that is listed (Blackwell ``sm_120`` on the
+    pinned torch 2.8.0+cu128, for one) counts as supported; unrelated compiler
+    or runtime failures are still caught by the eager fallback in model_manager.
 
     Returns ``(supported, reason)``. Fails open — any probe error returns
     ``(True, "")`` so a weird torch build never silently loses the
@@ -251,6 +277,10 @@ def should_torch_compile(device: str) -> bool:
     """
     if device != "cuda":
         return False
+    environment_switch = compile_opt_out_name()
+    if environment_switch:
+        logger.info("%s requests eager execution; torch.compile will not run.", environment_switch)
+        return False
     if importlib.util.find_spec("triton") is None:
         logger.info("torch.compile skipped: Triton unavailable — using eager mode.")
         return False
@@ -258,8 +288,15 @@ def should_torch_compile(device: str) -> bool:
         from services import settings_store
 
         if settings_store.get_text(_TORCH_COMPILE_KEY, "0") == "1":
-            logger.info("torch.compile skipped: disabled in Settings (Performance).")
+            logger.info(
+                "Performance settings in %s select eager execution; skipping torch.compile.",
+                _settings_db_path(),
+            )
             return False
+        logger.debug(
+            "Compile remains eligible because %s is off in settings database %s.",
+            _TORCH_COMPILE_KEY, _settings_db_path(),
+        )
     except Exception:
         logger.exception("should_torch_compile: settings read failed; proceeding")
     if _compile_runtime_failure is not None:
@@ -317,6 +354,16 @@ def build_engine_env(
     # AUTH-04: HF token injection from the resolver cascade. We import lazily
     # so the helper is callable in test contexts that don't stand up the
     # full settings_store / DB.
+    from services.hf_auth import env_allows_token
+
+    # An engine whose HF_ENDPOINT is a mirror must not send it the token.
+    if not env_allows_token(env):
+        inject_hf_token = False
+        env.pop("HF_TOKEN", None)
+        env.pop("YOUR_HF_TOKEN", None)
+        # "0" or another false value would still let a cached token reach the mirror.
+        env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+
     if inject_hf_token:
         try:
             from services import token_resolver
@@ -328,19 +375,20 @@ def build_engine_env(
         except Exception:
             logger.exception("build_engine_env: token resolver failed (non-fatal)")
 
-    # INST-12: TORCH_COMPILE_DISABLE on Windows when the user opted in.
-    # The flag is a Windows-only escape hatch — torch.compile OOMs the same
-    # Triton kernel cache differently on macOS/Linux, so injecting on those
-    # platforms would just slow the engine for no gain. (The in-process
-    # should_torch_compile() gate handles the automatic Triton-absence case;
-    # the subprocess var stays user-driven by design — see test_perf_settings.)
-    if sys.platform.startswith("win"):
-        try:
-            from services import settings_store
+    try:
+        from services import settings_store
 
-            if settings_store.get_text(_TORCH_COMPILE_KEY, "0") == "1":
-                env["TORCH_COMPILE_DISABLE"] = "1"
-        except Exception:
-            logger.exception("build_engine_env: torch_compile_disabled read failed")
+        if settings_store.get_text(_TORCH_COMPILE_KEY, "0") == "1":
+            env["TORCH_COMPILE_DISABLE"] = "1"
+    except Exception:
+        logger.exception("build_engine_env: torch_compile_disabled read failed")
+
+    inherited_opt_out = compile_opt_out_name()
+    if inherited_opt_out and env.get("TORCH_COMPILE_DISABLE") != "1":
+        env["TORCH_COMPILE_DISABLE"] = "1"
+        logger.debug(
+            "Engine child receives TORCH_COMPILE_DISABLE because the parent set %s.",
+            inherited_opt_out,
+        )
 
     return env

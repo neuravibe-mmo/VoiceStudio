@@ -13,7 +13,7 @@ interpreter, so MOSS runs behind
 `backend/services/subprocess_backend.py::SubprocessBackend`.
 
 > **Opt-in, and never a default.** MOSS-TTS-v1.5 is selected explicitly in
-> **Model Catalogue → Engines** (or `OMNIVOICE_TTS_BACKEND=moss-tts-v15`). It is
+> **Model Catalogue** (or `OMNIVOICE_TTS_BACKEND=moss-tts-v15`). It is
 > not part of the default install and does not change VoiceStudio's
 > out-of-the-box behaviour on any platform.
 
@@ -23,10 +23,39 @@ interpreter, so MOSS runs behind
   8 GB GPUs when quantized; the bf16 Transformers path used here is ~16 GB
   of weights, so a 16 GB+ GPU is the realistic CUDA target. It also runs on
   **CPU** (fp32) — correct but slow.
-- **Device:** CUDA when present, else CPU. **There is no MPS path** —
-  upstream documents only CUDA/CPU and the custom modelling code is
-  untested on Apple Silicon, so VoiceStudio never routes MOSS to MPS. On a
-  Mac it runs on CPU.
+- **Device:** the sidecar uses a runtime-available PyTorch CUDA/ROCm, XPU,
+  or registered NPU backend, otherwise CPU. The isolated engine venv needs the
+  matching torch/vendor integration. A failed accelerator probe falls back to
+  CPU, including in older venvs without the unified accelerator API. MPS still uses CPU. XPU/NPU routing is
+  covered by mocked loader tests; physical-device synthesis has not been
+  validated by this change.
+
+## One-click install
+
+On a machine with an NVIDIA GPU, **Model Catalogue → MOSS-TTS-v1.5 →
+Install** does every step below for you. It installs into its own folder under VoiceStudio's data directory, with its own Python environment. Nothing it installs touches VoiceStudio itself or any other engine, so you can switch to it and back without breaking what already worked. **Uninstall** in the same row removes only that folder. The ~16 GB of weights still
+download on first synthesis. On a CPU-only host the button is not offered; use
+the manual install.
+
+The first synthesis downloads the weights, which takes a while on a slow
+connection. The generation stays alive while the download makes progress;
+if a stalled download runs out of time, raise the compute-time budget in
+**Settings → Performance & Device** and try again.
+
+The TTS model and its audio codec load from separate pinned Hugging Face
+snapshots: `OpenMOSS-Team/MOSS-TTS-v1.5` at
+`cdd3b911b1585e3f2dbc7775ef10f9926f58850a` and
+`OpenMOSS-Team/MOSS-Audio-Tokenizer` at
+`3cd226ba2947efa357ef453bcad111b6eafba782`. Existing cached files are reused;
+missing weight shards, tokenizer assets or model-code dependencies resume the
+same pinned download on the next synthesis. Snapshots with all loading files
+work offline even when optional files such as `README.md` are absent.
+
+For a managed installation created with the older decoder recipe, run
+**Model Catalogue → MOSS-TTS-v1.5 → Install** once to apply the update. The
+installer repairs dependencies in the existing venv and keeps the model cache.
+External clones retain their own dependency setup; use the decoder replacement
+command under **Common errors** if their CUDA decoder cannot load.
 
 ## Install
 
@@ -47,13 +76,28 @@ into an isolated venv on demand.
 
    ```bash
    cd MOSS-TTS
-   uv venv .venv
-   uv pip install -e ".[torch-runtime]"
+   uv venv --python 3.11 .venv
+   uv pip install -e ".[torch-runtime]" "torchcodec===0.8.1"      --extra-index-url https://download.pytorch.org/whl/cu128      --index-strategy unsafe-best-match
    ```
 
-   On a **non-CUDA / CPU host** (e.g. Apple Silicon), install plain
-   `torch`/`torchaudio`/`transformers==5.0.0` into the venv instead of the
-   `+cu128` extra (the auto-bootstrap below only targets CUDA hosts).
+   The extra pins `torch==2.9.1+cu128`, which is published only on PyTorch's
+   own index, so the `--extra-index-url` is required — without it uv reports
+   the requirements as unsatisfiable on every host.
+   The exact `torchcodec===0.8.1` requirement selects the CPU audio decoder;
+   `==0.8.1` also admits the CUDA build, which needs additional NVIDIA NPP
+   libraries even when decoding reference audio on the CPU.
+
+   On a **non-CUDA / CPU host** (e.g. Apple Silicon), install the base
+   editable package with the compatible PyTorch pair instead of the
+   `+cu128` extra (the auto-bootstrap below only targets CUDA hosts):
+
+   ```bash
+   uv pip install -e . "torch==2.9.1" "torchaudio==2.9.1" "transformers==5.0.0" "torchcodec===0.8.1" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+   ```
+
+   [TorchCodec 0.8 requires PyTorch 2.9](https://github.com/meta-pytorch/torchcodec#compatibility-with-torch-versions).
+   Do not leave `torch` or `torchaudio` unpinned: a newer PyTorch can make
+   this decoder fail to load.
 
 3. The ~16 GB weights download from HuggingFace on first synthesize. The
    parent forwards `HF_HOME` / `HF_HUB_CACHE` to the sidecar so the cache is
@@ -73,7 +117,7 @@ into an isolated venv on demand.
    [Environment]::SetEnvironmentVariable("OMNIVOICE_MOSS_TTS_V15_DIR","$env:USERPROFILE\code\MOSS-TTS","User")
    ```
 
-5. Restart VoiceStudio. MOSS-TTS-v1.5 appears in **Model Catalogue → Engines** with
+5. Restart VoiceStudio. MOSS-TTS-v1.5 appears in **Model Catalogue** with
    `available: true` and `isolation_mode: subprocess`.
 
 ## Venv resolution order
@@ -118,12 +162,28 @@ You haven't pointed VoiceStudio at a MOSS-TTS clone yet. Follow **Install**.
 ### `uv pip install -e failed ... '[torch-runtime]' extra (cu128) cannot resolve`
 
 You're on a non-CUDA host. The upstream `torch-runtime` extra is CUDA-only;
-set up the venv manually with plain `torch`/`transformers==5.0.0` (step 2).
+set up the venv manually with the pinned CPU command in step 2.
+
+### `Could not load libtorchcodec` or `libnppicc.so.12` during voice cloning
+
+An older installation may contain the CUDA TorchCodec build. Stop the engine,
+then replace only its audio decoder, leaving the model weights and other
+packages in place:
+
+```bash
+uv pip install --python <moss-venv-python> --index-url https://pypi.org/simple --reinstall-package torchcodec --no-deps "torchcodec===0.8.1"
+```
+
+Use the Python executable in the MOSS engine's own `.venv`: `bin/python` on
+macOS/Linux or `Scripts/python.exe` on Windows. New one-click and lazy
+bootstrap installs already select this decoder.
 
 ## License
 
-Apache-2.0 (code and weights) — no acceptance gate. See the upstream
-[README](https://github.com/OpenMOSS/MOSS-TTS/blob/main/README.md).
+The upstream model cards identify both the TTS model and audio codec as
+Apache-2.0. VoiceStudio records them as separate components; their full terms
+remain unreviewed, so accept the displayed model licence notice before use.
+See the upstream [README](https://github.com/OpenMOSS/MOSS-TTS/blob/main/README.md).
 
 ---
 

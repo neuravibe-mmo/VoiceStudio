@@ -64,12 +64,11 @@ def test_system_info_smoke(client):
 
 def test_system_info_reports_code_fingerprint(client, monkeypatch):
     """#1770: the desktop attach handshake compares this against its own
-    build's fingerprint (frontend/src-tauri/src/backend.rs::
-    code_fingerprint_is_current) to tell "this build's code" apart from "a
+    build's fingerprint to tell "this build's code" apart from "a
     same-version backend running older code" — a plain version match isn't
     enough because `main` holds one version string for an entire release
     cycle. Blank by default (no OMNIVOICE_BUILD_FINGERPRINT set, e.g. a
-    manually started backend); echoed back verbatim when Tauri sets it.
+    manually started backend); echoed back verbatim when the desktop sets it.
     """
     monkeypatch.delenv("OMNIVOICE_BUILD_FINGERPRINT", raising=False)
     body = client.get("/system/info").json()
@@ -78,6 +77,16 @@ def test_system_info_reports_code_fingerprint(client, monkeypatch):
     monkeypatch.setenv("OMNIVOICE_BUILD_FINGERPRINT", "deadbeef1234")
     body = client.get("/system/info").json()
     assert body["code_fingerprint"] == "deadbeef1234"
+
+
+def test_system_info_reports_the_build_commit(client, monkeypatch):
+    """Bug reports carry the commit next to the version (#3293)."""
+    from core import version
+
+    version.build_commit.cache_clear()
+    monkeypatch.setenv("OMNIVOICE_BUILD_COMMIT", "0123456789abcdef")
+    assert client.get("/system/info").json()["build_commit"] == "012345678"
+    version.build_commit.cache_clear()
 
 
 def test_health_exposes_version(client):
@@ -256,7 +265,7 @@ def test_dub_generate_unknown_job(client):
     # Hitting /dub/generate/{id} with a non-existent id should surface the
     # rewritten 404 copy.
     r = client.post("/dub/generate/__nonexistent__", json={
-        "segments": [],
+        "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
         "language": "Auto",
         "language_code": "und",
         "num_step": 16,

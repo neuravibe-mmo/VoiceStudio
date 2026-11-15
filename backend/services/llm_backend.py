@@ -28,10 +28,60 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Iterator, Optional
 
 logger = logging.getLogger("omnivoice.llm")
+
+_REASONING_NAMES = r"think|thinking|reasoning"
+_OPEN_REASONING_TAG = re.compile(rf"<({_REASONING_NAMES})>", re.IGNORECASE)
+_CLOSE_REASONING_TAG = re.compile(rf"</({_REASONING_NAMES})>", re.IGNORECASE)
+_REASONING_EFFORT_REJECTED: set[str] = set()
+
+
+def _conversation_text(messages: list[dict]) -> str:
+    parts: list[str] = []
+    for turn in messages:
+        value = turn.get("content")
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _reasoning_option_was_rejected(exc: Exception) -> bool:
+    provider_message = str(exc).casefold()
+    return any(
+        term in provider_message
+        for term in ("reasoning_effort", "reasoning effort")
+    )
+
+
+def _strip_reasoning(raw: str, prompt: str = "") -> str:
+    """Discard reasoning markup only when it occupies the reply prefix."""
+    answer = raw
+    first_closer = _CLOSE_REASONING_TAG.search(answer)
+    if first_closer is not None:
+        prefix = answer[:first_closer.start()]
+        closer = first_closer.group(0).casefold()
+        is_prefilled = _OPEN_REASONING_TAG.search(prefix) is None
+        repeats_input = answer.casefold().count(closer) <= prompt.casefold().count(closer)
+        if is_prefilled and not repeats_input:
+            answer = answer[first_closer.end():]
+
+    while True:
+        candidate = answer.lstrip()
+        opening = _OPEN_REASONING_TAG.match(candidate)
+        if opening is None:
+            break
+        tag_name = opening.group(1)
+        after_open = candidate[opening.end():]
+        closing = re.search(rf"</{re.escape(tag_name)}>", after_open, re.IGNORECASE)
+        if closing is None:
+            return ""
+        answer = after_open[closing.end():]
+
+    return answer.strip()
 
 
 class LLMBackend(ABC):
@@ -55,12 +105,53 @@ class LLMBackend(ABC):
 
     @abstractmethod
     def chat(self, *, system: str, user: str, timeout: Optional[float] = None,
-             temperature: Optional[float] = None) -> str:
+             temperature: Optional[float] = None,
+             reasoning_effort: Optional[str] = None) -> str:
         """One-shot chat completion. Returns the assistant content string.
         Raises on failure — callers decide whether to fallback gracefully.
         ``temperature`` is only sent to the provider when set — callers that
         leave it None keep the provider default (existing behavior).
+        ``reasoning_effort`` hints that latency-sensitive work should skip or
+        shorten model thinking; backends without that capability may ignore it.
         """
+        ...
+
+    def chat_messages(self, *, messages: list[dict], timeout: Optional[float] = None,
+                      temperature: Optional[float] = None,
+                      reasoning_effort: Optional[str] = None) -> str:
+        """Adapt message turns for a two-message backend.
+
+        Backends that need complete few-shot conversations must override this.
+        """
+        begins_with_system = bool(messages and messages[0].get("role") == "system")
+        system_text = messages[0]["content"] if begins_with_system else ""
+        user_text = messages[-1]["content"] if messages else ""
+        retained_turns = 2 if system_text else 1
+        omitted_turns = max(len(messages) - retained_turns, 0)
+        if omitted_turns:
+            logger.warning(
+                "%s omitted %d intermediate turn(s) from its two-message request",
+                type(self).__name__,
+                omitted_turns,
+            )
+        return self.chat(
+            system=system_text,
+            user=user_text,
+            timeout=timeout,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
+
+    def chat_messages_stream(self, *, messages: list[dict], timeout: Optional[float] = None,
+                             temperature: Optional[float] = None) -> Iterator[str]:
+        """Yield the reply as text deltas while it is generated.
+
+        Latency-critical callers (the phone call agent starts speaking on the
+        first sentence) use this. Backends without streaming yield the whole
+        reply once. Reasoning blocks are NOT stripped here — a streaming
+        caller must handle a leading ``<think>`` block itself.
+        """
+        yield self.chat_messages(messages=messages, timeout=timeout, temperature=temperature)
 
 
 # ── OpenAI-compatible (the only backend that actually calls out today) ─────
@@ -83,6 +174,16 @@ class OpenAICompatBackend(LLMBackend):
         from services import llm_providers
         return llm_providers.active_provider()
 
+    def _base_url(self) -> Optional[str]:
+        try:
+            provider = self._resolve_provider()
+            if provider is not None:
+                from services import llm_providers
+                return llm_providers.resolve_base_url(provider)
+            return os.environ.get("TRANSLATE_BASE_URL") or None
+        except Exception:
+            return None
+
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
         try:
@@ -97,14 +198,13 @@ class OpenAICompatBackend(LLMBackend):
         p = llm_providers.active_provider()
         if p is None:
             return False, (
-                "No LLM configured. Add a provider key in Settings → LLM Providers "
-                "(OpenAI/OpenRouter/OrcaRouter/Groq/… or a local Ollama), or set "
-                "TRANSLATE_BASE_URL (+ TRANSLATE_API_KEY)."
+                "Add a provider key in Settings -> LLM Providers (for example OpenAI, "
+                "Cheaper Inference, or Groq), choose local Ollama, or set "
+                "TRANSLATE_BASE_URL with optional TRANSLATE_API_KEY."
             )
-        if not llm_providers.resolve_base_url(p):
-            return False, f"{p.display_name}: set a Base URL in Settings → LLM Providers."
-        if not llm_providers.has_key(p):
-            return False, f"{p.display_name}: add an API key in Settings → LLM Providers."
+        error = llm_providers.configuration_error(p)
+        if error:
+            return False, error
         return True, f"ready ({p.display_name})"
 
     @property
@@ -118,62 +218,99 @@ class OpenAICompatBackend(LLMBackend):
     def _get_client(self):
         if self._client is not None:
             return self._client
-        from openai import OpenAI
         from services import llm_providers
         p = self._resolve_provider()
         if p is None:
             raise RuntimeError("LLM not configured. See `is_available()` for the hint.")
-        base_url = llm_providers.resolve_base_url(p)
-        api_key = llm_providers.resolve_api_key(p)
-        if not api_key:
-            raise RuntimeError("LLM not configured. See `is_available()` for the hint.")
-        kw = {"api_key": api_key}
-        if base_url:
-            kw["base_url"] = base_url
-        # max_retries=0 so a 429 + Retry-After can't make one chat() sleep
-        # through the Autofit fit-pass wall-clock budget (speech_rate).
-        self._client = OpenAI(max_retries=0, **kw)
+        from services.llm_transport import create_client
+        self._client = create_client(p)
         return self._client
 
     def chat(self, *, system: str, user: str, timeout: Optional[float] = None,
-             temperature: Optional[float] = None) -> str:
+             temperature: Optional[float] = None,
+             reasoning_effort: Optional[str] = None) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
         return self.chat_messages(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=messages,
             timeout=timeout,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
         )
 
     def chat_messages(self, *, messages: list[dict], timeout: Optional[float] = None,
-                      temperature: Optional[float] = None) -> str:
-        """One-shot completion over a full message list.
+                      temperature: Optional[float] = None,
+                      reasoning_effort: Optional[str] = None) -> str:
+        """Complete a structured conversation without flattening few-shot turns.
 
-        Additive surface for callers that need structured few-shot turns
-        (dictation refinement, Wave 2.1) — small local models pattern-match
-        and echo inline examples, so examples must arrive as prior chat
-        turns, not inside the system prompt.
-
-        ``temperature`` is only forwarded when set (Cinematic/Autofit pin 0.2
-        — the provider default of 1.0 makes local models drift and invent);
-        every other caller leaves it None and keeps the provider default.
+        Inline examples are often echoed by small local models, so examples
+        remain earlier chat turns. Temperature is omitted unless selected;
+        Cinematic and Autofit use 0.2 to avoid drift from provider defaults.
+        Latency-sensitive callers may pass ``reasoning_effort="none"`` to
+        avoid long reasoning pauses.
         """
         if timeout is None:
             try:
                 timeout = float(os.environ.get("OMNIVOICE_LLM_TIMEOUT", "45"))
             except ValueError:
                 timeout = 45.0
-        kw = {}
+        selected_model = self.model_name
+        route_signature = f"{self._base_url() or ''}|{selected_model}"
+        optional_fields = {}
         if temperature is not None:
-            kw["temperature"] = temperature
-        res = self._get_client().chat.completions.create(
-            model=self.model_name,
-            timeout=timeout,
-            messages=messages,
-            **kw,
+            optional_fields["temperature"] = temperature
+        if reasoning_effort is not None and route_signature not in _REASONING_EFFORT_REJECTED:
+            optional_fields["reasoning_effort"] = reasoning_effort
+
+        client = self._get_client()
+        try:
+            response = client.chat.completions.create(
+                model=selected_model,
+                timeout=timeout,
+                messages=messages,
+                **optional_fields,
+            )
+        except Exception as exc:
+            sent_reasoning_hint = "reasoning_effort" in optional_fields
+            if not sent_reasoning_hint or not _reasoning_option_was_rejected(exc):
+                raise
+            _REASONING_EFFORT_REJECTED.add(route_signature)
+            logger.debug("Disabling the reasoning hint for endpoint %s", route_signature)
+            optional_fields.pop("reasoning_effort")
+            response = client.chat.completions.create(
+                model=selected_model,
+                timeout=timeout,
+                messages=messages,
+                **optional_fields,
+            )
+
+        reply_text = response.choices[0].message.content or ""
+        source_text = _conversation_text(messages)
+        return _strip_reasoning(reply_text, prompt=source_text)
+
+    def chat_messages_stream(self, *, messages: list[dict], timeout: Optional[float] = None,
+                             temperature: Optional[float] = None) -> Iterator[str]:
+        if timeout is None:
+            try:
+                timeout = float(os.environ.get("OMNIVOICE_LLM_TIMEOUT", "45"))
+            except ValueError:
+                timeout = 45.0
+        kw = {} if temperature is None else {"temperature": temperature}
+        stream = self._get_client().chat.completions.create(
+            model=self.model_name, timeout=timeout, messages=messages, stream=True, **kw,
         )
-        return (res.choices[0].message.content or "").strip()
+        try:
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0].delta, "content", None) if choices else None
+                if delta:
+                    yield delta
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
 
 # ── Off — explicit no-LLM path ────────────────────────────────────────────
@@ -270,7 +407,7 @@ def _provider_hint(bid: str) -> str | None:
         p = llm_providers.active_provider()
         if p is None:
             return None
-        model = llm_providers.resolve_model(p)
+        model = llm_providers.configured_model(p)
         return f"{p.display_name} · {model}" if model else p.display_name
     except Exception:
         # The hint is decoration; a provider-registry hiccup must not take

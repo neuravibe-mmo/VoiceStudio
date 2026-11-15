@@ -21,6 +21,10 @@ logger = logging.getLogger("omnivoice.api")
 _active_procs: dict[str, list] = {}
 _active_procs_lock = threading.Lock()
 
+from core import activity as _activity  # noqa: E402
+
+_activity.register_probe("subprocesses", lambda: any(list(_active_procs.values())))
+
 
 def register_proc(job_id: str, proc) -> None:
     """Track an in-flight subprocess so /dub/abort can kill it."""
@@ -52,8 +56,14 @@ def kill_job_procs(job_id: str) -> None:
                 "Failed to kill subprocess for %s: %s",
                 job_id.replace("\n", " ").replace("\r", " "), e,
             )
+    # Drop only what was killed: a process registered while we were killing
+    # belongs to a still-live step and must stay tracked.
     with _active_procs_lock:
-        _active_procs.pop(job_id, None)
+        lst = _active_procs.get(job_id)
+        if lst is not None:
+            lst[:] = [p for p in lst if not any(p is k for k in procs)]
+            if not lst:
+                _active_procs.pop(job_id, None)
 
 
 def has_active_procs(job_id: str) -> bool:

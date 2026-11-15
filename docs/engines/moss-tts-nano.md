@@ -25,7 +25,7 @@ cd MOSS-TTS-Nano
 uv pip install -e .
 ```
 
-Then select the engine via **Model Catalogue → Engines** or
+Then select the engine via **Model Catalogue** (TTS tab → **Use**) or
 `OMNIVOICE_TTS_BACKEND=moss-tts-nano`.
 
 ## Model selection
@@ -45,7 +45,7 @@ See [downloading-models.md](../downloading-models.md).
 - The model emits 48 kHz stereo; VoiceStudio downmixes to mono, matching the
   rest of the pipeline (the dub mixer treats TTS output as mono per
   segment).
-- Runs on CPU or CUDA.
+- Runs on CPU, CUDA, or a supported Linux ROCm stack.
 
 ## Upstream is unpinned
 
@@ -58,12 +58,37 @@ shows unavailable with a "does not expose a usable model class" message,
 pull the latest upstream and re-run `uv pip install -e .`, or open an issue
 with the version you have.
 
+The one-click install is not affected: it pins a reviewed commit
+(`8b7bcc93`, 2026-09-06) and drives the runtime that commit ships.
+
 ## Known limits
 
 - No voice design, no instruct, no speed control — cloning from a reference
   clip only.
 - Quality sits below the large engines; see
   [benchmarks.md](../benchmarks.md).
+
+## One-click install
+
+Click **Install** in **Model Catalogue → MOSS-TTS-Nano**.
+VoiceStudio clones a reviewed upstream commit into its own folder under the
+data directory, gives it its own Python environment (CUDA PyTorch on an NVIDIA
+GPU or a matching ROCm build on Linux ROCm hosts), and runs it in a separate process.
+
+Nothing it installs touches VoiceStudio itself or any other engine, and
+**Uninstall** in the same row removes only that folder. The button is not
+offered on Intel Macs, where the PyTorch version it pins has no build.
+
+The first synthesis downloads the model and its audio tokenizer. The
+generation stays alive while the download makes progress; if a stalled
+download runs out of time, raise the compute-time budget in
+**Settings → Performance & Device** and try again.
+
+The text tokenizer reuses the configured Hugging Face Hub cache, including
+`HF_HOME` / `HF_HUB_CACHE` overrides. Loading it preserves `HF_MODULES_CACHE`
+instead of creating a nested cache beside the downloaded model code, keeping
+the app's short Windows cache paths effective. Tokenizers already downloaded
+into an older nested cache remain usable offline without another download.
 
 ## Troubleshooting
 
@@ -76,3 +101,13 @@ with the version you have.
 See also: [languages.md](../languages.md),
 [expressive-speech.md](../expressive-speech.md),
 [disk usage](disk-usage.md).
+
+### Repairing older managed installations
+
+Older managed installs may lack the audio backend needed to read reference clips.
+Model Catalogue now detects their outdated dependency marker and offers Install
+again. Select it to repair dependencies in the existing environment; the checkout
+and cached models are retained. Checking installation status never downloads
+anything. Verification requires an available torchaudio audio backend, including
+when Python optimization is enabled. User-managed environments remain under your
+control: install `soundfile` in that engine’s virtual environment.

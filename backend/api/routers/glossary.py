@@ -19,16 +19,18 @@ stored list, passes it into `/dub/translate`, and that's the full loop.
 import logging
 import os
 import time
+import unicodedata
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from api.dependencies import require_consumer_reads_admin_writes
 from pydantic import BaseModel, Field
 
 from core.db import db_conn
 
 logger = logging.getLogger("omnivoice.glossary")
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_consumer_reads_admin_writes)])
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -57,6 +59,13 @@ class AutoExtractRequest(BaseModel):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _fold(text: str) -> str:
+    """Case-insensitive, normalization-insensitive key for source terms."""
+    # NFKC also folds compatibility forms (full-width Latin letters, the "fi"
+    # ligature), which LLM output in CJK-adjacent projects often contains.
+    return unicodedata.normalize("NFKC", text or "").casefold()
 
 
 def _row_to_dict(r) -> dict:
@@ -212,7 +221,8 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
         (s.get("text") or "").strip() for s in req.segments if (s.get("text") or "").strip()
     )
     if not source_text.strip():
-        return list_terms(project_id)
+        return {"project_id": project_id, "proposed": 0, "inserted": 0,
+                "terms": list_terms(project_id)}
 
     max_chars = int(os.environ.get("OMNIVOICE_GLOSSARY_MAX_CHARS", "12000"))
     if len(source_text) > max_chars:
@@ -234,7 +244,8 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
                 {"role": "user", "content": user},
             ],
         )
-        body = (res.choices[0].message.content or "").strip()
+        from services.llm_backend import _strip_reasoning
+        body = _strip_reasoning(res.choices[0].message.content or "", prompt=f"{system}\n{user}")
     except Exception as e:
         logger.warning("auto-extract LLM call failed: %s", e)
         # Scrub the provider error — some OpenAI-compatible providers echo the
@@ -269,22 +280,24 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
     # Dedupe against existing (case-insensitive on source).
     with db_conn() as conn:
         existing = conn.execute(
-            "SELECT LOWER(source) AS src FROM glossary_terms WHERE project_id = ?",
+            "SELECT source FROM glossary_terms WHERE project_id = ?",
             (project_id,),
         ).fetchall()
-        existing_srcs = {r["src"] for r in existing}
+        # Fold in Python: SQLite LOWER() only folds ASCII, so accented and
+        # Cyrillic terms would otherwise slip past the dedupe.
+        existing_srcs = {_fold(r["source"]) for r in existing}
 
         inserted = 0
         now = time.time()
         for src, tgt, note in proposed:
-            if src.lower() in existing_srcs:
+            if _fold(src) in existing_srcs:
                 continue
             conn.execute(
                 "INSERT INTO glossary_terms (id, project_id, source, target, note, auto, created_at) "
                 "VALUES (?, ?, ?, ?, ?, 1, ?)",
                 (str(uuid.uuid4())[:12], project_id, src, tgt, note, now),
             )
-            existing_srcs.add(src.lower())
+            existing_srcs.add(_fold(src))
             inserted += 1
 
         rows = conn.execute(

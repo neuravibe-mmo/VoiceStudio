@@ -39,12 +39,8 @@ _BACKEND = Path(__file__).resolve().parents[1] / "backend"
 
 
 @pytest.fixture
-def mm(monkeypatch):
-    for mod_name in ("core.config", "services.model_manager"):
-        if getattr(sys.modules.get(mod_name), "__file__", None) is None:
-            sys.modules.pop(mod_name, None)
-    import services.model_manager as _mm
-    return _mm
+def mm(fresh_model_manager):
+    return fresh_model_manager()
 
 
 # ── Defect 1: the execution clock must not start at submit ──────────────────
@@ -205,7 +201,10 @@ def test_timeout_guidance_does_not_claim_capacity_was_restored(mm):
     assert "until it finishes" in msg
     # Actionable for interactive users AND scripted clients.
     assert "restart the backend" in msg
-    assert "OMNIVOICE_GENERATE_TIMEOUT_S" in msg
+    # #1808: the budget moved into Settings → Performance & Device in #1797,
+    # so the remedy names that control now. The env var still works and still
+    # shadows the setting — only which one we point the user at changed.
+    assert "Settings → Performance & Device" in msg
 
 
 # ── Defect 4: every dispatch uses the shared length-scaled budget ───────────

@@ -28,12 +28,15 @@ This is the main entry point for both inference and training:
 """
 
 import difflib
+import json
 import logging
 import math
 import os
+import threading
 import re
 import sys
-from dataclasses import dataclass, fields
+import zlib
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from typing import Any, List, Optional, Union
 
@@ -53,12 +56,18 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 from omnivoice.utils.audio import (
+    CLONE_REF_MAX_WINDOWS,
     CLONE_REF_NO_SPEECH_MARKER,
+    CLONE_REF_TEXT_MAX_SECONDS,
     CLONE_REF_TOO_LONG_MARKER,
+    CLONE_REF_WINDOW_SECONDS,
+    check_reference_encode_memory,
+    clone_ref_transcript_too_long_message,
     cross_fade_chunks,
     fade_and_pad_audio,
     load_audio,
     remove_silence_safe,
+    trim_passage_to_pauses,
     validate_clone_reference,
 )
 from omnivoice.utils.duration import RuleDurationEstimator
@@ -93,6 +102,10 @@ class OmniVoiceModelAssetError(RuntimeError):
 
 
 _VOICE_CLONE_PROMPT_FORMAT_VERSION = 1
+
+
+class _ReferenceAsrNotInstalled(ValueError):
+    """No cached speech-to-text snapshot exists for implicit cloning."""
 
 
 @dataclass
@@ -160,10 +173,11 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    _generator: Optional[torch.Generator] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, kwargs_dict):
-        valid_keys = {f.name for f in fields(cls)}
+        valid_keys = {f.name for f in fields(cls) if not f.name.startswith("_")}
         filtered = {k: v for k, v in kwargs_dict.items() if k in valid_keys}
         return cls(**filtered)
 
@@ -298,6 +312,175 @@ def _resolve_snapshot_dir(checkpoint) -> str:
         return snapshot_download(checkpoint)
 
 
+_DEFAULT_ASR_MODEL = "openai/whisper-large-v3-turbo"
+# Guards the lazy creation of each model's reference-ASR lock (see _reference_asr_lock).
+_ASR_LOCK_GUARD = threading.Lock()
+
+
+def _reference_asr_lock(model) -> "threading.RLock":
+    """The per-model lock around reference-ASR load, use and release.
+
+    A module function storing the lock in the instance ``__dict__`` (not a
+    method), so an instance attribute can never shadow it and every caller,
+    including models restored without ``__init__``, shares one lock.
+    """
+    lock = model.__dict__.get("_reference_asr_lock")
+    if lock is None:
+        with _ASR_LOCK_GUARD:
+            lock = model.__dict__.setdefault("_reference_asr_lock", threading.RLock())
+    return lock
+
+
+DIAG_ENV = "OMNIVOICE_DIAG"
+
+
+def _diag(event: str) -> None:
+    """One `[diag]` stderr line with a memory snapshot, when ``OMNIVOICE_DIAG=1``.
+
+    The engine sidecar installs no log handler, so `logger.info` never reaches
+    the backend log; stderr does. These lines show whether reference ASR has
+    left unified/GPU memory before synthesis. Off by default so synthesis pays
+    no snapshot cost and logs stay quiet on every platform. Never raises.
+    """
+    if os.environ.get(DIAG_ENV) != "1":
+        return
+    try:
+        import psutil
+
+        vm, sw = psutil.virtual_memory(), psutil.swap_memory()
+        gb = 1024 ** 3
+        parts = [
+            f"rss={psutil.Process().memory_info().rss / gb:.2f}G",
+            f"avail={vm.available / gb:.2f}G",
+            f"swap={sw.used / gb:.2f}G",
+        ]
+        if torch.cuda.is_available():
+            parts.append(f"cuda_alloc={torch.cuda.memory_allocated() / gb:.2f}G")
+            parts.append(f"cuda_reserved={torch.cuda.memory_reserved() / gb:.2f}G")
+        if torch.backends.mps.is_available():
+            parts.append(f"mps_alloc={torch.mps.current_allocated_memory() / gb:.2f}G")
+            parts.append(f"mps_driver={torch.mps.driver_allocated_memory() / gb:.2f}G")
+        print(f"[diag] {event} | {' '.join(parts)}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — diagnostics must not break synthesis
+        pass
+
+
+def _reference_asr_repos() -> List[str]:
+    """Whisper checkpoints the implicit cloning fallback may reuse, best first.
+
+    The configured PyTorch Whisper model leads; ``openai/whisper-large-v3`` is
+    the checkpoint Model Catalogue lists for that engine, so a user who
+    installed it there is not told that no speech-to-text model exists.
+    """
+    configured = os.environ.get("OMNIVOICE_PYTORCH_ASR_MODEL", "").strip()
+    repos: List[str] = []
+    for repo in (configured, _DEFAULT_ASR_MODEL, "openai/whisper-large-v3"):
+        if repo and repo not in repos:
+            repos.append(repo)
+    return repos
+
+
+def _hub_cache_roots() -> List[str]:
+    """Directories that directly contain ``models--*`` folders."""
+    from huggingface_hub import constants
+
+    candidates = [
+        os.environ.get("HF_HUB_CACHE"),
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        getattr(constants, "HF_HUB_CACHE", None),
+    ]
+    home = os.environ.get("HF_HOME")
+    if home:
+        candidates += [os.path.join(home, "hub"), home]
+    roots: List[str] = []
+    for root in candidates:
+        if root and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _has_asr_weights(snapshot: str) -> bool:
+    """True when ``snapshot`` holds every file a Whisper pipeline loads.
+
+    Config, feature-extractor settings, a tokenizer and the complete weights
+    (every shard named by an index). A truncated download is rejected so the
+    caller can fall through to a complete snapshot instead of failing at load.
+    """
+    try:
+        names = set(os.listdir(snapshot))
+    except OSError:
+        return False
+    if not {"config.json", "preprocessor_config.json"} <= names:
+        return False
+    if not ({"tokenizer.json", "vocab.json"} & names):
+        return False
+    for index in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        if index in names:
+            try:
+                with open(os.path.join(snapshot, index), encoding="utf-8") as handle:
+                    shards = set(json.load(handle).get("weight_map", {}).values())
+            except (OSError, ValueError, AttributeError):
+                return False
+            return bool(shards) and shards <= names
+    return bool({"model.safetensors", "pytorch_model.bin"} & names)
+
+
+def _find_cached_reference_asr() -> Optional[str]:
+    """Local snapshot directory of an installed Whisper checkpoint, or None.
+
+    ``snapshot_download(repo, local_files_only=True)`` only resolves the
+    ``main`` ref. Model Catalogue installs every checkpoint at a pinned commit
+    and never writes that ref, so the plain lookup reported an installed model
+    as missing and cloning asked for a speech-to-text model the user already
+    had. Each cache root is therefore also asked for its concrete snapshot
+    revisions. Nothing here touches the network.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    configured = os.environ.get("OMNIVOICE_PYTORCH_ASR_MODEL", "").strip()
+    if configured and os.path.isdir(configured) and _has_asr_weights(configured):
+        return configured
+    for repo in _reference_asr_repos():
+        if os.path.isdir(repo):
+            continue
+        try:
+            found = snapshot_download(repo, local_files_only=True)
+            if _has_asr_weights(found):
+                return found
+        except (LocalEntryNotFoundError, ValueError):
+            pass
+        for root in _hub_cache_roots():
+            snapshots = os.path.join(
+                root, "models--" + repo.replace("/", "--"), "snapshots"
+            )
+            try:
+                revisions = sorted(
+                    (
+                        name
+                        for name in os.listdir(snapshots)
+                        if os.path.isdir(os.path.join(snapshots, name))
+                    ),
+                    key=lambda name: os.path.getmtime(os.path.join(snapshots, name)),
+                    reverse=True,
+                )
+            except OSError:
+                continue
+            for revision in revisions:
+                try:
+                    found = snapshot_download(
+                        repo,
+                        revision=revision,
+                        local_files_only=True,
+                        cache_dir=root,
+                    )
+                except (LocalEntryNotFoundError, ValueError):
+                    continue
+                if _has_asr_weights(found):
+                    return found
+    return None
+
+
 class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
@@ -361,9 +544,15 @@ class OmniVoice(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        # Explicit local checkpoints never authorize a Hub tokenizer fallback.
+        local_checkpoint = os.path.isdir(pretrained_model_name_or_path)
+        if os.path.isabs(str(pretrained_model_name_or_path)) and not local_checkpoint:
+            raise FileNotFoundError("The local OmniVoice checkpoint no longer exists")
+        if local_checkpoint:
+            kwargs["local_files_only"] = True
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
+        asr_model_name = kwargs.pop("asr_model_name", _DEFAULT_ASR_MODEL)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during
         # loading. Scoped to those two logger trees — NOT logging.disable(),
@@ -379,9 +568,15 @@ class OmniVoice(PreTrainedModel):
         for _lg in _quiet_loggers:
             _lg.setLevel(logging.WARNING)
 
-        # Disable tqdm on non-TTY (e.g., Tauri backend) to prevent OSError on Windows
-        _prev_tqdm = os.environ.get("TQDM_DISABLE")
-        if sys.stdout is not None and not sys.stdout.isatty():
+        _had_tqdm_setting = "TQDM_DISABLE" in os.environ
+        _previous_tqdm_setting = os.environ.get("TQDM_DISABLE")
+        _disable_tqdm = False
+        if sys.stdout is not None:
+            try:
+                _disable_tqdm = not sys.stdout.isatty()
+            except (AttributeError, OSError):
+                _disable_tqdm = True
+        if _disable_tqdm:
             os.environ["TQDM_DISABLE"] = "1"
 
         try:
@@ -396,12 +591,14 @@ class OmniVoice(PreTrainedModel):
                 resolved_path = _resolve_snapshot_dir(pretrained_model_name_or_path)
 
                 model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
+                    pretrained_model_name_or_path, local_files_only=local_checkpoint
                 )
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
+                    if local_checkpoint:
+                        raise FileNotFoundError("The local OmniVoice checkpoint is missing audio_tokenizer")
                     # Fallback to the HuggingFace Hub path of transformers'
                     # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
                     audio_tokenizer_path = _AUDIO_TOKENIZER_FALLBACK_REPO
@@ -412,10 +609,11 @@ class OmniVoice(PreTrainedModel):
                 )
                 try:
                     model.audio_tokenizer = _audio_tokenizer_cls().from_pretrained(
-                        audio_tokenizer_path, device_map=tokenizer_device
+                        audio_tokenizer_path, device_map=tokenizer_device,
+                        local_files_only=local_checkpoint,
                     )
                     model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                        audio_tokenizer_path
+                        audio_tokenizer_path, local_files_only=local_checkpoint
                     )
                 except Exception as exc:
                     if audio_tokenizer_path != _AUDIO_TOKENIZER_FALLBACK_REPO:
@@ -433,11 +631,11 @@ class OmniVoice(PreTrainedModel):
         finally:
             for _lg, _lvl in _prev_levels:
                 _lg.setLevel(_lvl)
-            # Restore TQDM_DISABLE state
-            if _prev_tqdm is None:
-                os.environ.pop("TQDM_DISABLE", None)
-            else:
-                os.environ["TQDM_DISABLE"] = _prev_tqdm
+            if _disable_tqdm:
+                if _had_tqdm_setting:
+                    os.environ["TQDM_DISABLE"] = _previous_tqdm_setting
+                else:
+                    os.environ.pop("TQDM_DISABLE", None)
 
         return model
 
@@ -445,7 +643,7 @@ class OmniVoice(PreTrainedModel):
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
 
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
+    def load_asr_model(self, model_name: str = _DEFAULT_ASR_MODEL):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
@@ -454,6 +652,10 @@ class OmniVoice(PreTrainedModel):
         from transformers import pipeline as hf_pipeline
 
         logger.info("Loading ASR model %s ...", model_name)
+        # Half precision on CUDA only. On MPS a float16 Whisper transcribes the
+        # reference passage into text that does not match its audio, and the
+        # clone then babbles for a minute; memory on 8 GB Macs is handled by
+        # releasing the recognizer before synthesis instead.
         asr_dtype = (
             torch.float16 if str(self.device).startswith("cuda") else torch.float32
         )
@@ -464,6 +666,42 @@ class OmniVoice(PreTrainedModel):
             device_map=self.device,
         )
         logger.info("ASR model loaded on %s.", self.device)
+        _diag(f"ASR loaded dtype={asr_dtype} device={self.device}")
+
+    def _load_cached_reference_asr(self):
+        """Implicit cloning fallback may reuse local weights, never download them."""
+        snapshot = _find_cached_reference_asr()
+        if snapshot is None:
+            raise _ReferenceAsrNotInstalled(
+                "Automatic reference transcription needs an installed speech-to-text "
+                "model. Provide a matching reference transcript, or install and select "
+                "a speech-to-text model in Model Catalogue, then try again."
+            )
+        # Pass a directory rather than the repo ID so transformers cannot make
+        # metadata requests or download missing assets from a partial snapshot.
+        self.load_asr_model(model_name=snapshot)
+
+    def _release_implicit_asr(self):
+        """Free a Whisper that cloning loaded on its own, before synthesis.
+
+        The implicit fallback loads a full-precision Whisper next to the TTS
+        weights. On an 8 GB unified-memory Mac the two do not fit together and
+        the clone swaps until it times out, so the recognizer is dropped as soon
+        as the reference is transcribed. An explicitly loaded ASR stays.
+        """
+        if getattr(self, "_asr_pipe", None) is None:
+            return
+        self._asr_pipe = None
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        mps = getattr(torch, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            mps.empty_cache()
+        logger.info("Released implicitly loaded reference ASR.")
+        _diag("ASR released before synthesis")
 
     @torch.inference_mode()
     def transcribe(
@@ -632,6 +870,7 @@ class OmniVoice(PreTrainedModel):
         duration: Union[float, list[Optional[float]], None] = None,
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        seed: Optional[int] = None,
         **kwargs,
     ) -> list[torch.Tensor]:
         """Generate speech audio given text in various modes.
@@ -695,6 +934,13 @@ class OmniVoice(PreTrainedModel):
             else OmniVoiceGenerationConfig.from_dict(kwargs)
         )
 
+        if seed is not None:
+            # Isolate the random draws from other requests sharing this model.
+            # The generator follows the request through every text chunk.
+            device = self.device if self.device.type in {"cpu", "cuda"} else "cpu"
+            generator = torch.Generator(device=device).manual_seed(seed)
+            gen_config = replace(gen_config, _generator=generator)
+
         self.eval()
 
         full_task = self._preprocess_all(
@@ -712,6 +958,7 @@ class OmniVoice(PreTrainedModel):
         short_idx, long_idx = full_task.get_indices(
             gen_config, self.audio_tokenizer.config.frame_rate
         )
+        _diag(f"TTS synthesis starting asr_resident={getattr(self, '_asr_pipe', None) is not None}")
 
         results = [None] * full_task.batch_size
 
@@ -736,6 +983,7 @@ class OmniVoice(PreTrainedModel):
                 )
             )
 
+        _diag("TTS synthesis finished")
         return generated_audios
 
     def create_voice_clone_prompt(
@@ -749,9 +997,10 @@ class OmniVoice(PreTrainedModel):
         Args:
             ref_audio: File path (str) or ``(waveform, sample_rate)`` tuple.
                 waveform should be a 1-D or 2-D torch.Tensor (channels x samples).
-            ref_text: Transcript of the reference audio. If ``None``, the
-                ASR model will be used to auto-transcribe (must call
-                :meth:`load_asr_model` first).
+            ref_text: Transcript of the reference audio. If ``None``, use the
+                loaded ASR pipeline or an installed Whisper snapshot without
+                downloading. If neither is available, provide a transcript or
+                explicitly load an ASR model with :meth:`load_asr_model`.
             preprocess_prompt: If ``True`` (default), apply silence removal and
                 trimming to the reference audio, add punctuation in the end
                 of reference text (if not already)
@@ -759,6 +1008,23 @@ class OmniVoice(PreTrainedModel):
         Returns:
             A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
         """
+        # Overlapping in-process clones must not release each other's recognizer:
+        # whether to release is decided from the state at entry, so the whole
+        # load -> use -> release sequence runs under one per-model lock.
+        with _reference_asr_lock(self):
+            implicit_asr = getattr(self, "_asr_pipe", None) is None
+            try:
+                return self._create_voice_clone_prompt(ref_audio, ref_text, preprocess_prompt)
+            finally:
+                if implicit_asr:
+                    self._release_implicit_asr()
+
+    def _create_voice_clone_prompt(
+        self,
+        ref_audio: Union[str, tuple[torch.Tensor, int]],
+        ref_text: Optional[str],
+        preprocess_prompt: bool,
+    ) -> VoiceClonePrompt:
         if self.audio_tokenizer is None:
             raise RuntimeError(
                 "Audio tokenizer is not loaded. Make sure you loaded the model "
@@ -791,27 +1057,21 @@ class OmniVoice(PreTrainedModel):
             ref_wav = ref_wav * input_gain
 
         ref_duration = ref_wav.size(-1) / self.sampling_rate
-        if ref_text is not None and ref_duration > 20.0:
-            raise ValueError(
-                f"{CLONE_REF_TOO_LONG_MARKER} Reference audio is "
-                f"{ref_duration:.1f} seconds long; supplied transcripts support "
-                "at most 20 seconds. Trim both the audio and transcript to the "
-                "same 3-10 second passage, or omit the transcript so VoiceStudio "
-                "can trim and transcribe the clip automatically."
-            )
-        if ref_text is None and ref_duration > 15.0:
+        if ref_text is not None and ref_duration > CLONE_REF_TEXT_MAX_SECONDS:
+            raise ValueError(clone_ref_transcript_too_long_message(ref_duration))
+        if ref_text is None and ref_duration > CLONE_REF_WINDOW_SECONDS:
             # Transcript-free automatic selection examines every passage, but
             # caps the work at five bounded ASR calls. Longer references need
             # an explicit user-selected passage rather than a lossy sampling
             # policy that could silently miss speech between fixed windows.
-            max_samples = int(15.0 * self.sampling_rate)
-            max_auto_samples = 5 * max_samples
+            max_samples = int(CLONE_REF_WINDOW_SECONDS * self.sampling_rate)
+            max_auto_samples = CLONE_REF_MAX_WINDOWS * max_samples
             if ref_wav.size(-1) > max_auto_samples:
                 raise ValueError(
                     f"{CLONE_REF_TOO_LONG_MARKER} Reference audio is "
                     f"{ref_duration:.1f} seconds long; automatic transcript-free "
                     "selection supports at most 75 seconds. Trim the audio to a "
-                    "3-10 second speech passage, or supply a matching transcript."
+                    "3-10 second speech passage."
                 )
 
             original_power = ref_wav.abs().amax(dim=0).square()
@@ -822,26 +1082,85 @@ class OmniVoice(PreTrainedModel):
                 return float(power.double().sum())
 
             if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
+                logger.info("Loading cached ASR for reference transcription ...")
+                try:
+                    self._load_cached_reference_asr()
+                except _ReferenceAsrNotInstalled as exc:
+                    if ref_duration <= CLONE_REF_TEXT_MAX_SECONDS:
+                        raise
+                    # A typed transcript is refused for this length, so the
+                    # transcript advice in the generic message is a dead end.
+                    raise ValueError(
+                        f"{CLONE_REF_TOO_LONG_MARKER} Reference audio is "
+                        f"{ref_duration:.1f} seconds long; a transcript only "
+                        f"works up to {CLONE_REF_TEXT_MAX_SECONDS:.0f} seconds. "
+                        "Trim the audio and transcript to a 3-10 second "
+                        "passage. A longer clip needs a speech-to-text model "
+                        "to pick the passage, and none could be loaded; "
+                        "install or select one in Model Catalogue."
+                    ) from exc
             candidates = list(ref_wav.split(max_samples, dim=-1))
 
-            def speech_score(text):
+            def speech_score(text, audio):
+                # Repetition is suspicious, not proof of silence: genuine speech
+                # can repeat, including in very quiet recordings (#2836).
+                encoded = (text or "").encode("utf-8")
+                words = re.findall(r"\w+", (text or "").casefold(), flags=re.UNICODE)
+                repetitive = (
+                    bool(encoded) and len(encoded) / len(zlib.compress(encoded)) > 2.4
+                ) or (len(words) >= 6 and len(set(words)) * 2 < len(words))
+                if repetitive:
+                    power = activity_score(audio) / audio.numel()
+                    quieter_than_other_passages = power < strongest_power * 0.01
+                    # A quiet, effectively flat recording carries no varying
+                    # voice signal. Use original gain so normalization does not
+                    # make a low-level DC/noise floor appear to be loud speech.
+                    flat_noise_floor = (
+                        power / input_gain ** 2 < 1e-5
+                        and float(audio.double().var(unbiased=False)) < power * 0.01
+                    )
+                    if quieter_than_other_passages or flat_noise_floor:
+                        return 0
                 return len(re.sub(r"[^\w]+", "", text or "", flags=re.UNICODE))
 
             transcribed = [
                 (self.transcribe((candidate, self.sampling_rate)), candidate)
                 for candidate in candidates
             ]
+            # A loud non-speech window must not disqualify the only spoken
+            # passage merely because that passage repeats a phrase.
+            strongest_power = max(
+                (activity_score(audio) / audio.numel() for text, audio in transcribed
+                 if re.search(r"\w", text or "", flags=re.UNICODE)),
+                default=0.0,
+            )
             ref_text, ref_wav = max(
                 transcribed,
-                key=lambda item: (speech_score(item[0]), activity_score(item[1])),
+                key=lambda item: (speech_score(item[0], item[1]), activity_score(item[1])),
             )
-            if speech_score(ref_text) == 0:
+            trimmed = trim_passage_to_pauses(ref_wav, self.sampling_rate)
+            if trimmed.size(-1) != ref_wav.size(-1):
+                # Re-read the passage so the transcript covers exactly its audio.
+                # A trim that leaves no words must not turn a usable passage
+                # into a "no speech" failure: keep the untrimmed one then.
+                try:
+                    trimmed_text = self.transcribe((trimmed, self.sampling_rate))
+                except Exception:  # noqa: BLE001 — the untrimmed passage is still valid
+                    logger.warning("Trimmed-passage transcription failed; keeping the untrimmed passage")
+                    trimmed_text = ""
+                if speech_score(trimmed_text, trimmed) > 0:
+                    ref_wav, ref_text = trimmed, trimmed_text
+            if speech_score(ref_text, ref_wav) == 0:
+                # A transcript is only accepted up to CLONE_REF_TEXT_MAX_SECONDS.
+                transcript_hint = (
+                    ", or supply a matching transcript"
+                    if ref_duration <= CLONE_REF_TEXT_MAX_SECONDS
+                    else ""
+                )
                 raise ValueError(
                     f"{CLONE_REF_NO_SPEECH_MARKER} Automatic speech detection "
                     "could not find spoken words in the reference. Trim it to a "
-                    "clear 3-10 second speech passage, or supply a matching transcript."
+                    f"clear 3-10 second speech passage{transcript_hint}."
                 )
 
         if preprocess_prompt:
@@ -875,10 +1194,15 @@ class OmniVoice(PreTrainedModel):
         # Auto-transcribe if ref_text not provided
         if ref_text is None:
             if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
+                logger.info("Loading cached ASR for reference transcription ...")
+                self._load_cached_reference_asr()
             ref_text = self.transcribe((ref_wav, self.sampling_rate))
             logger.debug("Auto-transcribed ref_text: %s", ref_text)
+
+        _diag(
+            f"reference passage {ref_wav.size(-1) / self.sampling_rate:.2f}s "
+            f"ref_text_chars={len(ref_text)}"
+        )
 
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.size(-1) % chunk_size)
@@ -886,11 +1210,21 @@ class OmniVoice(PreTrainedModel):
         aligned_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
         validate_clone_reference(ref_wav, aligned_rms)
         selected_ref_rms = aligned_rms / input_gain
-        ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
-        ).audio_codes.squeeze(
-            0
-        )  # (C, T)
+        check_reference_encode_memory(
+            ref_wav.size(-1) / self.sampling_rate,
+            torch.device(self.audio_tokenizer.device).type,
+        )
+        # #3340: with autograd on (the default in a request thread) the
+        # tokenizer also kept every activation for a backward pass that never
+        # comes — measured +27% peak RAM on a 20 s clip. generate() runs in
+        # inference mode, but the clone-prompt cache calls this method
+        # directly, so the encode needs its own.
+        with torch.inference_mode():
+            ref_audio_tokens = self.audio_tokenizer.encode(
+                ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
+            ).audio_codes.squeeze(
+                0
+            )  # (C, T)
 
         if preprocess_prompt:
             ref_text = add_punctuation(ref_text)
@@ -1475,7 +1809,7 @@ class OmniVoice(PreTrainedModel):
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, gen_config.position_temperature)
+                    scores = _gumbel_sample(scores, gen_config.position_temperature, gen_config._generator)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(
@@ -1510,7 +1844,7 @@ class OmniVoice(PreTrainedModel):
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)
             pred_tokens = _gumbel_sample(
-                filtered_probs, gen_config.class_temperature
+                filtered_probs, gen_config.class_temperature, gen_config._generator
             ).argmax(dim=-1)
         else:
             pred_tokens = log_probs.argmax(dim=-1)
@@ -1538,7 +1872,12 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
 
 
 def _resolve_language(language: Optional[str]) -> Union[str, None]:
-    from omnivoice.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
+    from omnivoice.utils.lang_map import (
+        APP_LANGUAGE_IDS,
+        APP_LANGUAGE_NAMES,
+        LANG_IDS,
+        LANG_NAME_TO_ID,
+    )
 
     if language is None or language.lower() == "none":
         return None
@@ -1547,6 +1886,9 @@ def _resolve_language(language: Optional[str]) -> Union[str, None]:
     key = language.lower()
     if key in LANG_NAME_TO_ID:
         return LANG_NAME_TO_ID[key]
+    alias = APP_LANGUAGE_NAMES.get(key) or APP_LANGUAGE_IDS.get(key)
+    if alias:
+        return alias
     logger.warning(
         f"Language '{language}' is not recognized. "
         f"Please use a valid language ID (e.g., 'en', 'zh', 'ja', 'de') "
@@ -1701,9 +2043,16 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
     return probs
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _gumbel_sample(
+    logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None
+) -> torch.Tensor:
     scaled_logits = logits / temperature
-    u = torch.rand_like(scaled_logits)
+    if generator is None:
+        u = torch.rand_like(scaled_logits)
+    else:
+        u = torch.rand(
+            logits.shape, dtype=logits.dtype, device=generator.device, generator=generator
+        ).to(logits.device)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 

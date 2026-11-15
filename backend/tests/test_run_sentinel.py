@@ -113,6 +113,57 @@ def test_unclean_shutdown_yields_crash_record(sentinel_env, monkeypatch):
     assert acked is False, "a fresh crash record must be unacknowledged"
 
 
+@pytest.fixture()
+def pristine_backend(monkeypatch):
+    """Import ``main`` and friends from scratch; put the old modules back after."""
+    roots = {"main", "core", "api", "services"}
+
+    def belongs(name):
+        return name in roots or name.split(".", 1)[0] in roots
+
+    stash = {k: v for k, v in sys.modules.items() if belongs(k)}
+    for k in stash:
+        del sys.modules[k]
+    try:
+        yield
+    finally:
+        for k in [k for k in sys.modules if belongs(k)]:
+            del sys.modules[k]
+        sys.modules.update(stash)
+
+
+def test_shutdown_retires_sentinel_before_slow_teardown(pristine_backend, monkeypatch, tmp_path):
+    """#1895: the shell SIGKILLs a quitting backend after ~2 s. A teardown step
+    that dies partway must not strand the sentinel, or the next launch would
+    invent a crash."""
+    import asyncio
+
+    import main as backend_main
+    from core import run_sentinel as sentinel
+
+    monkeypatch.setattr(sentinel, "SENTINEL_PATH", str(tmp_path / "run_sentinel.json"))
+    monkeypatch.setattr(sentinel, "CRASH_RECORD_PATH", str(tmp_path / "last_run_crash.json"))
+    monkeypatch.setattr(sentinel, "LOG_PATH", str(tmp_path / "omnivoice.log"))
+    sentinel._reset_for_tests()
+
+    def explode():
+        raise RuntimeError("teardown blew up")
+
+    monkeypatch.setattr(backend_main, "model_loads_begin_shutdown", explode)
+
+    async def start_and_stop():
+        async with backend_main.lifespan(FastAPI()):
+            pass
+
+    try:
+        with pytest.raises(RuntimeError, match="teardown blew up"):
+            asyncio.run(start_and_stop())
+        assert not Path(sentinel.SENTINEL_PATH).exists()
+        assert sentinel.detect_unclean_shutdown() is None
+    finally:
+        sentinel._reset_for_tests()
+
+
 def test_live_pid_means_second_instance_not_a_crash(sentinel_env):
     """A sentinel owned by a LIVE process is a concurrent second instance
     sharing DATA_DIR — never a crash, and we must not take over or delete
@@ -197,17 +248,40 @@ def test_touch_activity_without_ownership_never_writes(sentinel_env):
     assert not os.path.exists(run_sentinel.SENTINEL_PATH)
 
 
+def test_idle_shell_exit_is_retained_without_becoming_a_user_warning(sentinel_env):
+    record = {
+        "last_activity": None,
+        "log_tail": [
+            "INFO VoiceStudio model loaded successfully.",
+            "INFO Preload complete - model ready.",
+        ],
+    }
+    assert run_sentinel.warrants_user_notice(record) is False
+
+
+def test_interrupted_work_or_fatal_startup_still_warrants_a_warning(sentinel_env):
+    assert run_sentinel.warrants_user_notice(
+        {"last_activity": {"kind": "generate"}, "log_tail": []}
+    ) is True
+    assert run_sentinel.warrants_user_notice(
+        {"last_activity": None, "log_tail": ["CRITICAL: native runtime failed"]}
+    ) is True
+
+
 # ── Record store semantics (mirrors crash.rs) ──────────────────────────────
 
 
 def _crash_once(kind="generate"):
+    last_activity = None
+    if kind is not None:
+        last_activity = {"ts": time.time() - 5, "kind": kind, "detail": None}
     with open(run_sentinel.SENTINEL_PATH, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "pid": _dead_pid(),
                 "started_at": time.time() - 60,
                 "version": run_sentinel.APP_VERSION,
-                "last_activity": {"ts": time.time() - 5, "kind": kind, "detail": None},
+                "last_activity": last_activity,
             },
             f,
         )
@@ -334,3 +408,168 @@ def test_notification_surfaces_unacked_crash_and_reack(client):
     fresh = [n for n in notes if n["id"].startswith("last-run-crash-")]
     assert len(fresh) == 1
     assert fresh[0]["id"] != crash_notes[0]["id"]
+
+
+def test_notification_keeps_idle_exit_forensics_without_repeated_warning(client):
+    record = _crash_once(kind=None)
+    assert record is not None
+
+    notes = client.get("/system/notifications").json()["notifications"]
+    assert not [n for n in notes if n["id"].startswith("last-run-crash-")]
+
+    details = client.get("/system/last-run-crash").json()
+    assert details["record"]["detected_at"] == record["detected_at"]
+    assert details["acknowledged"] is False
+
+
+# ── crash context: what the shell can attach to a native crash ───────────
+
+
+def _emitted_context(capsys):
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith(run_sentinel.CONTEXT_PREFIX)
+    ]
+    return [json.loads(line[len(run_sentinel.CONTEXT_PREFIX):]) for line in lines]
+
+
+def test_activity_tells_the_shell_the_memory_at_that_moment(sentinel_env, monkeypatch, capsys):
+    import psutil
+    from types import SimpleNamespace
+
+    gib = 1024 ** 3
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=3 * gib, total=8 * gib)
+    )
+    monkeypatch.setattr(psutil, "swap_memory", lambda: SimpleNamespace(free=gib, total=2 * gib))
+    run_sentinel._reset_for_tests()
+
+    run_sentinel.touch_activity("model_load", "omnivoice-tts")
+
+    context = _emitted_context(capsys)[-1]
+    assert context["kind"] == "model_load"
+    assert context["detail"] == "omnivoice-tts"
+    assert context["ram_free_gb"] == 3.0
+    assert context["ram_total_gb"] == 8.0
+    assert context["swap_free_gb"] == 1.0
+    assert context["swap_total_gb"] == 2.0
+    # A browser or Docker session has no shell: the next run reads this instead.
+    assert run_sentinel._state["last_activity"]["ram_free_gb"] == 3.0
+
+
+def test_repeating_an_activity_does_not_flood_the_log(sentinel_env, capsys):
+    run_sentinel._reset_for_tests()
+
+    run_sentinel.touch_activity("task", "generate")
+    run_sentinel.touch_activity("task", "generate")
+    assert len(_emitted_context(capsys)) == 1
+
+    run_sentinel.touch_activity("model_load", "omnivoice-tts")
+    assert len(_emitted_context(capsys)) == 1
+
+
+def test_a_broken_memory_probe_never_breaks_the_work(sentinel_env, monkeypatch, capsys):
+    import psutil
+
+    def boom():
+        raise OSError("no")
+
+    monkeypatch.setattr(psutil, "virtual_memory", boom)
+    monkeypatch.setattr(psutil, "swap_memory", boom)
+    run_sentinel._reset_for_tests()
+
+    run_sentinel.touch_activity("task", "generate")
+
+    context = _emitted_context(capsys)[-1]
+    assert context["kind"] == "task"
+    assert "ram_free_gb" not in context
+
+
+def test_context_names_the_device_without_starting_a_probe(sentinel_env, monkeypatch, capsys):
+    from core import device_caps
+
+    device_caps.detect_host_caps.cache_clear()
+    run_sentinel._reset_for_tests()
+    monkeypatch.setattr(
+        device_caps, "_probe", lambda: pytest.fail("the context must not start a GPU probe")
+    )
+
+    run_sentinel.touch_activity("task", "generate")
+
+    assert "device" not in _emitted_context(capsys)[-1]
+
+
+def test_the_next_run_keeps_the_memory_in_its_crash_record(sentinel_env):
+    record = run_sentinel._build_crash_record(
+        {
+            "pid": 1,
+            "started_at": 100.0,
+            "version": "1",
+            "last_activity": {
+                "ts": 110.0,
+                "kind": "model_load",
+                "detail": "omnivoice-tts",
+                "engine": "omnivoice",
+                "device": "cpu",
+                "ram_free_gb": 3.1,
+                "ram_total_gb": 7.7,
+                "note": "dropped",
+            },
+        },
+        120.0,
+    )
+    activity = record["last_activity"]
+    assert activity["ram_free_gb"] == 3.1
+    assert activity["engine"] == "omnivoice"
+    assert "note" not in activity
+
+
+def test_context_includes_the_device_once_the_probe_has_run(sentinel_env, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from core import device_caps
+
+    device_caps.detect_host_caps.cache_clear()
+    monkeypatch.setattr(device_caps, "_probe", lambda: SimpleNamespace(family="rocm"))
+    device_caps.detect_host_caps()
+    run_sentinel._reset_for_tests()
+    try:
+        run_sentinel.touch_activity("task", "generate")
+    finally:
+        device_caps.detect_host_caps.cache_clear()
+
+    assert _emitted_context(capsys)[-1]["device"] == "rocm"
+
+
+def test_a_blocked_stderr_does_not_hold_the_lock(sentinel_env, monkeypatch):
+    """A full pipe would otherwise stop every thread that records activity."""
+    import io
+
+    held = []
+
+    class Recording(io.StringIO):
+        def write(self, text):
+            held.append(run_sentinel._lock.locked())
+            return super().write(text)
+
+    monkeypatch.setattr(sys, "stderr", Recording())
+    run_sentinel._reset_for_tests()
+
+    run_sentinel.touch_activity("task", "generate")
+
+    assert held and not any(held)
+
+
+def test_a_full_disk_does_not_hide_the_context(sentinel_env, monkeypatch, capsys):
+    def full(*_args):
+        raise OSError(28, "No space left on device")
+
+    run_sentinel._reset_for_tests()
+    run_sentinel.write_sentinel()
+    monkeypatch.setattr(run_sentinel, "_write_json_atomic", full)
+    monkeypatch.setitem(run_sentinel._state, "last_write", 0.0)
+
+    run_sentinel.touch_activity("model_load", "omnivoice-tts")
+
+    assert _emitted_context(capsys)[-1]["kind"] == "model_load"

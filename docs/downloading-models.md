@@ -4,25 +4,8 @@ VoiceStudio downloads models from the Hugging Face Hub on first use. This page
 explains how downloads are made fast, how to read the progress, and what to do
 on slow or restricted networks.
 
-When a remote GPU is selected, the catalog is filtered and curated for that
-worker's reported OS, architecture, and GPU backend—not for the control-plane
-computer. Generation checks the worker's capability report before submitting a
-job. If the required weights are positively known to be absent, VoiceStudio
-shows “model not downloaded on &lt;worker&gt;” with a download action. The download
-runs on that worker and refreshes its capabilities when it finishes; press
-Generate again afterward (the interrupted job is not automatically resubmitted).
-The same `POST /models/install` request targets either `local` or the selected
-worker, and `/setup/download-stream` reports both with a `target` field. Progress
-is tracked by `(target, repo_id)`, so simultaneous downloads of one model on two
-machines remain separate. Workers receive only an opaque model identifier and
-resolve the reviewed Hugging Face repository and pinned revision from their own
-catalog.
 Unknown or user-managed cache layouts are allowed through so existing manual
 engine installs remain compatible.
-
-Managed sidecar engines are intentionally excluded from remote installation.
-Their current installer fetches mutable source before creating an editable
-environment; install those directly on the worker until that source is pinned.
 
 ## Download backend: legacy LFS by default (accurate progress)
 
@@ -35,20 +18,66 @@ lands, the app forces the **classic LFS path**, which streams through the
 standard progress reporter and gives accurate downloaded/remaining/speed.
 
 To keep that path **fast** despite Xet being off, the app runs a built-in
-**multi-connection (segmented) downloader on by default** — it fetches each file
-over parallel byte-ranges (IDM/uGet style), so the legacy-LFS path is no longer
-single-stream. It reports real live speed/ETA and **falls back to the normal
-download on any error**, so it can never compromise a correct install. Adding a
+**multi-connection (segmented) downloader on by default**. It keeps up to eight
+byte ranges in flight, caps each range at 16 MB, and records every completed
+range in a resume manifest. After a dropped connection, only unfinished ranges
+are fetched again: the install retries the accelerator and resumes that
+manifest. An origin without range support remains a single stream within the
+accelerator. Before publishing the file, the accelerator checks its size and
+supported content digest: Git blob SHA-1 for 40-character ETags (including the
+Git object header), or SHA-256 for 64-character LFS ETags. A checksum mismatch
+leaves any previously installed destination untouched and invalidates the
+completed-range manifest, so a later retry fetches all ranges again rather than
+trusting the rejected bytes. Ordinary connection failures and cancellation keep
+valid completed ranges for resume; cancellation is checked during verification
+and before publication too. A checksum mismatch stops the install with a failure
+instead of switching to an unverified plain transfer; retrying the install can
+fetch the rejected ranges again. Other non-transient failures or the final attempt disable acceleration
+for the rest of that install and lets plain `snapshot_download` take over. Adding a
 free Hugging Face token (first-run setup, or Settings → Credentials) makes this
 faster still — authenticated downloads get higher rate limits and fewer stalls.
 To force the old single-stream path, set `OMNIVOICE_SEGMENTED_DOWNLOAD=0`.
+
+The segmented downloader checks the initial destination and every redirect,
+then pins each HEAD, body and range request to a validated public address.
+Redirects returned only by GET or range requests use the same checks and
+pinned transport; public hops retain range validation and content verification,
+while a refused hop stops the install before any legacy-transfer fallback.
+Changed DNS answers cannot turn a previously checked hostname into a private
+network fetch, including when a connection pool or proxy is used. HTTPS keeps
+the original hostname for certificate verification and SNI, and requests keep
+their original Host header. System HTTP/HTTPS/SOCKS proxies and `NO_PROXY`
+continue to apply to the original hostname; a configured local proxy remains
+usable. Hugging Face redirects to public CDNs remain supported, without
+forwarding the Hub token to those CDNs. Injected HTTP clients also keep their
+default authentication and cookies on the original origin (including a secure
+HTTP-to-HTTPS upgrade on default ports); an explicit Hub token remains authoritative on trusted Hugging Face HTTPS hosts.
+
+DNS validation uses a finite connection-timeout budget (30 seconds by default),
+including waiting for bounded resolver capacity. Cancellation does not wait for
+a stalled operating-system resolver. An interrupted, timed-out or unavailable
+destination check stops the install, including when another range fails first;
+its unresolved result cannot enable a plain-transfer fallback.
+
+A destination-policy refusal stops the install instead of switching to a
+plain transfer. For an intentionally private model mirror, the existing
+`OMNIVOICE_ALLOW_PRIVATE_URL_IMPORTS=1` opt-in permits private destinations;
+that setting also permits private URL imports elsewhere in the app. Leave it
+off for public model hosts. This policy is scoped to the segmented downloader
+and does not block the app's unrelated local backend connections.
+Hub metadata and plain Hugging Face transfers use the Hub client's transport;
+the address-pinning guarantee applies to accelerated transfers. Ordinary
+transfer failures after destination validation retain the documented plain-transfer
+fallback. Within an
+accelerated transfer, a working address is preferred only while fresh validated
+DNS answers still contain it, avoiding repeated dead-family timeouts per range.
 
 State is reported at **Settings → About** / `GET /system/info`:
 
 - `fast_download.xet_installed` — `hf_xet` present (true)
 - `fast_download.xet_active` — whether Xet actually drives downloads (false by
   default, because of `HF_HUB_DISABLE_XET`)
-- the **⚡ fast download** badge in **Model Catalogue → Models** appears only when Xet
+- `GET /system/info` reports `fast_download.xet_enabled` only when Xet
   is *active*.
 
 The backend logs one line at startup, e.g.
@@ -105,9 +134,20 @@ official endpoint unless the mirror is decisively faster, and remembers the
 winner. The decision is re-tested only on the first-run system check, after a
 network-classified download failure (the failed download retries once on the
 new winner), when it's more than 7 days old, or when you press **Test again**
-in **Settings → Models → Hugging Face mirror**. Mirror integrity is a
-non-issue: `huggingface_hub` verifies every download by checksum regardless
-of endpoint. Opt out with `OMNIVOICE_HF_ENDPOINT_MODE=manual`.
+in **Settings → Models → Hugging Face mirror**. Use an endpoint you trust:
+size and digest checks detect damaged transfers against the metadata supplied
+by that endpoint; they do not independently authenticate its publisher or make
+an untrusted mirror safe. Opt out with `OMNIVOICE_HF_ENDPOINT_MODE=manual`.
+
+This retry also applies to the model weights fetched by one-click engine
+installation. It retries once only when a network failure selects a different
+automatic endpoint; explicit endpoint choices stay fixed, and a full disk
+stops the download immediately.
+
+If an engine's live sidecar fails while fetching its first-use model weights,
+an automatic endpoint change also restarts that sidecar before one retry, so
+its Hub client reads the new endpoint. An unchanged endpoint or a non-network
+engine failure does not restart it.
 
 **Explicit (always wins).** To pin an endpoint yourself:
 
@@ -133,13 +173,29 @@ failed download at once. Caveats:
   chunk-dedup and Xet's parallel fetch, but you gain reachability. On the
   classic path, per-byte speed/ETA **is** shown continuously.
 - Russia and some networks have no official mirror; use a VPN/tunnel.
+- A custom mirror URL must use `https://` (plain `http://` is accepted only
+  for a local proxy on `localhost`/`127.0.0.1`) and must not contain a user
+  name, password, query or fragment.
+- Your Hugging Face token is sent only to Hugging Face, never to a mirror —
+  including token checks and gated-access checks. Gated models (speaker
+  diarization) therefore download from the official endpoint: in **Auto** mode
+  they always do, even when automatic selection picked the mirror; with a
+  mirror you chose yourself, the install fails with `HF_MIRROR_GATED` — switch
+  to **Hugging Face (official)** to install them.
 
 ## Cancelling a download
 
-**Model Catalogue → Models** lets you cancel an in-flight install. Cancellation stops
-further retries and clears the failure cooldown so you can restart
-immediately. A file that's already streaming finishes first — cancellation
-takes effect at the next retry boundary.
+The engine's **Weights** list in **Model Catalogue** lets you cancel an
+in-flight install. The transfer stops at its next chunk (or before it starts,
+if you cancel while it is still resolving; with the opt-in Xet transfer a file
+already in progress may finish first), and the row shows *cancelling*
+until cleanup finishes. Cleanup removes what that download wrote: partial
+`*.incomplete` / `*.part` files, files it finished, and new snapshot entries.
+Files that were already in the cache before you started (an earlier revision
+or another model's files) are kept, so the model returns to its previous state.
+On Windows, a file still held open is retried for a few seconds before it is
+left in place. Cancelling also clears the failure cooldown, so you can start
+the download again immediately.
 
 ## Troubleshooting
 
@@ -150,6 +206,8 @@ takes effect at the next retry boundary.
   High-performance mode only helps if RAM and bandwidth are plentiful.
 - **"download finished but no model weights were found"** — the download was
   interrupted and left a partial snapshot. Delete the model in
-  **Model Catalogue → Models** and install it again.
+  the engine's **Weights** list in **Model Catalogue** and install it again.
 - **Out of disk** — model sizes are shown in the catalog; free space or change
-  the cache location with `HF_HOME` / `HF_HUB_CACHE`.
+  the cache location with `HF_HOME` / `HF_HUB_CACHE`. An install also keeps
+  2 GB free on the model disk after the download, so it needs the download
+  size plus 2 GB; the warning in Model Catalogue shows both numbers.

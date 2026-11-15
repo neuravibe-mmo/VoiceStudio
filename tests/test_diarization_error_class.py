@@ -28,29 +28,11 @@ import pytest
 
 
 @pytest.fixture
-def model_manager(monkeypatch):
-    """Fresh import of services.model_manager with the diar pipeline cache
-    cleared. We also reset `_torch` so `_lazy_torch()` is hermetic.
-
-    Unconditional sys.modules purge — running this test after another that
-    monkey-patched `services.token_resolver.resolve` (e.g. the smoke test)
-    leaves a stale resolver bound inside `model_manager`'s local imports,
-    so we force a fresh load. Same defensive pattern as `tests/smoke/`
-    after PR #95.
-    """
-    # Don't pop services.token_resolver — the test body's `from services
-    # import token_resolver` and the function body's `from services import
-    # token_resolver` must resolve to the SAME module object, otherwise
-    # monkeypatch.setattr binds on a different identity than the function
-    # reads. Popping forces re-import which can create a fresh ID.
-    for mod_name in ("core.config", "services.model_manager"):
-        sys.modules.pop(mod_name, None)
-
-    import services.model_manager as mm
-
-    monkeypatch.setattr(mm, "_diar_pipeline", None)
-    monkeypatch.setattr(mm, "_torch", None)
-    return mm
+def model_manager(fresh_model_manager, monkeypatch):
+    manager = fresh_model_manager(force=True)
+    monkeypatch.setattr(manager, "_diar_pipeline", None)
+    monkeypatch.setattr(manager, "_torch", None)
+    return manager
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +128,12 @@ class TestGetDiarizationPipeline:
         # Stub _lazy_torch so it doesn't try to import the real torch.
         monkeypatch.setattr(model_manager, "_lazy_torch", lambda: SimpleNamespace(device=lambda d: d))
 
+        from contextlib import contextmanager
+        @contextmanager
+        def local_config():
+            yield "local-config.yaml"
+        monkeypatch.setattr("services.diarization_local.local_pipeline_config", local_config)
+
         # Inject a fake pyannote.audio module whose Pipeline.from_pretrained
         # raises a 401-equivalent. Use sys.modules patching since
         # `from pyannote.audio import Pipeline` is done inside the function.
@@ -176,6 +164,12 @@ class TestGetDiarizationPipeline:
         )
         monkeypatch.setattr(model_manager, "_lazy_torch", lambda: SimpleNamespace(device=lambda d: d))
 
+        from contextlib import contextmanager
+        @contextmanager
+        def local_config():
+            yield "local-config.yaml"
+        monkeypatch.setattr("services.diarization_local.local_pipeline_config", local_config)
+
         class FakePipeline:
             @staticmethod
             def from_pretrained(*args, **kwargs):
@@ -204,7 +198,7 @@ class TestErrorDocsDeeplink:
 
     def test_pyannote_license_required_is_in_locked_taxonomy(self):
         """If this test fails, the 5-class taxonomy was bumped without
-        also bumping the TS mirror — see frontend/src/utils/errorDocsMap.ts
+        also bumping the TS mirror — see electron/src/shared/utils/errorDocsMap.ts
         and its keys-sync test."""
         from core import error_docs_map
         assert "PYANNOTE_LICENSE_REQUIRED" in error_docs_map.ERROR_DOCS

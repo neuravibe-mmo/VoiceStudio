@@ -84,7 +84,7 @@ def test_low_free_vram_routes_pytorch_whisper_to_cpu(monkeypatch):
     import torch
 
     monkeypatch.setattr("services.model_manager.get_best_device", lambda: "cuda:0")
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (4 * 1024**3, 24 * 1024**3))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (3 * 1024**3, 24 * 1024**3))
 
     assert ab.PyTorchWhisperBackend._pick_device() == "cpu"
 
@@ -113,3 +113,39 @@ def test_pytorch_asr_model_overridable_via_env(monkeypatch):
 
     ab.PyTorchWhisperBackend(asr_pipe=None)._ensure_pipe()
     assert captured["kw"]["model"] == "openai/whisper-small"
+
+
+@pytest.mark.parametrize('message', [
+    'PyTorch should be installed.',
+    'CUDA out of memory',
+    'Model file is unreadable',
+])
+def test_pipeline_error_does_not_invent_an_import_or_dependency_mismatch(monkeypatch, message):
+    from core.failure import classify
+    cause = RuntimeError(message)
+    def fail(*args, **kwargs):
+        raise cause
+    fake = types.ModuleType('transformers')
+    fake.pipeline = fail
+    monkeypatch.setitem(sys.modules, 'transformers', fake)
+    monkeypatch.setattr(ab.PyTorchWhisperBackend, '_pick_device', lambda *args: 'cpu')
+    with pytest.raises(RuntimeError) as caught:
+        ab.PyTorchWhisperBackend()._ensure_pipe()
+    assert caught.value.__cause__ is cause
+    assert message in str(caught.value)
+    assert 'AutoFeatureExtractor' not in str(caught.value)
+    assert 'Reinstall' not in str(caught.value)
+    assert classify(str(caught.value)) != 'TRANSFORMERS_IMPORT'
+
+
+def test_actual_transformers_import_failure_remains_classifiable(monkeypatch):
+    from core.failure import classify
+    def fail(*args, **kwargs):
+        raise ImportError("Could not import module 'AutoFeatureExtractor'")
+    fake = types.ModuleType('transformers')
+    fake.pipeline = fail
+    monkeypatch.setitem(sys.modules, 'transformers', fake)
+    monkeypatch.setattr(ab.PyTorchWhisperBackend, '_pick_device', lambda *args: 'cpu')
+    with pytest.raises(RuntimeError) as caught:
+        ab.PyTorchWhisperBackend()._ensure_pipe()
+    assert classify(str(caught.value)) == 'TRANSFORMERS_IMPORT'

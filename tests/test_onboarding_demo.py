@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 import wave
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
@@ -77,20 +78,13 @@ def test_demo_clip_is_not_gitignored():
         )
 
 
-def test_backend_is_a_bundled_tauri_resource():
-    """The clip ships only because the whole `backend/` tree is a Tauri bundle
-    resource. If that entry is removed, the asset (and the backend) stops
-    shipping. Pin it."""
-    import json
-    conf = os.path.join(_ROOT, "frontend", "src-tauri", "tauri.conf.json")
-    if not os.path.isfile(conf):
-        import pytest
-        pytest.skip("tauri.conf.json not found")
-    resources = json.load(open(conf)).get("bundle", {}).get("resources", []) or []
-    assert any(str(r).rstrip("/").endswith("backend") for r in resources), (
-        "backend/ is no longer a bundle resource in tauri.conf.json — the demo "
-        "clip and the backend source would stop shipping with the app."
+def test_backend_is_a_bundled_electron_resource():
+    """The backend tree, including the demo clip, must ship with Electron."""
+    config = Path(_ROOT, "electron", "electron-builder.config.mjs").read_text(
+        encoding="utf-8"
     )
+    assert "from: '../backend'" in config
+    assert "to: 'backend'" in config
 
 
 def _table_sql():
@@ -182,3 +176,34 @@ def test_existing_demo_profile_receives_the_latest_bundled_voice(tmp_path, monke
     ).fetchone()[0]
     conn.close()
     assert description == onboarding._DEMO_DESCRIPTION
+
+
+def test_demo_keeps_a_user_rename_but_drops_the_old_default_name(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "ob.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(_table_sql())
+    conn.execute(
+        "INSERT INTO voice_profiles (id, name, is_demo, description, ref_text) VALUES (?, ?, 1, '', ?)",
+        (onboarding.DEMO_PROFILE_ID, "VoiceStudio Demo Voice", onboarding.DEMO_REF_TEXT),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(onboarding, "get_db", lambda: sqlite3.connect(db_path))
+    monkeypatch.setattr(onboarding, "_DEMO_AUDIO", str(tmp_path / "missing.wav"))
+
+    def name():
+        c = sqlite3.connect(db_path)
+        try:
+            return c.execute("SELECT name FROM voice_profiles WHERE id=?", (onboarding.DEMO_PROFILE_ID,)).fetchone()[0]
+        finally:
+            c.close()
+
+    onboarding.seed_sample_project()
+    assert name() == "Demo Voice"
+
+    c = sqlite3.connect(db_path)
+    c.execute("UPDATE voice_profiles SET name='Narrator' WHERE id=?", (onboarding.DEMO_PROFILE_ID,))
+    c.commit()
+    c.close()
+    onboarding.seed_sample_project()
+    assert name() == "Narrator"

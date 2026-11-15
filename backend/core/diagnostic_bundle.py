@@ -3,11 +3,12 @@
 The prefilled GitHub Issues URL caps out around 8k characters, so logs can
 never ride along with a report. This module zips the full picture instead:
 
-    omnivoice-diagnostics-<timestamp>.zip
+    omnivoice-diagnostics-<timestamp>-<unique>.zip
     ├── meta.json            app version, platform, python, generated-at
     ├── self_check.txt       human-readable diagnose report
     ├── self_check.json      same, structured
     ├── errors.json          recent error journal (deduped, classified)
+    ├── render_traces.json   recent local render timings and operation counts
     └── logs/
         ├── omnivoice.log.txt    last 500 lines, scrubbed
         └── crash_log.txt        last 200 lines, scrubbed
@@ -24,6 +25,7 @@ import json
 import os
 import platform
 import sys
+import tempfile
 import time
 import zipfile
 
@@ -56,7 +58,7 @@ def build_bundle(include_network: bool = False) -> str:
     to "save the evidence".
     """
     from core.diagnose import run_diagnostics, format_text
-    from core import error_journal
+    from core import error_journal, render_trace
 
     report = run_diagnostics(include_network=include_network)
 
@@ -69,7 +71,10 @@ def build_bundle(include_network: bool = False) -> str:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUTS_DIR, f"omnivoice-diagnostics-{stamp}.zip")
+    fd, out_path = tempfile.mkstemp(
+        prefix=f"omnivoice-diagnostics-{stamp}-", suffix=".zip", dir=OUTPUTS_DIR,
+    )
+    os.close(fd)
 
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("meta.json", json.dumps(meta, indent=2, ensure_ascii=False))
@@ -79,6 +84,7 @@ def build_bundle(include_network: bool = False) -> str:
             "errors.json",
             json.dumps(error_journal.recent(50), indent=2, ensure_ascii=False),
         )
+        zf.writestr("render_traces.json", json.dumps(render_trace.recent(), indent=2))
         zf.writestr("logs/omnivoice.log.txt", _scrubbed_tail(LOG_PATH, _LOG_TAIL_LINES))
         zf.writestr("logs/crash_log.txt", _scrubbed_tail(CRASH_LOG_PATH, _CRASH_TAIL_LINES))
 

@@ -1,3 +1,5 @@
+import importlib.abc
+import importlib.machinery
 import os
 import sys
 import tempfile
@@ -19,8 +21,24 @@ if _BACKEND not in sys.path:
 # test module, which is what freezes DATA_DIR at `core.config` import time)
 # makes every local run behave like a clean CI runner. `setdefault` semantics:
 # an explicitly exported OMNIVOICE_DATA_DIR still wins.
-if not os.environ.get("OMNIVOICE_DATA_DIR"):
+#
+# pytest-xdist: the controller imports this file first and exports the dir it
+# made; every worker then inherits it, so all workers shared ONE prefs.json /
+# omnivoice.db / user-env and one worker's `llm_backend=off` flipped another's
+# "ready" assertion. A dir WE created (tracked in _OMNIVOICE_TEST_AUTO_DATA_DIR)
+# is therefore re-made per worker; an explicitly exported one is still honored.
+_AUTO_DATA_DIR = "_OMNIVOICE_TEST_AUTO_DATA_DIR"
+_inherited_auto_dir = os.environ.get("OMNIVOICE_DATA_DIR") if (
+    os.environ.get("PYTEST_XDIST_WORKER")
+    and os.environ.get("OMNIVOICE_DATA_DIR") == os.environ.get(_AUTO_DATA_DIR)
+) else None
+if _inherited_auto_dir:
+    _env_file = os.environ.get("OMNIVOICE_ENV_FILE", "")
+    if _env_file.startswith(_inherited_auto_dir):
+        del os.environ["OMNIVOICE_ENV_FILE"]  # re-derived below from the worker's dir
+if not os.environ.get("OMNIVOICE_DATA_DIR") or _inherited_auto_dir:
     os.environ["OMNIVOICE_DATA_DIR"] = tempfile.mkdtemp(prefix="omnivoice-test-data-")
+    os.environ[_AUTO_DATA_DIR] = os.environ["OMNIVOICE_DATA_DIR"]
 # Same story for the durable per-user env file (~/.config/omnivoice/env):
 # `main.py` loads it with override=True at import, so a TestClient importing
 # the app mid-suite would inject the developer's real TRANSLATE_* / key vars
@@ -45,6 +63,12 @@ if not os.environ.get("OMNIVOICE_ENV_FILE"):
 # need a different value monkeypatch it explicitly.
 os.environ["OMNIVOICE_MODEL"] = "test"
 
+# Starlette's TestClient addresses the app as "http://testserver". The backend
+# refuses unrecognized Host names (DNS-rebinding guard, core.browser_guard),
+# so the suite registers that name the way a deployment registers its own.
+# Tests of the host check itself clear this with monkeypatch.
+os.environ.setdefault("OMNIVOICE_ALLOWED_HOSTS", "testserver")
+
 # Background warm-ups must not fire mid-suite: many tests boot the app
 # lifespan via TestClient, and any that exits without a lifespan shutdown
 # leaves the deferred preload task pending — 35s later (mid-suite, in
@@ -54,12 +78,186 @@ os.environ["OMNIVOICE_MODEL"] = "test"
 # shell must not re-enable it; a test that wants the warm-up monkeypatches.
 os.environ["OMNIVOICE_PRELOAD_WATERMARK"] = "0"
 
+# Physical-GPU inventory (core.gpu_inventory) reads the OS registry / sysfs. A
+# developer's own AMD/NVIDIA card must not change what a routing or probe test
+# resolves, so the suite sees a GPU-less inventory; the inventory's own tests
+# call its readers directly with fakes.
+os.environ["OMNIVOICE_DISABLE_GPU_INVENTORY"] = "1"
+
 
 # ── Test fixtures ──────────────────────────────────────────────────────────
 
 
 import pytest
 import warnings as _warnings
+
+
+# ── Persisted user settings: per-test isolation ────────────────────────────
+# The hermetic data dir above is per SESSION, so prefs.json and the user-env
+# file are shared by every test in the run. Anything a test persists there —
+# directly, or as a side effect such as the app lifespan's startup
+# `reconcile_active_profile()` — silently changes what every later test
+# resolves. That lifespan pass picks models from the developer's real HF cache
+# and persists them (`dictation.model_id`, `asr_backend`, …), so a dev with a
+# sherpa dictation model installed saw later capture-WebSocket tests routed to
+# the sherpa handler, while CI (empty cache, nothing to persist) stayed green.
+# Restoring the files byte-for-byte at every test and module boundary closes
+# the whole class — including leaks from module-scoped fixtures — without each
+# test having to redirect `prefs._PREFS_PATH` itself. The paths are frozen
+# here, not read from `core.prefs`, so a test that re-imports or repoints the
+# module cannot move the store this guard protects.
+_PERSISTED_SETTINGS_FILES = (
+    os.path.join(os.environ["OMNIVOICE_DATA_DIR"], "prefs.json"),
+    os.environ["OMNIVOICE_ENV_FILE"],
+)
+
+
+def _settings_files_snapshot() -> dict:
+    snapshot = {}
+    for path in _PERSISTED_SETTINGS_FILES:
+        try:
+            with open(path, "rb") as handle:
+                snapshot[path] = handle.read()
+        except FileNotFoundError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _settings_files_restore(snapshot: dict) -> None:
+    # `core.prefs` freezes its path at first import. When that first import
+    # happens inside a test that aimed OMNIVOICE_DATA_DIR at its tmp_path
+    # (the reload-fixture shape), the rest of the session would read and
+    # write prefs in that test's directory, out of this guard's reach. Test
+    # monkeypatches are already undone here, so any other value is a leak.
+    prefs = sys.modules.get("core.prefs")
+    if prefs is not None and getattr(prefs, "_PREFS_PATH", None) != _PERSISTED_SETTINGS_FILES[0]:
+        prefs._PREFS_PATH = _PERSISTED_SETTINGS_FILES[0]
+    for path, before in snapshot.items():
+        try:
+            with open(path, "rb") as handle:
+                after = handle.read()
+        except FileNotFoundError:
+            after = None
+        if after == before:
+            continue
+        if before is None:
+            os.remove(path)
+            continue
+        tmp = f"{path}.conftest-restore"
+        with open(tmp, "wb") as handle:
+            handle.write(before)
+        os.replace(tmp, path)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "model_licence_gate: run with real model-licence acceptance (default: accepted)",
+    )
+    _pin_beartype_claw_state()
+
+
+def _pin_beartype_claw_state():
+    """Load beartype's import-hook state before any test can snapshot sys.modules.
+
+    ``pocket_tts`` (an ``is_available()`` probe imports it in-process) calls
+    ``beartype_this_package()``, which installs a process-wide import hook whose
+    ``get_code`` does a lazy ``from beartype.claw._clawstate import claw_state``.
+    A test that imports it inside ``patch.dict("sys.modules", ...)`` has every
+    ``beartype*`` module removed again on exit while the hook stays installed, so
+    the next import re-executes ``_clawstate`` under the hook and recurses into
+    itself ("cannot import name 'claw_state' from partially initialized
+    module"), failing every later new import on that xdist worker. Having it in
+    sys.modules up front puts it in every such snapshot, so it is restored.
+    """
+    try:
+        import beartype.claw._clawstate  # noqa: F401
+    except ImportError:
+        pass  # beartype is only present with the pockettts extra
+
+
+_LICENCE_STUB = {"active": False, "stubbed": []}
+
+
+class _LicenceDefaultFinder(importlib.abc.MetaPathFinder):
+    """Stub ``ensure_accepted`` on every copy of services.model_acceptance.
+
+    Suites that purge and re-import backend modules mid-test (tests/backend)
+    create a fresh copy after the autouse fixture below has already run, so
+    patching the copy that existed then would miss the one the app uses.
+    """
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "services.model_acceptance":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None:
+            return spec
+        loader, run = spec.loader, spec.loader.exec_module
+
+        def exec_module(module):
+            run(module)
+            if _LICENCE_STUB["active"]:
+                _stub_licence_module(module)
+
+        loader.exec_module = exec_module
+        return spec
+
+
+def _stub_licence_module(module) -> None:
+    _LICENCE_STUB["stubbed"].append((module, module.ensure_accepted))
+    module.ensure_accepted = lambda repo_ids: None
+
+
+sys.meta_path.insert(0, _LicenceDefaultFinder())
+
+
+@pytest.fixture(autouse=True)
+def _model_licences_accepted_by_default(request):
+    """Gated model licences read as accepted unless a test opts in with
+    ``@pytest.mark.model_licence_gate``.
+
+    Enforcement has its own tests (test_model_acceptance, test_tts_model_licence_gate);
+    every other engine test would otherwise depend on acceptance state that a
+    fresh test data dir never has. Mirrored in backend/tests/conftest.py.
+    """
+    if request.node.get_closest_marker("model_licence_gate"):
+        yield
+        return
+    _LICENCE_STUB["active"] = True
+    current = sys.modules.get("services.model_acceptance")
+    if current is not None and all(m is not current for m, _ in _LICENCE_STUB["stubbed"]):
+        _stub_licence_module(current)
+    try:
+        yield
+    finally:
+        _LICENCE_STUB["active"] = False
+        for module, original in reversed(_LICENCE_STUB["stubbed"]):
+            module.ensure_accepted = original
+        _LICENCE_STUB["stubbed"].clear()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_persisted_settings_per_module():
+    snapshot = _settings_files_snapshot()
+    yield
+    _settings_files_restore(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _reset_share_pin_guard():
+    """Wrong-PIN counts are process state; one test's guesses must not lock out the next."""
+    yield
+    guard = sys.modules.get("services.pin_guard")
+    if guard is not None:
+        guard.pin_guard.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persisted_settings():
+    snapshot = _settings_files_snapshot()
+    yield
+    _settings_files_restore(snapshot)
 
 
 # App lifespans deliberately close watermark admission during shutdown. The
@@ -212,6 +410,157 @@ def asr_model_installed(monkeypatch, request):
         monkeypatch.setattr(mod, "asr_model_missing_error", lambda **_kw: None)
 
 
+def _asr_backend_targets(request):
+    """The canonical ``services.asr_backend`` plus any stale module-typed alias
+    the test module holds (see ``asr_model_installed``)."""
+    import importlib
+    import types
+
+    canonical = importlib.import_module("services.asr_backend")
+    targets = {id(canonical): canonical}
+    for val in vars(getattr(request, "module", None) or types.SimpleNamespace()).values():
+        if isinstance(val, types.ModuleType) and getattr(val, "__name__", "") == "services.asr_backend":
+            targets[id(val)] = val
+    return list(targets.values())
+
+
+@pytest.fixture
+def neutral_asr_host(monkeypatch, request):
+    """A CPU-only host for ASR selection tests, whatever machine runs them.
+
+    ``_auto_detect`` reads MPS, CUDA, ROCm-Torch and the Windows HIP install
+    before any test stub of ``_probe_available`` matters, so a selection test
+    that pins only some of them passes on a plain runner and fails on an Apple
+    Silicon or Windows ROCm host (#3549). Every predicate starts False here;
+    a test opts back in to the hardware it is about. The Windows HIP checks
+    are imported lazily by the code under test from ``sys.modules``, so they
+    are patched on the module that is canonical NOW, not on an alias an
+    earlier ``sys.modules`` purge left behind. The warm transcription instance
+    is released on both sides so a cached engine never outlives its stubs
+    (with an explicit clock: a test may have stubbed ``time.monotonic``).
+    """
+    import importlib
+
+    hip = importlib.import_module("core.windows_rocm.ct2")
+    monkeypatch.setattr(hip, "windows_hip_installed", lambda: False)
+    monkeypatch.setattr(hip, "hip_ct2_available", lambda: False)
+    targets = _asr_backend_targets(request)
+    for mod in targets:
+        for name in ("_mps_available", "_cuda_reported_available", "_rocm_torch"):
+            monkeypatch.setattr(mod, name, lambda: False)
+        mod.release_transcription_backend(0.0, now=float("inf"))
+    yield
+    for mod in targets:
+        mod.release_transcription_backend(0.0, now=float("inf"))
+
+
+@pytest.fixture
+def cpu_host(monkeypatch):
+    """Pin host capabilities to a plain CPU machine.
+
+    On Apple Silicon the configured ``omnivoice`` engine resolves to the
+    crash-isolated MPS sidecar, which loads the real checkpoint in a child
+    process and never sees a test's in-process ``get_model`` stub — so tests
+    that stub the native OmniVoice path passed on Linux CI and failed on every
+    Mac (#3695). Patches ``core.device_caps.detect_host_caps`` on the canonical
+    module and every loaded backend module that bound it at import time.
+    """
+    import importlib
+
+    device_caps = importlib.import_module("core.device_caps")
+    real = device_caps.detect_host_caps
+    caps = device_caps.HostCaps(family="cpu", available_families=("cpu",))
+    fake = lambda: caps  # noqa: E731 — a stand-in with the probe's signature
+    monkeypatch.setattr(device_caps, "detect_host_caps", fake)
+    for name, mod in list(sys.modules.items()):
+        if (name.split(".")[0] in {"api", "core", "engines", "main", "services"}
+                and getattr(mod, "detect_host_caps", None) is real):
+            monkeypatch.setattr(mod, "detect_host_caps", fake)
+    return caps
+
+
+def threads_to_join(before, pool_before, pool_now, current):
+    """Threads a test must join: everything it started, plus GPU-pool workers
+    that were live before it but whose pool it reset (no longer live)."""
+    retired = set(pool_before) - set(pool_now)
+    exempt = (set(before) - retired) | set(pool_now)
+    return [t for t in current if t not in exempt]
+
+
+@pytest.fixture
+def join_test_threads(monkeypatch):
+    """Join every thread the test started before its state is torn down.
+
+    Tests that wedge a model load and then abandon it (``release.set()`` plus
+    ``pool.shutdown(wait=False)``) leave the woken worker still finishing
+    ``_load_model_exclusive``: it then publishes the module-global ``model``,
+    clears ``_load_abandoned`` and releases whatever load lock is current —
+    which on a slow runner is already the NEXT test's freshly patched state,
+    so that test's cold load returns a model nobody loaded (flaky on Linux CI
+    only). Requesting ``monkeypatch`` sets it up first, so it is undone last:
+    the workers finish against this test's patches, which are then restored
+    over whatever they wrote.
+
+    Workers of the app's live GPU pool are exempt: that pool is built
+    lazily and is meant to outlive the call. A pool that was reset after a
+    timeout is no longer live, so its wedged worker is still joined.
+    """
+    import threading
+
+    def _live_gpu_pool_workers() -> set:
+        mm = sys.modules.get("services.model_manager")
+        wrapper = getattr(mm, "_gpu_pool_singleton", None)
+        return set(getattr(getattr(wrapper, "_pool", None), "_threads", ()))
+
+    before = set(threading.enumerate())
+    pool_before = _live_gpu_pool_workers()
+    yield
+    pool_now = _live_gpu_pool_workers()
+    # A GPU worker that existed before the test but whose pool the test reset
+    # (e.g. after a load timeout) is no longer live: join it like any other.
+    started = threads_to_join(before, pool_before, pool_now, threading.enumerate())
+    deadline = time.monotonic() + 35.0  # test stubs park on bounded 30 s waits
+    for thread in started:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    alive = [t.name for t in started if t.is_alive()]
+    assert not alive, (
+        "threads started by this test are still running and would act on the "
+        f"next test's state: {alive}"
+    )
+
+
+_MODEL_MANAGER_TEST_REPO = "test/checkpoint"
+
+
+@pytest.fixture
+def fresh_model_manager(monkeypatch):
+    """Load the real model manager while discarding collection-time stubs."""
+    import importlib
+
+    def load(*, force: bool = False):
+        for name in ("core.config", "services.model_manager"):
+            loaded = sys.modules.get(name)
+            if force or (loaded is not None and getattr(loaded, "__file__", None) is None):
+                sys.modules.pop(name, None)
+        return importlib.import_module("services.model_manager")
+
+    return load
+
+
+@pytest.fixture
+def offline_model_manager(fresh_model_manager, monkeypatch):
+    manager = fresh_model_manager()
+    for name in ("_torch", "_OmniVoice", "model"):
+        monkeypatch.setattr(manager, name, None)
+    monkeypatch.setenv("OMNIVOICE_MODEL", _MODEL_MANAGER_TEST_REPO)
+    for name in ("OMNIVOICE_PRELOAD_TTS_ASR", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(name, raising=False)
+    fake_torch = type("TestTorch", (), {"float16": object(), "float32": object()})()
+    monkeypatch.setattr(manager, "_lazy_torch", lambda: fake_torch)
+    monkeypatch.setattr(manager, "get_best_device", lambda: "cpu")
+    return manager
+
+
 @pytest.fixture(autouse=True)
 def _clear_asr_installed_memo(request):
     """The ASR preflight memoizes installed-POSITIVE repos process-wide
@@ -267,8 +616,9 @@ def torch_dtype_isolation(request):
 # change what *later* tests' `active_backend_id()` / `active_provider_id()`
 # resolved to (order-dependent failures in test_engines.py,
 # test_llm_endpoint_settings.py, test_llm_providers.py). The autouse guard
-# below snapshots all three surfaces before every test and restores them
-# exactly afterwards, making the whole class of leak impossible.
+# below snapshots the env vars and settings rows before every test and
+# restores them exactly afterwards; prefs.json is restored whole by
+# `_isolate_persisted_settings` above.
 
 # Env vars that are NOT declared on a Provider entry but still steer LLM /
 # translation resolution.
@@ -347,36 +697,6 @@ def _llm_store_restore(before: dict) -> None:
         pass  # table never existed during the test → nothing leaked
 
 
-def _llm_prefs_subset(data: dict) -> dict:
-    return {
-        k: v for k, v in data.items()
-        if k == "llm_backend" or k.startswith("env.TRANSLATE")
-    }
-
-
-def _llm_prefs_snapshot() -> dict:
-    try:
-        from core import prefs
-        return _llm_prefs_subset(prefs._load())
-    except Exception:
-        return {}
-
-
-def _llm_prefs_restore(before: dict) -> None:
-    try:
-        from core import prefs
-        data = prefs._load()
-        current = _llm_prefs_subset(data)
-        if current == before:
-            return
-        for k in current.keys() - before.keys():
-            data.pop(k, None)
-        data.update(before)
-        prefs._save(data)
-    except Exception:
-        pass
-
-
 # ── HF endpoint probes: no real network, ever ───────────────────────────────
 # services.endpoint_race probes huggingface.co / hf-mirror.com over HTTPS.
 # Several suites reach it indirectly (/setup/preflight forces a race, the
@@ -392,7 +712,6 @@ def _no_real_endpoint_probes():
     # teardown against other autouse guards (it broke the dtype guard vs
     # test_torch_compile_gate's torch stub). An isolated MonkeyPatch leaves
     # the shared fixture's position untouched.
-    from core import prefs as _prefs
     from services import endpoint_race as _er
 
     def _fake_probe(endpoint, timeout=None):
@@ -406,13 +725,8 @@ def _no_real_endpoint_probes():
         mp.setattr(_er, "probe_endpoint", _fake_probe)
         mp.setattr(_er, "throughput_probe", lambda endpoint, timeout=None: None)
         yield
-    # The decision cache lives in prefs, which persist across tests within
-    # the hermetic session dir — clear it so one test's auto pick can never
-    # leak into another's preflight assertions.
-    try:
-        _prefs.set_(_er._DECISION_PREF, None)
-    except Exception:
-        pass
+    # The decision cache lives in prefs; `_isolate_persisted_settings` restores
+    # it, so one test's auto pick cannot leak into another's preflight.
 
 
 @pytest.fixture(autouse=True)
@@ -421,7 +735,6 @@ def _isolate_llm_provider_state():
     names = _llm_env_names()
     env_before = {n: os.environ.get(n) for n in names}
     store_before = _llm_store_snapshot()
-    prefs_before = _llm_prefs_snapshot()
     yield
     for n, v in env_before.items():
         if os.environ.get(n) != v:
@@ -430,7 +743,6 @@ def _isolate_llm_provider_state():
             else:
                 os.environ[n] = v
     _llm_store_restore(store_before)
-    _llm_prefs_restore(prefs_before)
 
 
 @pytest.fixture
@@ -570,3 +882,23 @@ def _restore_config_paths_after_reload():
             for const, value in before.items():
                 if isinstance(getattr(mod, const, None), str) and getattr(mod, const) != value:
                     setattr(mod, const, value)
+
+
+# ── Symlinks on a stock Windows checkout ───────────────────────────────────
+# Creating a symlink on Windows needs SeCreateSymbolicLinkPrivilege, which a
+# normal user account does not hold unless Developer Mode is on. Hosted CI
+# runs elevated, so unguarded `Path.symlink_to` / `os.symlink` calls pass
+# there and hand a Windows contributor a suite that fails on their machine
+# for reasons that have nothing to do with their change (WinError 1314). Tests
+# that need a real symlink take this fixture, so the environment that cannot
+# make one skips instead of erroring. Coverage still holds: the full pytest
+# job runs on Linux.
+@pytest.fixture
+def symlink_or_skip():
+    def _make(link, target, *, target_is_directory: bool = False):
+        try:
+            os.symlink(target, link, target_is_directory=target_is_directory)
+        except (OSError, NotImplementedError) as exc:  # pragma: no cover - Windows-only
+            pytest.skip(f"symlinks unavailable in this environment: {exc}")
+
+    return _make

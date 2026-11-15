@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import time
 import json
 import logging
@@ -8,6 +9,39 @@ from core import failure
 from core import run_sentinel
 
 logger = logging.getLogger("omnivoice.tasks")
+
+
+def _stream_payload(update):
+    """The JSON payload and raw lines of one SSE update, or ``(None, [])``."""
+    if isinstance(update, bytes):
+        update = update.decode("utf-8", errors="replace")
+    if not isinstance(update, str):
+        return None, []
+    lines = update.splitlines()
+    try:
+        payload = json.loads("\n".join(line[5:].strip() for line in lines if line.startswith("data:")))
+    except (ValueError, TypeError):
+        return None, lines
+    return (payload if isinstance(payload, dict) else None), lines
+
+
+def _stream_completed(update) -> bool:
+    """Whether an update reports work that has already been committed."""
+    payload, _lines = _stream_payload(update)
+    return payload is not None and payload.get("type") == "done"
+
+
+def _stream_failure(update):
+    """Recognize terminal SSE failures, including generators that do not raise."""
+    payload, lines = _stream_payload(update)
+    if payload is None:
+        return None
+    if payload.get("type") != "error" and not any(line.strip() == "event: error" for line in lines):
+        return None
+    detail = payload.get("reason") or payload.get("error") or payload.get("detail")
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("reason")
+    return detail if isinstance(detail, str) and detail else "Task failed"
 
 
 class TaskManager:
@@ -117,17 +151,34 @@ class TaskManager:
                 import inspect
                 res = func(*args, **kwargs)
                 if inspect.isasyncgen(res):
-                    async for update in res:
-                        if t.get("cancelled"):
-                            await self._push_event(task_id, f"data: {json.dumps({'type': 'cancelled'})}\n\n")
-                            t["status"] = "cancelled"
-                            try: job_store.mark_cancelled(task_id)
-                            except Exception: logger.exception("job_store.mark_cancelled failed")
-                            break
-                        await self._push_event(task_id, update)
+                    # Close the stream however the task ends (done, cancelled,
+                    # failed or raised) so a render releases what it holds, such
+                    # as voice-file leases, instead of staying suspended (#2535).
+                    async with contextlib.aclosing(res):
+                        async for update in res:
+                            # A `done` update means the work is already
+                            # committed; a cancel that arrived meanwhile must
+                            # not report it as cancelled, or the client would
+                            # redo work that exists.
+                            if t.get("cancelled") and not _stream_completed(update):
+                                await self._push_event(task_id, f"data: {json.dumps({'type': 'cancelled'})}\n\n")
+                                t["status"] = "cancelled"
+                                try: job_store.mark_cancelled(task_id)
+                                except Exception: logger.exception("job_store.mark_cancelled failed")
+                                break
+                            await self._push_event(task_id, update)
+                            stream_error = _stream_failure(update)
+                            if stream_error is not None:
+                                t["status"] = "failed"
+                                t["error"] = stream_error
+                                try:
+                                    job_store.mark_failed(task_id, stream_error)
+                                except Exception:
+                                    logger.exception("job_store.mark_failed failed")
+                                break
                 elif inspect.iscoroutine(res):
                     await res
-                if t["status"] != "cancelled":
+                if t["status"] not in {"cancelled", "failed"}:
                     t["status"] = "done"
                     try: job_store.mark_done(task_id)
                     except Exception: logger.exception("job_store.mark_done failed")

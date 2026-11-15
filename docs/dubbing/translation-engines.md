@@ -15,6 +15,9 @@ optional Python package.
 | MyMemory | online | `deep_translator` | no |
 | LLM (OpenAI-compatible) | llm | `openai` | usually yes |
 
+Electron's Settings > Models > Translation page shows available and unavailable
+engines together, so install and configuration options remain visible.
+
 If you pick an engine whose package isn't importable yet, the Engine label shows
 a **highlighted Install affordance**, and — if you try to translate anyway — the
 backend returns a single, actionable error telling you exactly what to install
@@ -159,10 +162,10 @@ and with no LLM configured (or on any LLM error) it simply does nothing.
 
 **Settings → System → LLM Providers** is the one place to set up the LLM. Pick a
 provider, paste its API key, choose a model, **Test** it, and "use for
-translation." Supported: OpenAI, OpenRouter, OrcaRouter, Groq, Cerebras, Google AI (Gemini),
-Mistral, Cohere, NVIDIA, GitHub Models, Cloudflare, Hugging Face, SambaNova,
-SiliconFlow, **local Ollama / LM Studio** (offline, no key), and a **Custom**
-OpenAI-compatible endpoint.
+translation." Supported choices are OpenAI, OpenRouter, OrcaRouter, Cheaper Inference,
+Opper, API Route, Groq, Cerebras, Google AI (Gemini), Mistral, Cohere, NVIDIA, GitHub Models,
+Cloudflare, Hugging Face, SambaNova, SiliconFlow, iFLYTEK Astron MaaS,
+**local Ollama / LM Studio (offline, no key)**, and a **Custom OpenAI-compatible endpoint**.
 
 Keys entered here are stored **encrypted** on your machine and never returned to
 the UI. For a fully offline setup, pick **Ollama** (`ollama pull llama3.1`) or
@@ -174,6 +177,38 @@ provider via environment variables (e.g. `GROQ_API_KEY`, or the legacy
 OrcaRouter can be configured without the UI with `ORCAROUTER_API_KEY`, and its
 defaults can be overridden with `ORCAROUTER_BASE_URL` and `ORCAROUTER_MODEL`.
 
+[Cheaper Inference](https://cheaperinference.com) is an OpenAI-compatible gateway
+covering models from several labs. It defaults to `gpt-5.4-mini`; pricing depends
+on the selected model and request, as listed in its [provider catalog](https://cheaperinference.com/docs).
+Without the UI, set `CHEAPER_INFERENCE_API_KEY`; override the defaults with
+`CHEAPER_INFERENCE_BASE_URL` and `CHEAPER_INFERENCE_MODEL`.
+
+[Opper](https://opper.ai) is an EU-hosted AI gateway with 700+ models from 50+
+providers behind one OpenAI-compatible API and one key (default model
+`claude-sonnet-4-6`). Enter a key from [platform.opper.ai](https://platform.opper.ai)
+in the provider settings, or set `OPPER_API_KEY`, and override the model with
+`OPPER_MODEL`. The endpoint can only be changed in the provider settings,
+because Opper's own tools use `OPPER_BASE_URL` for a different URL.
+
+[API Route](https://www.api-route.com) uses the OpenAI-compatible endpoint
+`https://global.api-route.com/v1` and defaults to `deepseek-v4.1-flash`.
+Choose **API Route** in the provider settings and enter your API key, or set
+`API_ROUTE_API_KEY`. Override the endpoint and model with `API_ROUTE_BASE_URL`
+and `API_ROUTE_MODEL`. To pin the active provider, set
+`LLM_DEFAULT_PROVIDER=api-route`. Cloud requests require explicit selection
+and a configured key, just like the other hosted providers.
+
+iFLYTEK Astron MaaS uses `IFLYTEK_API_KEY`, `IFLYTEK_BASE_URL` and
+`IFLYTEK_MODEL`. It has no default model: copy the model ID (for example Spark
+X2.5) from the service's model card in the [MaaS console](https://maas.xfyun.cn).
+The default Base URL is the pay-as-you-go inference API; a Token Plan key only
+works with `https://maas-token-api.cn-huabei-1.xf-yun.com/v2`, and a key from the
+older Spark HTTP API (`spark-api-open.xf-yun.com`) does not work with either.
+
+To run Spark X2.5 offline instead, use the open-weight 4B or 1.7B model with the
+existing **Ollama** provider (`ollama pull SparkLLM/Spark-X2.5-4B`, then set it
+as the model) or load it in **LM Studio**.
+
 ### Pinning the active provider with `LLM_DEFAULT_PROVIDER`
 
 By default the LLM used for Cinematic/Autofit is the one you mark "use for
@@ -183,7 +218,7 @@ shared machine — set the `LLM_DEFAULT_PROVIDER` environment variable to a
 provider id before launching the backend:
 
 ```
-LLM_DEFAULT_PROVIDER=groq        # or openai, openrouter, orcarouter, cerebras, ollama, custom, …
+LLM_DEFAULT_PROVIDER=groq        # or openai, openrouter, orcarouter, cheaperinference, opper, api-route, cerebras, iflytek, ollama, custom, …
 ```
 
 Resolution order for the active provider is: `LLM_DEFAULT_PROVIDER` (env) →
@@ -212,8 +247,8 @@ The non-LLM online engines need a key, set as an environment variable before
 launching the backend (or in **Settings → Credentials**):
 
 - **DeepL:** `DEEPL_API_KEY` (optionally `DEEPL_BASE_URL` for a self-hosted /
-  pro endpoint).
-- **Microsoft Translator:** `MICROSOFT_API_KEY` (optionally `MICROSOFT_BASE_URL`).
+  pro HTTPS endpoint).
+- **Microsoft Translator:** `MICROSOFT_API_KEY` (optionally `MICROSOFT_BASE_URL`, which must use HTTPS).
 
 ## Editing workspace
 
@@ -234,3 +269,42 @@ panels instead so neither editor becomes unusably small.
   from-source checkout.
 - **Installed it but still "needs install"** — restart the backend so Python
   picks up the newly-installed module.
+- **"Offline translation with 'argos' is unavailable: its CTranslate2 backend failed to start"** — Argos
+  runs on CTranslate2, and older CTranslate2 builds (4.4.0 and below) ask the
+  Linux kernel for an executable stack, which hardened kernels refuse.
+  VoiceStudio first tries to repair the library in place by clearing that flag.
+  If that is not possible (read-only install), either reinstall the backend on
+  Python 3.12+ (CTranslate2 4.8+ has no such request) or run
+  `patchelf --clear-execstack <library>` once. NLLB (local) stays available
+  meanwhile ([#692](https://github.com/debpalash/VoiceStudio/issues/692)).
+
+
+
+
+
+SRT and WebVTT imports accept hour fields longer than two digits, preserving cues from recordings over 99 hours.
+
+SRT and WebVTT exports round each cue timestamp once to the nearest millisecond, including carry into the next second or minute. The OpenAI-compatible transcription exports use the same formatter.
+
+
+Paste translation accepts WebVTT files with hourless timestamps. Only timing records at line starts activate timestamp matching; timestamp-like text inside a sentence remains dialogue.
+
+Subtitle import preserves numeric dialogue such as years and countdowns, including files mixing numbered and unnumbered cues. Cue numbers are removed only at identified cue boundaries.
+
+
+Argos accepts Chinese/Simplified Chinese names, Mandarin aliases, and language tags such as `zh-CN`. Traditional Chinese requests (`zh-TW`, `zh-Hant`, and the display name) are rejected explicitly; select NLLB for Traditional Chinese rather than silently receiving a different script.
+
+Mixed or malformed SRT files can make a bare number indistinguishable from spoken dialogue. The importer removes numbering only when cue boundaries and sequential numbering support it; ambiguous nonsequential numbers are retained as text to avoid silent data loss. Standard indexed SRT and WebVTT exports avoid this ambiguity.
+
+If the Argos native runtime cannot load, both desktop and browser clients show localized recovery guidance: reinstall the backend or select NLLB. The API returns the stable `argos_runtime_unavailable` error code without exposing native library paths.
+
+WebVTT import separates metadata blocks from cue identifiers using the [WebVTT block-parsing rules](https://www.w3.org/TR/webvtt1/#file-parsing): a timing line immediately after an identifier makes a cue, even when that identifier is NOTE, STYLE, or REGION. Later timing examples inside metadata are ignored, and empty cues never borrow the next cue’s identifier as dialogue.
+
+Dubbing transcription emits keepalives during quiet diarization, reference-refinement, and cleanup steps. Disconnecting stops queued model work; native calls already running retain their model until they finish, then cleanup restores TTS. Task streams also request that proxies disable buffering so keepalives reach the client promptly.
+
+WebVTT exports escape unsafe cue text while retaining imported subtitle markup and existing references. OpenAI-compatible VTT transcription responses escape all markup and references because newly recognized speech is plain text. SRT output is unchanged.
+Downloaded and pasted WebVTT captions decode character references once before editing or synthesis, so `Q&amp;A` becomes `Q&A`. SubRip has no escaping, so SubRip text keeps `&amp;` as written.
+Pasted, picked, and downloaded captions, and SubRip files imported into Stories, drop karaoke timestamps, cue tags (`<c>`, `<i>`, `<font>`, `<v Name>`), and SubRip alignment overrides (`{\an8}`) from the spoken text so the dub does not read markup. A `<br>` line break reads as a space. In SubRip, a `<` outside those tags stays dialogue (`2 < 3`, `<laughter>`). WebVTT and SubRip exports write the original cue syntax only while a line still holds the words that import wrote; a paste, edit or translation that lands on the same words exports them as plain text, and a WebVTT export of SubRip captions escapes that dialogue `<` so it reads the same after re-import.
+Downloaded rolling captions are deduplicated across their brief repeated bridge cues before translation. Ordinary consecutive cues keep intentional repeated words and phrases, even when their timestamps touch.
+
+New WebVTT imports retain source cue syntax alongside decoded text, preserving literal escaped tags and entities on unchanged exports. Edited text and older projects retain the legacy markup interpretation.

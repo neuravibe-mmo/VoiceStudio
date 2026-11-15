@@ -37,35 +37,6 @@ def test_required_models_is_tts_only():
     assert [rid for rid, _ in REQUIRED_MODELS] == ["k2-fsa/OmniVoice"]
 
 
-def test_platform_tags_follow_selected_worker_not_control_plane(monkeypatch):
-    from api.routers.setup import models as setup_models
-
-    monkeypatch.setattr(setup_models, "_target_host", lambda: {
-        "os": "linux", "arch": "x86_64", "gpus": [{"backend": "cuda"}],
-    })
-    assert setup_models._current_platform_tags() == ["linux", "linux-x86_64", "cuda"]
-
-
-def test_recommendations_use_selected_worker_install_state(monkeypatch):
-    from api.routers.setup import models as setup_models
-
-    monkeypatch.setattr(
-        setup_models,
-        "_target_repo_inventory",
-        lambda: ("gpu2", {"k2-fsa/OmniVoice"}),
-    )
-    monkeypatch.setattr(
-        setup_models,
-        "_current_platform_tags",
-        lambda: ["linux", "linux-x86_64", "cuda"],
-    )
-
-    payload = setup_models.recommendations()
-
-    required = next(row for row in payload["models"] if row["repo_id"] == "k2-fsa/OmniVoice")
-    assert required["installed"] is True
-
-
 def test_mac_arm_curates_mlx_whisper_not_ct2(client):
     ids = _ids(_recommend(client, ["darwin", "darwin-arm64"]))
     assert "k2-fsa/OmniVoice" in ids
@@ -128,3 +99,13 @@ def test_models_endpoint_exposes_curated_flag(client):
     # The required TTS model is always curated.
     tts = next(m for m in models if m["repo_id"] == "k2-fsa/OmniVoice")
     assert tts["curated"] is True
+
+
+def test_cpu_preset_lists_the_light_whisper_before_the_heavy_ones(client):
+    models = _recommend(client, ["linux", "linux-x86_64", "cpu"])["models"]
+    asr = [m["repo_id"] for m in models if m["role"] == "ASR"]
+    small = asr.index("Systran/faster-whisper-small")
+    for heavy in ("Systran/faster-whisper-large-v3", "deepdml/faster-whisper-large-v3-turbo-ct2"):
+        assert small < asr.index(heavy), asr
+    # The required TTS entry still leads the whole preset.
+    assert models[0]["repo_id"] == "k2-fsa/OmniVoice"

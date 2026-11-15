@@ -25,10 +25,10 @@ on your own machine: no accounts, no API keys, no cloud.
 |---|---|---|
 | Speaker encoder + reference utterance | Reference clip in the **Voice Clone** workflow ("From audio") | No separate embedding step — zero-shot engines condition on the clip directly |
 | Saved speaker embeddings (`.npy`) | **Voice Profiles** — save a clone once, reuse it everywhere | Exportable as portable `.ovsvoice` bundles |
-| Synthesizer + vocoder choice (Tacotron 2 · WaveRNN / Griffin-Lim) | **TTS engine choice** — Model Catalogue → Engines | 14 engines, from CPU-realtime to GPU heavyweights; per-engine GPU preflight |
+| Synthesizer + vocoder choice (Tacotron 2 · WaveRNN / Griffin-Lim) | **TTS engine choice** — Model Catalogue | 14 engines, from CPU-realtime to GPU heavyweights; per-engine GPU preflight |
 | The Toolbox GUI (`demo_toolbox.py`) | The app itself | Record or drop a clip, type text, synthesize — same loop, no `python demo_toolbox.py` |
-| `demo_cli.py` / scripting your own pipeline | Local REST API (OpenAI-compatible, `http://localhost:3900/v1`), `omnivoice-infer` CLI, MCP server | See the [API section of the README](../../README.md#openai-api) |
-| Training your own encoder / synthesizer / vocoder | Partial — see ["What RTVC did that VoiceStudio doesn't"](#what-rtvc-did-that-omnivoice-doesnt) | Fine-tuning the bundled model is documented; RTVC-style three-stage research training is not what this project is |
+| `demo_cli.py` / scripting your own pipeline | Local REST API (OpenAI-compatible, `http://localhost:3900/v1`), `omnivoice-infer` CLI, MCP server | See the [local API guide](../speech-platform.md) |
+| Training your own encoder / synthesizer / vocoder | Partial — see ["What RTVC did that VoiceStudio doesn't"](#what-rtvc-did-that-voicestudio-doesnt) | Fine-tuning the bundled model is documented; RTVC-style three-stage research training is not what this project is |
 
 ## What you gain
 
@@ -78,7 +78,7 @@ Honesty where it's due:
   any use including commercial, but if you modify it and serve the
   modified version over a network, you must share your changes. A
   commercial license is available for closed-source embedding — see
-  the [README's License section](../../README.md#license).
+  the [README's License section](../../README.md#license--responsible-use).
 
 One more honesty note: despite the name, RTVC's "real-time" was about
 vocoding speed. VoiceStudio generation speed depends on the engine and
@@ -113,8 +113,10 @@ plainly):
 
 * **Length:** cloning works from as little as ~3 seconds, but
   **5–15 seconds of continuous clean speech is the sweet spot**
-  (~8 s is ideal). Longer than that is wasted context, not better
-  quality.
+  (~8 s is ideal). Voice Clone accepts up to 75 seconds, but each
+  engine uses only part of a long clip — the default engine picks its
+  best 15-second passage, VoxCPM2 keeps the first 30 seconds; see
+  [reference clip length](../engines/README.md#reference-clip-length).
 * **Clean and dry beats long.** Zero-shot cloning mirrors the
   *acoustics* of the clip, not just the voice — an echoey or noisy
   clip clones echoey and noisy. A close-mic recording in a quiet room
@@ -157,7 +159,7 @@ Engines** — the choice applies everywhere synthesis happens.
 
 * **OpenAI-compatible REST API** — the backend serves
   `POST /v1/audio/speech` on `http://localhost:3900/v1`; the `voice`
-  field accepts your saved voice-profile IDs. Existing OpenAI-SDK
+  field accepts your saved voice-profile IDs or names. Existing OpenAI-SDK
   code points at it with a one-line `base_url` change.
 * **CLI** — from a source checkout, `omnivoice-infer` (and
   `omnivoice-infer-batch`) run the bundled engine directly.
