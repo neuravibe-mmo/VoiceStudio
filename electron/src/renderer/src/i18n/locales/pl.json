@@ -4381,6 +4381,18 @@
     "clear": "Wyczyść",
     "ready_to_export": "Wszystkie kwestie wygenerowane. Kliknij Złóż pełną ścieżkę, aby wyeksportować.",
     "export_srt": "Eksportuj .SRT",
-    "duration_label": "Czas trwania"
+    "duration_label": "Czas trwania",
+    "generate_missing": "Generuj tylko brakujące",
+    "all_cues_have_audio": "Wszystkie kwestie mają już dźwięk",
+    "select_cues": "Zaznacz kwestie",
+    "exit_select": "Gotowe",
+    "select_all": "Zaznacz wszystko",
+    "deselect_all": "Odznacz wszystko",
+    "assemble_selected": "Połącz zaznaczone ({{count}})",
+    "no_cues_selected": "Wybierz przynajmniej jedną kwestię",
+    "no_audio_in_selected": "Zaznaczone kwestie nie mają jeszcze dźwięku",
+    "some_selected_unvoiced": "Łączenie {{ready}}/{{total}} kwestii z dźwiękiem",
+    "batch_adjust": "Czas trwania zaznaczonych",
+    "generate_selected": "Generuj głos tylko dla zaznaczonych"
   }
 }

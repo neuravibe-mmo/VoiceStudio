@@ -4351,6 +4351,18 @@
     "clear": "Borrar",
     "ready_to_export": "Todos los subtítulos generados. Haz clic en Ensamblar pista completa para exportar.",
     "export_srt": "Exportar .SRT",
-    "duration_label": "Duración"
+    "duration_label": "Duración",
+    "generate_missing": "Generar solo no creados",
+    "all_cues_have_audio": "Todas las líneas ya tienen audio",
+    "select_cues": "Seleccionar subtítulos",
+    "exit_select": "Listo",
+    "select_all": "Seleccionar todo",
+    "deselect_all": "Deseleccionar todo",
+    "assemble_selected": "Ensamblar seleccionados ({{count}})",
+    "no_cues_selected": "Por favor seleccione al menos un subtítulo",
+    "no_audio_in_selected": "Los subtítulos seleccionados aún no tienen audio",
+    "some_selected_unvoiced": "Ensamblando {{ready}}/{{total}} subtítulos con audio",
+    "batch_adjust": "Duración seleccionada",
+    "generate_selected": "Generar voz solo para seleccionados"
   }
 }

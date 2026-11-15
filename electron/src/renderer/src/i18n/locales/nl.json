@@ -4349,6 +4349,18 @@
     "clear": "Wissen",
     "ready_to_export": "Alle regels gegenereerd. Klik op Volledig spoor samenvoegen om te exporteren.",
     "export_srt": ".SRT exporteren",
-    "duration_label": "Duur"
+    "duration_label": "Duur",
+    "generate_missing": "Alleen ontbrekende genereren",
+    "all_cues_have_audio": "Alle regels hebben al audio",
+    "select_cues": "Ondertitels selecteren",
+    "exit_select": "Klaar",
+    "select_all": "Alles selecteren",
+    "deselect_all": "Alles deselecteren",
+    "assemble_selected": "Geselecteerde samenvoegen ({{count}})",
+    "no_cues_selected": "Selecteer ten minste één ondertitel",
+    "no_audio_in_selected": "Geselecteerde ondertitels hebben nog geen audio",
+    "some_selected_unvoiced": "{{ready}}/{{total}} ondertitels met audio samenvoegen",
+    "batch_adjust": "Duur van selectie",
+    "generate_selected": "Stem alleen voor geselecteerde genereren"
   }
 }

@@ -4351,6 +4351,18 @@
     "clear": "Effacer",
     "ready_to_export": "Toutes les répliques sont générées. Cliquez sur Assembler pour exporter.",
     "export_srt": "Exporter .SRT",
-    "duration_label": "Durée"
+    "duration_label": "Durée",
+    "generate_missing": "Générer uniquement les manquants",
+    "all_cues_have_audio": "Toutes les répliques ont déjà de l audio",
+    "select_cues": "Sélectionner des sous-titres",
+    "exit_select": "Terminé",
+    "select_all": "Tout sélectionner",
+    "deselect_all": "Tout désélectionner",
+    "assemble_selected": "Assembler la sélection ({{count}})",
+    "no_cues_selected": "Veuillez sélectionner au moins un sous-titre",
+    "no_audio_in_selected": "Les sous-titres sélectionnés n'ont pas encore d'audio",
+    "some_selected_unvoiced": "Assemblage de {{ready}}/{{total}} sous-titres avec audio",
+    "batch_adjust": "Durée de la sélection",
+    "generate_selected": "Générer la voix pour la sélection uniquement"
   }
 }

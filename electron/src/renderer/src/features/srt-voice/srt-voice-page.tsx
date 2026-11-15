@@ -14,10 +14,14 @@ import {
   Loader2Icon,
   MinusIcon,
   PlusIcon,
+  ChevronDownIcon,
+  SparklesIcon,
+  CheckSquareIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { Button } from '@/components/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/popover';
 import { WaveformPlayer } from '@/components/waveform-player';
 import { AudioPreviewButton } from '@/components/audio-preview-button';
 // Shared application controls are JavaScript; keep their established voice/value contracts.
@@ -32,6 +36,9 @@ import { apiFetch, apiJson, apiPath, describeError } from '@/lib/api/client';
 import { saveLocalFile } from '@/lib/local-export';
 import { formatTimestamp } from '@shared/utils/timeFormat';
 import { cn } from '@/lib/utils';
+
+const SELECT_TRIGGER_CLASS =
+  'h-7 w-full rounded-md border border-input/80 bg-input/25 px-2.5 text-xs font-medium text-foreground shadow-2xs transition-colors hover:border-input hover:bg-input/45 focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/30 dark:bg-input/30 dark:hover:bg-input/50';
 
 export interface SrtCue {
   id: number;
@@ -112,11 +119,14 @@ export function SubtitlesPage() {
 
   const [isParsing, setIsParsing] = useState(false);
   const [isGeneratingAll, setIsGeneratingAll] = useState(false);
+  const [generateMenuOpen, setGenerateMenuOpen] = useState(false);
+  const [assembleMenuOpen, setAssembleMenuOpen] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number }>({ current: 0, total: 0 });
   const [isAssembling, setIsAssembling] = useState(false);
 
   const [assembledAudioUrl, setAssembledAudioUrl] = useState<string | null>(null);
   const [assembledDuration, setAssembledDuration] = useState<number | null>(null);
+  const [selectedCueIds, setSelectedCueIds] = useState<Set<number>>(() => new Set());
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -135,6 +145,7 @@ export function SubtitlesPage() {
 
         setFilename(res.filename);
         setCues(res.cues);
+        setSelectedCueIds(new Set());
         setTotalDuration(res.total_duration);
         setAssembledAudioUrl(null);
         setAssembledDuration(null);
@@ -207,6 +218,50 @@ export function SubtitlesPage() {
     });
   }, []);
 
+  const handleBatchDurationChange = useCallback(
+    (delta: number) => {
+      if (selectedCueIds.size === 0) return;
+
+      setCues((prev) => {
+        let cumulativeShift = 0;
+        const updated = prev.map((cue) => {
+          const newStart = Math.max(0, Math.round((cue.start + cumulativeShift) * 100) / 100);
+
+          if (selectedCueIds.has(cue.id)) {
+            const safeDuration = Math.max(0.2, Math.round((cue.duration + delta) * 100) / 100);
+            const actualDelta = Math.round((safeDuration - cue.duration) * 100) / 100;
+            cumulativeShift = Math.round((cumulativeShift + actualDelta) * 100) / 100;
+            const newEnd = Math.max(0.1, Math.round((newStart + safeDuration) * 100) / 100);
+
+            return {
+              ...cue,
+              start: newStart,
+              end: newEnd,
+              duration: safeDuration,
+            };
+          } else {
+            const newEnd = Math.max(0.1, Math.round((cue.end + cumulativeShift) * 100) / 100);
+            return {
+              ...cue,
+              start: newStart,
+              end: newEnd,
+            };
+          }
+        });
+
+        const lastCue = updated[updated.length - 1];
+        if (lastCue) {
+          setTotalDuration(lastCue.end);
+        }
+        return updated;
+      });
+
+      setAssembledAudioUrl(null);
+      setAssembledDuration(null);
+    },
+    [selectedCueIds],
+  );
+
   const generateSingleCue = useCallback(
     async (cue: SrtCue, signal?: AbortSignal) => {
       if (!cue.text.trim()) return;
@@ -256,37 +311,56 @@ export function SubtitlesPage() {
     [generateSingleCue],
   );
 
-  const handleGenerateAll = useCallback(async () => {
-    if (cues.length === 0) return;
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-    setIsGeneratingAll(true);
-    setProgress({ current: 0, total: cues.length });
-
-    try {
-      for (let i = 0; i < cues.length; i++) {
-        if (controller.signal.aborted) break;
-        const cue = cues[i];
-        setProgress({ current: i + 1, total: cues.length });
-        setCues((prev) => prev.map((c) => (c.id === cue.id ? { ...c, isGenerating: true } : c)));
-
-        try {
-          await generateSingleCue(cue, controller.signal);
-        } catch (err) {
-          if (controller.signal.aborted) break;
-          toast.error(`Cue #${cue.id}: ${describeError(err)}`);
-        } finally {
-          setCues((prev) => prev.map((c) => (c.id === cue.id ? { ...c, isGenerating: false } : c)));
+  const handleGenerateAll = useCallback(
+    async (mode: 'all' | 'missing' | 'selected' = 'all') => {
+      let targetCues = cues;
+      if (mode === 'missing') {
+        targetCues = cues.filter((c) => !c.audio_url);
+        if (targetCues.length === 0) {
+          toast.info(t('srtVoice.all_cues_have_audio'));
+          return;
+        }
+      } else if (mode === 'selected') {
+        targetCues = cues.filter((c) => selectedCueIds.has(c.id));
+        if (targetCues.length === 0) {
+          toast.error(t('srtVoice.no_cues_selected'));
+          return;
         }
       }
-      if (!controller.signal.aborted) {
-        toast.success(t('srtVoice.ready_to_export'));
+
+      if (targetCues.length === 0) return;
+
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      setIsGeneratingAll(true);
+      setProgress({ current: 0, total: targetCues.length });
+
+      try {
+        for (let i = 0; i < targetCues.length; i++) {
+          if (controller.signal.aborted) break;
+          const cue = targetCues[i];
+          setProgress({ current: i + 1, total: targetCues.length });
+          setCues((prev) => prev.map((c) => (c.id === cue.id ? { ...c, isGenerating: true } : c)));
+
+          try {
+            await generateSingleCue(cue, controller.signal);
+          } catch (err) {
+            if (controller.signal.aborted) break;
+            toast.error(`Cue #${cue.id}: ${describeError(err)}`);
+          } finally {
+            setCues((prev) => prev.map((c) => (c.id === cue.id ? { ...c, isGenerating: false } : c)));
+          }
+        }
+        if (!controller.signal.aborted) {
+          toast.success(t('srtVoice.ready_to_export'));
+        }
+      } finally {
+        setIsGeneratingAll(false);
+        abortControllerRef.current = null;
       }
-    } finally {
-      setIsGeneratingAll(false);
-      abortControllerRef.current = null;
-    }
-  }, [cues, generateSingleCue, t]);
+    },
+    [cues, generateSingleCue, selectedCueIds, t],
+  );
 
   const handleStop = useCallback(() => {
     if (abortControllerRef.current) {
@@ -296,12 +370,37 @@ export function SubtitlesPage() {
     }
   }, []);
 
+  const toggleCueSelection = useCallback((id: number) => {
+    setSelectedCueIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleToggleSelectAll = useCallback(() => {
+    setSelectedCueIds((prev) => {
+      if (prev.size === cues.length) {
+        return new Set();
+      }
+      return new Set(cues.map((c) => c.id));
+    });
+  }, [cues]);
+
   const handleAssemble = useCallback(async () => {
     const readyCues = cues.filter((c) => Boolean(c.audio_url));
     if (readyCues.length === 0) {
       toast.error(t('srtVoice.no_audio_yet'));
       return;
     }
+
+    // Always clear previous assembled audio immediately
+    setAssembledAudioUrl(null);
+    setAssembledDuration(null);
 
     setIsAssembling(true);
     try {
@@ -330,6 +429,63 @@ export function SubtitlesPage() {
       setIsAssembling(false);
     }
   }, [cues, timingMode, totalDuration, t]);
+
+  const handleAssembleSelected = useCallback(async () => {
+    if (selectedCueIds.size === 0) {
+      toast.error(t('srtVoice.no_cues_selected'));
+      return;
+    }
+
+    const selectedCues = cues.filter((c) => selectedCueIds.has(c.id));
+    const readySelectedCues = selectedCues.filter((c) => Boolean(c.audio_url));
+
+    if (readySelectedCues.length === 0) {
+      toast.error(t('srtVoice.no_audio_in_selected'));
+      return;
+    }
+
+    if (readySelectedCues.length < selectedCues.length) {
+      toast.info(
+        t('srtVoice.some_selected_unvoiced', {
+          ready: readySelectedCues.length,
+          total: selectedCues.length,
+        }),
+      );
+    }
+
+    // Always clear previous assembled audio immediately
+    setAssembledAudioUrl(null);
+    setAssembledDuration(null);
+
+    setIsAssembling(true);
+    try {
+      const minStart = Math.min(...readySelectedCues.map((c) => c.start));
+      const maxEnd = Math.max(...readySelectedCues.map((c) => c.end));
+      const payload = {
+        cues: readySelectedCues.map((c) => ({
+          id: c.id,
+          start: Math.max(0, Number((c.start - minStart).toFixed(2))),
+          end: Math.max(0, Number((c.end - minStart).toFixed(2))),
+          audio_url: c.audio_url!,
+        })),
+        timing_mode: timingMode,
+        total_duration: Math.max(0.1, Number((maxEnd - minStart).toFixed(2))),
+      };
+
+      const res = await apiJson<AssembleResponse>('/srt/assemble', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+
+      setAssembledAudioUrl(res.audio_url);
+      setAssembledDuration(res.duration);
+      toast.success(t('srtVoice.play_all'));
+    } catch (err) {
+      toast.error(describeError(err));
+    } finally {
+      setIsAssembling(false);
+    }
+  }, [cues, selectedCueIds, timingMode, t]);
 
   const handleDownload = useCallback(async () => {
     if (!assembledAudioUrl) return;
@@ -360,12 +516,19 @@ export function SubtitlesPage() {
     handleStop();
     setFilename('');
     setCues([]);
+    setSelectedCueIds(new Set());
     setTotalDuration(0);
     setAssembledAudioUrl(null);
     setAssembledDuration(null);
   };
 
-  const completedCount = cues.filter((c) => Boolean(c.audio_url)).length;
+  const completedCount = (cues ?? []).filter((c) => Boolean(c.audio_url)).length;
+  const selectedWithAudioCount = (cues ?? []).filter(
+    (c) => selectedCueIds.has(c.id) && Boolean(c.audio_url),
+  ).length;
+  const canDecreaseSelected = (cues ?? []).some(
+    (c) => selectedCueIds.has(c.id) && c.duration > 0.25,
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
@@ -453,6 +616,8 @@ export function SubtitlesPage() {
                 gallery={true}
                 engineDefault={true}
                 ariaLabel={t('srtVoice.voice_label')}
+                buttonClassName={SELECT_TRIGGER_CLASS}
+                menuPortal={true}
               />
             </div>
 
@@ -465,6 +630,8 @@ export function SubtitlesPage() {
                   { value: 'natural', label: t('srtVoice.natural') },
                 ]}
                 ariaLabel={t('srtVoice.timing_mode')}
+                buttonClassName={SELECT_TRIGGER_CLASS}
+                menuPortal={true}
               />
             </div>
 
@@ -475,28 +642,122 @@ export function SubtitlesPage() {
                   {t('srtVoice.generating', { current: progress.current, total: progress.total })}
                 </Button>
               ) : (
-                <Button
-                  variant="default"
-                  size="sm"
-                  onClick={handleGenerateAll}
-                  disabled={isAssembling}
-                  className="gap-1.5"
-                >
-                  <Wand2Icon className="size-3.5" />
-                  {t('srtVoice.generate_all')}
-                </Button>
+                <div className="inline-flex shrink-0 items-center overflow-hidden rounded-(--control-radius) border border-primary bg-primary text-primary-foreground shadow-xs inset-shadow-[0_1px_rgb(255_255_255/16%)]">
+                  <button
+                    type="button"
+                    onClick={() => handleGenerateAll('all')}
+                    disabled={isAssembling}
+                    className="inline-flex h-7 items-center gap-1.5 px-2.5 text-sm font-medium transition-colors hover:bg-black/10 focus-visible:bg-black/10 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    <Wand2Icon className="size-3.5" />
+                    <span>{t('srtVoice.generate_all')}</span>
+                  </button>
+                  <div className="h-4 w-px bg-primary-foreground/25" />
+                  <Popover open={generateMenuOpen} onOpenChange={setGenerateMenuOpen}>
+                    <PopoverTrigger
+                      aria-label="Generate options"
+                      disabled={isAssembling}
+                      className="inline-flex h-7 w-6.5 items-center justify-center transition-colors hover:bg-black/10 focus-visible:bg-black/10 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                    >
+                      <ChevronDownIcon className="size-3.5 opacity-90" />
+                    </PopoverTrigger>
+                    <PopoverContent align="end" className="flex min-w-56 flex-col p-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="justify-start text-xs"
+                        onClick={() => {
+                          setGenerateMenuOpen(false);
+                          void handleGenerateAll('all');
+                        }}
+                      >
+                        <Wand2Icon className="mr-2 size-3.5" />
+                        {t('srtVoice.generate_all')}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="justify-start text-xs"
+                        onClick={() => {
+                          setGenerateMenuOpen(false);
+                          void handleGenerateAll('missing');
+                        }}
+                      >
+                        <SparklesIcon className="mr-2 size-3.5 text-primary" />
+                        {t('srtVoice.generate_missing')}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={selectedCueIds.size === 0}
+                        className="justify-start text-xs"
+                        onClick={() => {
+                          setGenerateMenuOpen(false);
+                          void handleGenerateAll('selected');
+                        }}
+                      >
+                        <CheckSquareIcon className="mr-2 size-3.5 text-primary" />
+                        {t('srtVoice.generate_selected')}
+                        {selectedCueIds.size > 0 && (
+                          <span className="ms-auto text-[11px] text-muted-foreground">
+                            ({selectedCueIds.size})
+                          </span>
+                        )}
+                      </Button>
+                    </PopoverContent>
+                  </Popover>
+                </div>
               )}
 
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={handleAssemble}
-                disabled={completedCount === 0 || isGeneratingAll || isAssembling}
-                className="gap-1.5"
-              >
-                <LayersIcon className="size-3.5" />
-                {isAssembling ? t('srtVoice.assembling') : t('srtVoice.assemble_track')}
-              </Button>
+              <div className="inline-flex shrink-0 items-center overflow-hidden rounded-(--control-radius) border border-input/80 bg-secondary text-secondary-foreground shadow-xs">
+                <button
+                  type="button"
+                  onClick={handleAssemble}
+                  disabled={completedCount === 0 || isGeneratingAll || isAssembling}
+                  className="inline-flex h-7 items-center gap-1.5 px-2.5 text-sm font-medium transition-colors hover:bg-foreground/5 focus-visible:bg-foreground/5 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                >
+                  <LayersIcon className="size-3.5" />
+                  <span>{isAssembling ? t('srtVoice.assembling') : t('srtVoice.assemble_track')}</span>
+                </button>
+                <div className="h-4 w-px bg-secondary-foreground/20" />
+                <Popover open={assembleMenuOpen} onOpenChange={setAssembleMenuOpen}>
+                  <PopoverTrigger
+                    aria-label="Assemble options"
+                    disabled={isGeneratingAll || isAssembling}
+                    className="inline-flex h-7 w-6.5 items-center justify-center transition-colors hover:bg-foreground/5 focus-visible:bg-foreground/5 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    <ChevronDownIcon className="size-3.5 opacity-80" />
+                  </PopoverTrigger>
+                  <PopoverContent align="end" className="flex min-w-52 flex-col p-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="justify-start text-xs"
+                      disabled={completedCount === 0 || isGeneratingAll || isAssembling}
+                      onClick={() => {
+                        setAssembleMenuOpen(false);
+                        void handleAssemble();
+                      }}
+                    >
+                      <LayersIcon className="mr-2 size-3.5" />
+                      {t('srtVoice.assemble_track')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="justify-start text-xs"
+                      disabled={selectedWithAudioCount === 0 || isGeneratingAll || isAssembling}
+                      onClick={() => {
+                        setAssembleMenuOpen(false);
+                        void handleAssembleSelected();
+                      }}
+                    >
+                      <CheckSquareIcon className="mr-2 size-3.5 text-primary" />
+                      {t('srtVoice.assemble_selected', { count: selectedCueIds.size })}
+                    </Button>
+                  </PopoverContent>
+                </Popover>
+              </div>
             </div>
 
             <div className="ms-auto flex items-center gap-4 text-xs text-muted-foreground">
@@ -549,6 +810,56 @@ export function SubtitlesPage() {
 
           {/* Cues List */}
           <div className="studio-scrollbar flex-1 overflow-y-auto p-4">
+            <div className="mb-2.5 flex flex-wrap items-center gap-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleToggleSelectAll}
+                className="gap-1.5 text-xs"
+              >
+                <CheckSquareIcon className="size-3.5" />
+                {selectedCueIds.size === cues.length && cues.length > 0
+                  ? t('srtVoice.deselect_all')
+                  : t('srtVoice.select_all')}
+                {selectedCueIds.size > 0 && (
+                  <span className="text-muted-foreground">
+                    ({selectedCueIds.size}/{cues.length})
+                  </span>
+                )}
+              </Button>
+
+              {selectedCueIds.size > 0 && (
+                <div className="flex items-center gap-1.5 rounded-md border border-input/60 bg-input/20 px-2 py-0.5 text-xs">
+                  <span className="font-medium text-muted-foreground">
+                    {t('srtVoice.batch_adjust')}:
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="icon-xs"
+                    onClick={() => handleBatchDurationChange(-0.5)}
+                    disabled={!canDecreaseSelected || isGeneratingAll || isAssembling}
+                    title="-0.5s"
+                    aria-label="Decrease selected duration 0.5s"
+                    className="size-6 text-xs"
+                  >
+                    <MinusIcon className="size-3" />
+                  </Button>
+                  <span className="font-mono text-xs tabular-nums text-foreground">0.5s</span>
+                  <Button
+                    variant="outline"
+                    size="icon-xs"
+                    onClick={() => handleBatchDurationChange(0.5)}
+                    disabled={isGeneratingAll || isAssembling}
+                    title="+0.5s"
+                    aria-label="Increase selected duration 0.5s"
+                    className="size-6 text-xs"
+                  >
+                    <PlusIcon className="size-3" />
+                  </Button>
+                </div>
+              )}
+            </div>
+
             <div className="space-y-2">
               {cues.map((cue) => {
                 const startTime = formatTimestamp(cue.start, { decimals: 2 });
@@ -561,8 +872,17 @@ export function SubtitlesPage() {
                       'flex items-center gap-3 rounded-lg border border-border/60 bg-card p-3 transition-colors',
                       cue.isGenerating && 'border-primary/50 bg-primary/[0.02]',
                       cue.audio_url && 'border-emerald-500/30 dark:border-emerald-500/20',
+                      selectedCueIds.has(cue.id) && 'border-primary/60 bg-primary/[0.04]',
                     )}
                   >
+                    <input
+                      type="checkbox"
+                      checked={selectedCueIds.has(cue.id)}
+                      onChange={() => toggleCueSelection(cue.id)}
+                      className="size-4 shrink-0 cursor-pointer rounded accent-primary"
+                      aria-label={`Select cue ${cue.id}`}
+                    />
+
                     {/* Index & Timing */}
                     <div className="w-56 shrink-0 space-y-1.5">
                       <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
@@ -646,6 +966,7 @@ export function SubtitlesPage() {
                             ...availableProfiles.map((p) => ({ value: p.id, label: p.name })),
                           ]}
                           menuPortal
+                          buttonClassName={SELECT_TRIGGER_CLASS}
                           ariaLabel={t('srtVoice.voice_label')}
                         />
                       </div>

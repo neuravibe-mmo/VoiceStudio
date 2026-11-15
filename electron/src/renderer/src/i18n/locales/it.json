@@ -4351,6 +4351,18 @@
     "clear": "Cancella",
     "ready_to_export": "Tutte le battute sono state generate. Fai clic su Unisci traccia completa per esportare.",
     "export_srt": "Esporta .SRT",
-    "duration_label": "Durata"
+    "duration_label": "Durata",
+    "generate_missing": "Genera solo non creati",
+    "all_cues_have_audio": "Tutte le battute hanno già l audio",
+    "select_cues": "Seleziona sottotitoli",
+    "exit_select": "Fine",
+    "select_all": "Seleziona tutto",
+    "deselect_all": "Deseleziona tutto",
+    "assemble_selected": "Unisci selezionati ({{count}})",
+    "no_cues_selected": "Seleziona almeno un sottotitolo",
+    "no_audio_in_selected": "I sottotitoli selezionati non hanno ancora audio",
+    "some_selected_unvoiced": "Unione di {{ready}}/{{total}} sottotitoli con audio",
+    "batch_adjust": "Durata selezionata",
+    "generate_selected": "Genera voce solo per i selezionati"
   }
 }

@@ -4349,6 +4349,18 @@
     "clear": "Rensa",
     "ready_to_export": "Alla rader genererade. Klicka på Sätt ihop hela spåret för att exportera.",
     "export_srt": "Exportera .SRT",
-    "duration_label": "Varaktighet"
+    "duration_label": "Varaktighet",
+    "generate_missing": "Generera endast saknade",
+    "all_cues_have_audio": "Alla rader har redan ljud",
+    "select_cues": "Välj undertexter",
+    "exit_select": "Klar",
+    "select_all": "Välj alla",
+    "deselect_all": "Avmarkera alla",
+    "assemble_selected": "Sammanfoga markerade ({{count}})",
+    "no_cues_selected": "Välj minst en undertext",
+    "no_audio_in_selected": "Markerade undertexter har inget ljud än",
+    "some_selected_unvoiced": "Sammanfogar {{ready}}/{{total}} undertexter med ljud",
+    "batch_adjust": "Längd för markerade",
+    "generate_selected": "Generera röst endast för markerade"
   }
 }

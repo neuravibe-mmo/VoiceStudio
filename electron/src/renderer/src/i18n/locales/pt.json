@@ -4351,6 +4351,18 @@
     "clear": "Limpar",
     "ready_to_export": "Todas as legendas geradas. Clique em Montar faixa completa para exportar.",
     "export_srt": "Exportar .SRT",
-    "duration_label": "Duração"
+    "duration_label": "Duração",
+    "generate_missing": "Gerar apenas não criados",
+    "all_cues_have_audio": "Todas as falas já têm áudio",
+    "select_cues": "Selecionar legendas",
+    "exit_select": "Concluído",
+    "select_all": "Selecionar tudo",
+    "deselect_all": "Desmarcar tudo",
+    "assemble_selected": "Montar selecionados ({{count}})",
+    "no_cues_selected": "Por favor, selecione pelo menos uma legenda",
+    "no_audio_in_selected": "As legendas selecionadas ainda não têm áudio",
+    "some_selected_unvoiced": "Montando {{ready}}/{{total}} legendas com áudio",
+    "batch_adjust": "Duração selecionada",
+    "generate_selected": "Gerar voz apenas para selecionados"
   }
 }

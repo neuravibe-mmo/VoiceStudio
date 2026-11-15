@@ -4349,6 +4349,18 @@
     "clear": "クリア",
     "ready_to_export": "すべての字幕が生成されました。結合をクリックして書き出します。",
     "export_srt": ".SRT をエクスポート",
-    "duration_label": "長さ"
+    "duration_label": "長さ",
+    "generate_missing": "未生成のみ生成",
+    "all_cues_have_audio": "すべての字幕に音声があります",
+    "select_cues": "字幕を選択",
+    "exit_select": "完了",
+    "select_all": "すべて選択",
+    "deselect_all": "選択解除",
+    "assemble_selected": "選択した字幕を結合 ({{count}})",
+    "no_cues_selected": "結合する字幕を1つ以上選択してください",
+    "no_audio_in_selected": "選択した字幕にはまだ音声がありません",
+    "some_selected_unvoiced": "音声がある {{ready}}/{{total}} 件の字幕を結合中",
+    "batch_adjust": "選択した字幕の長さ",
+    "generate_selected": "選択した字幕のみ音声を生成"
   }
 }

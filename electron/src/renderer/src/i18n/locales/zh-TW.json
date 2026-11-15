@@ -4349,6 +4349,18 @@
     "clear": "清除",
     "ready_to_export": "所有字幕已生成。點擊合成完整音訊以按時間軸匯出。",
     "export_srt": "匯出 .SRT",
-    "duration_label": "時長"
+    "duration_label": "時長",
+    "generate_missing": "僅生成未生成的語音",
+    "all_cues_have_audio": "所有句子均已有音訊",
+    "select_cues": "選擇片段",
+    "exit_select": "完成",
+    "select_all": "全選",
+    "deselect_all": "取消全選",
+    "assemble_selected": "合成已選片段 ({{count}})",
+    "no_cues_selected": "請至少選擇一個片段",
+    "no_audio_in_selected": "所選片段尚未生成音訊",
+    "some_selected_unvoiced": "正在合成 {{ready}}/{{total}} 個已有音訊的片段",
+    "batch_adjust": "已選片段時長",
+    "generate_selected": "僅為所選片段生成語音"
   }
 }

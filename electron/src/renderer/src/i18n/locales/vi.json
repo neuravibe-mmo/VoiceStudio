@@ -4349,6 +4349,18 @@
     "clear": "Xóa trắng",
     "ready_to_export": "Đã hoàn thành tạo giọng cho các câu thoại. Bấm Ghép file hoàn chỉnh để kết xuất file âm thanh theo timeline.",
     "export_srt": "Xuất file .SRT",
-    "duration_label": "Thời lượng"
+    "duration_label": "Thời lượng",
+    "generate_missing": "Chỉ tạo voice cho câu chưa có",
+    "all_cues_have_audio": "Tất cả các câu đã có âm thanh",
+    "select_cues": "Chọn câu",
+    "exit_select": "Đóng chọn",
+    "select_all": "Chọn tất cả",
+    "deselect_all": "Bỏ chọn",
+    "assemble_selected": "Ghép câu đã chọn ({{count}})",
+    "no_cues_selected": "Vui lòng chọn ít nhất một câu để ghép",
+    "no_audio_in_selected": "Các câu đã chọn chưa có âm thanh",
+    "some_selected_unvoiced": "Ghép {{ready}}/{{total}} câu đã chọn có âm thanh",
+    "batch_adjust": "Thời lượng câu đã chọn",
+    "generate_selected": "Chỉ tạo voice cho câu đã chọn"
   }
 }

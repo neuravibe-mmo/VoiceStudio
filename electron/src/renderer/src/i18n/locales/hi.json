@@ -4349,6 +4349,18 @@
     "clear": "साफ़ करें",
     "ready_to_export": "सभी संवाद उत्पन्न हो गए हैं। निर्यात करने के लिए पूरा ट्रैक जोड़ें पर क्लिक करें।",
     "export_srt": ".SRT निर्यात करें",
-    "duration_label": "अवधि"
+    "duration_label": "अवधि",
+    "generate_missing": "केवल शेष आवाज बनाएं",
+    "all_cues_have_audio": "सभी पंक्तियों में पहले से ऑडियो है",
+    "select_cues": "संवाद चुनें",
+    "exit_select": "पूर्ण",
+    "select_all": "सभी चुनें",
+    "deselect_all": "सभी अचयनित करें",
+    "assemble_selected": "चयनित जोड़ें ({{count}})",
+    "no_cues_selected": "कृपया कम से कम एक संवाद चुनें",
+    "no_audio_in_selected": "चयनित संवाद में अभी कोई ऑडियो नहीं है",
+    "some_selected_unvoiced": "ऑडियो वाले {{ready}}/{{total}} संवाद जोड़े जा रहे हैं",
+    "batch_adjust": "चयनित संवाद अवधि",
+    "generate_selected": "केवल चयनित संवाद के लिए आवाज बनाएं"
   }
 }

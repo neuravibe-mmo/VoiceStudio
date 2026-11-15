@@ -4409,6 +4409,18 @@
     "clear": "مسح",
     "ready_to_export": "تم إنشاء جميع الأسطر. انقر على تجميع المسار كاملاً للتصدير.",
     "export_srt": "تصدير .SRT",
-    "duration_label": "المدة"
+    "duration_label": "المدة",
+    "generate_missing": "إنشاء غير المكتمل فقط",
+    "all_cues_have_audio": "جميع الأسطر تحتوي على صوت بالفعل",
+    "select_cues": "تحديد المقاطع",
+    "exit_select": "تم",
+    "select_all": "تحديد الكل",
+    "deselect_all": "إلغاء تحديد الكل",
+    "assemble_selected": "تجميع المحدد ({{count}})",
+    "no_cues_selected": "يرجى تحديد مقطع واحد على الأقل",
+    "no_audio_in_selected": "المقاطع المحددة ليس بها صوت بعد",
+    "some_selected_unvoiced": "جارٍ تجميع {{ready}}/{{total}} مقطع صوتي",
+    "batch_adjust": "مدة المقاطع المحددة",
+    "generate_selected": "إنشاء صوت للمحدد فقط"
   }
 }

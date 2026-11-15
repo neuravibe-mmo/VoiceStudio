@@ -7,7 +7,7 @@ const mock = vi.hoisted(() => ({
   generate: vi.fn(),
   apiJson: vi.fn(),
   apiFetch: vi.fn(),
-  toast: { success: vi.fn(), error: vi.fn() },
+  toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }));
 
 vi.mock('sonner', () => ({ toast: mock.toast }));
@@ -213,6 +213,266 @@ it('adjusts cue duration and shifts subsequent cues ripple-wise', async () => {
     expect(screen.getByText('0:03.50 → 0:05.50')).toBeInTheDocument();
   });
 });
+
+it('generates only missing cues when selecting generate_missing option', async () => {
+  mock.apiJson.mockResolvedValueOnce({
+    filename: 'test.srt',
+    total_cues: 2,
+    total_duration: 6.0,
+    cues: [
+      { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'First line' },
+      { id: 2, start: 3.0, end: 5.0, duration: 2.0, text: 'Second line' },
+    ],
+  });
+
+  mock.generate.mockResolvedValueOnce({ audioPath: 'c1.wav', blob: new Blob(['a']) });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'test.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('First line')).toBeInTheDocument();
+  });
+
+  // Generate only first cue individually using single cue generate button
+  const generateButtons = screen.getAllByRole('button', { name: 'srtVoice.generate_cue' });
+  fireEvent.click(generateButtons[0]);
+
+  await waitFor(() => {
+    expect(mock.generate).toHaveBeenCalledTimes(1);
+  });
+
+  // Open dropdown and click "Chỉ tạo câu chưa có"
+  const dropdownTrigger = screen.getByRole('button', { name: 'Generate options' });
+  fireEvent.click(dropdownTrigger);
+
+  const missingBtn = await screen.findByRole('button', { name: 'srtVoice.generate_missing' });
+  fireEvent.click(missingBtn);
+
+  await waitFor(() => {
+    // Only the second cue should be generated, total generate calls = 2
+    expect(mock.generate).toHaveBeenCalledTimes(2);
+    expect(mock.generate.mock.calls[1][0].text).toBe('Second line');
+  });
+});
+
+it('generates voice for selected cues only when selecting generate_selected option', async () => {
+  mock.apiJson.mockResolvedValueOnce({
+    filename: 'test.srt',
+    total_cues: 3,
+    total_duration: 6.0,
+    cues: [
+      { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'First line' },
+      { id: 2, start: 2.0, end: 4.0, duration: 2.0, text: 'Second line' },
+      { id: 3, start: 4.0, end: 6.0, duration: 2.0, text: 'Third line' },
+    ],
+  });
+
+  mock.generate.mockResolvedValueOnce({ audioPath: 'c2.wav', blob: new Blob(['a']) });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'test.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('First line')).toBeInTheDocument();
+  });
+
+  // Check cue 2 only
+  const checkboxes = screen.getAllByRole('checkbox');
+  fireEvent.click(checkboxes[1]);
+
+  // Open dropdown and click "Chỉ tạo voice cho câu đã chọn"
+  const dropdownTrigger = screen.getByRole('button', { name: 'Generate options' });
+  fireEvent.click(dropdownTrigger);
+
+  const selectedBtn = await screen.findByRole('button', { name: /srtVoice\.generate_selected/ });
+  fireEvent.click(selectedBtn);
+
+  await waitFor(() => {
+    expect(mock.generate).toHaveBeenCalledTimes(1);
+    expect(mock.generate.mock.calls[0][0].text).toBe('Second line');
+  });
+});
+
+
+it('supports cue selection mode and assembling only selected cues', async () => {
+  mock.apiJson
+    .mockResolvedValueOnce({
+      filename: 'multi.srt',
+      total_cues: 3,
+      total_duration: 10.0,
+      cues: [
+        { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'Cue 1' },
+        { id: 2, start: 3.0, end: 5.0, duration: 2.0, text: 'Cue 2' },
+        { id: 3, start: 6.0, end: 8.0, duration: 2.0, text: 'Cue 3' },
+      ],
+    })
+    .mockResolvedValueOnce({
+      audio_url: '/audio/partial.wav',
+      duration: 5.0,
+      filename: 'partial.wav',
+    });
+
+  mock.generate
+    .mockResolvedValueOnce({ audioPath: 'c1.wav', blob: new Blob(['a']) })
+    .mockResolvedValueOnce({ audioPath: 'c2.wav', blob: new Blob(['b']) })
+    .mockResolvedValueOnce({ audioPath: 'c3.wav', blob: new Blob(['c']) });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'multi.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('Cue 1')).toBeInTheDocument();
+  });
+
+  // Generate all cues
+  fireEvent.click(screen.getByRole('button', { name: 'srtVoice.generate_all' }));
+  await waitFor(() => {
+    expect(mock.generate).toHaveBeenCalledTimes(3);
+  });
+
+  // Checkboxes are always visible
+  const checkboxes = screen.getAllByRole('checkbox');
+  expect(checkboxes.length).toBe(3);
+
+  // Select cue 2 and cue 3
+  fireEvent.click(checkboxes[1]);
+  fireEvent.click(checkboxes[2]);
+
+  // Open Assemble options dropdown and click "Ghép câu đã chọn"
+  const assembleDropdownTrigger = screen.getByRole('button', { name: 'Assemble options' });
+  fireEvent.click(assembleDropdownTrigger);
+
+  const assembleSelectedBtn = await screen.findByRole('button', {
+    name: /srtVoice\.assemble_selected/,
+  });
+  fireEvent.click(assembleSelectedBtn);
+
+  await waitFor(() => {
+    expect(mock.apiJson).toHaveBeenCalledWith(
+      '/srt/assemble',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('"id":2'),
+      }),
+    );
+  });
+
+  // Verify only cues 2 and 3 were sent to assemble
+  const assembleCall = mock.apiJson.mock.calls.find((call) => call[0] === '/srt/assemble');
+  expect(assembleCall).toBeDefined();
+  const payload = JSON.parse(assembleCall![1].body);
+  expect(payload.cues).toHaveLength(2);
+  expect(payload.cues[0].id).toBe(2);
+  expect(payload.cues[1].id).toBe(3);
+  // And start should be normalized relative to minStart (cue 2 start=3.0 -> 0.0)
+  expect(payload.cues[0].start).toBe(0);
+});
+
+it('disables assemble_selected button when no selected cues have audio', async () => {
+  mock.apiJson.mockResolvedValueOnce({
+    filename: 'test.srt',
+    total_cues: 2,
+    total_duration: 5.0,
+    cues: [
+      { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'Line 1' },
+      { id: 2, start: 2.5, end: 5.0, duration: 2.5, text: 'Line 2' },
+    ],
+  });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'test.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('Line 1')).toBeInTheDocument();
+  });
+
+  const checkboxes = screen.getAllByRole('checkbox');
+  // Check cue 1
+  fireEvent.click(checkboxes[0]);
+
+  // Open Assemble options dropdown
+  const assembleDropdownTrigger = screen.getByRole('button', { name: 'Assemble options' });
+  fireEvent.click(assembleDropdownTrigger);
+
+  const assembleSelectedBtn = await screen.findByRole('button', {
+    name: /srtVoice\.assemble_selected/,
+  });
+  expect(assembleSelectedBtn).toBeDisabled();
+});
+
+it('adjusts duration for all selected cues and updates both timeStart and timeFinish for subsequent cues', async () => {
+  mock.apiJson.mockResolvedValueOnce({
+    filename: 'test.srt',
+    total_cues: 3,
+    total_duration: 6.0,
+    cues: [
+      { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'Line 1' },
+      { id: 2, start: 2.0, end: 4.0, duration: 2.0, text: 'Line 2' },
+      { id: 3, start: 4.0, end: 6.0, duration: 2.0, text: 'Line 3' },
+    ],
+  });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'test.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('Line 1')).toBeInTheDocument();
+  });
+
+  const checkboxes = screen.getAllByRole('checkbox');
+  // Select cue 2 and cue 3
+  fireEvent.click(checkboxes[1]);
+  fireEvent.click(checkboxes[2]);
+
+  // Click batch increase +0.5s
+  const batchPlusBtn = screen.getByRole('button', {
+    name: 'Increase selected duration 0.5s',
+  });
+  fireEvent.click(batchPlusBtn);
+
+  // Cue 1: remains 0:00.00 → 0:02.00
+  // Cue 2: start 2.00, duration 2.5s -> end becomes 4.50 (timeFinish changed)
+  // Cue 3: start shifts to 4.50 (timeStart changed!), duration 2.5s -> end becomes 7.00 (timeFinish changed!)
+  await waitFor(() => {
+    expect(screen.getByText('0:02.00 → 0:04.50')).toBeInTheDocument();
+    expect(screen.getByText('0:04.50 → 0:07.00')).toBeInTheDocument();
+  });
+});
+
+
+
+
 
 
 

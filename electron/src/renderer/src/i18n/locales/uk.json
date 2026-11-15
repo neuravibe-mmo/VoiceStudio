@@ -4381,6 +4381,18 @@
     "clear": "Очистити",
     "ready_to_export": "Усі репліки згенеровано. Натисніть Зібрати повний трек для експорту.",
     "export_srt": "Експорт .SRT",
-    "duration_label": "Тривалість"
+    "duration_label": "Тривалість",
+    "generate_missing": "Створити лише відсутні",
+    "all_cues_have_audio": "Усі репліки вже мають аудіо",
+    "select_cues": "Вибрати репліки",
+    "exit_select": "Готово",
+    "select_all": "Вибрати всі",
+    "deselect_all": "Зняти вибір",
+    "assemble_selected": "Об'єднати вибрані ({{count}})",
+    "no_cues_selected": "Виберіть хоча б одну репліку",
+    "no_audio_in_selected": "Вибрані репліки ще не мають аудіо",
+    "some_selected_unvoiced": "Об'єднання {{ready}}/{{total}} реплік з аудіо",
+    "batch_adjust": "Тривалість вибраних",
+    "generate_selected": "Створити голос лише для вибраних"
   }
 }

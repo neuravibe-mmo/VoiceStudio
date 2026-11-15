@@ -4349,6 +4349,18 @@
     "clear": "Clear",
     "ready_to_export": "All cues generated. Click Assemble full track to combine audio along the timeline.",
     "export_srt": "Export .SRT",
-    "duration_label": "Duration"
+    "duration_label": "Duration",
+    "generate_missing": "Generate unvoiced only",
+    "all_cues_have_audio": "All cues already have audio",
+    "select_cues": "Select cues",
+    "exit_select": "Done",
+    "select_all": "Select all",
+    "deselect_all": "Deselect all",
+    "assemble_selected": "Assemble selected ({{count}})",
+    "no_cues_selected": "Please select at least one cue",
+    "no_audio_in_selected": "Selected cues have no audio yet",
+    "some_selected_unvoiced": "Assembling {{ready}}/{{total}} cues with audio",
+    "batch_adjust": "Selected duration",
+    "generate_selected": "Generate voice for selected only"
   }
 }

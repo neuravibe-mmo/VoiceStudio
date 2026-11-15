@@ -4349,6 +4349,18 @@
     "clear": "Hapus",
     "ready_to_export": "Semua teks selesai dihasilkan. Klik Gabungkan seluruh trek untuk mengekspor.",
     "export_srt": "Ekspor .SRT",
-    "duration_label": "Durasi"
+    "duration_label": "Durasi",
+    "generate_missing": "Hanya buat yang belum ada",
+    "all_cues_have_audio": "Semua baris sudah memiliki audio",
+    "select_cues": "Pilih segmen",
+    "exit_select": "Selesai",
+    "select_all": "Pilih semua",
+    "deselect_all": "Batalkan semua",
+    "assemble_selected": "Gabungkan yang dipilih ({{count}})",
+    "no_cues_selected": "Silakan pilih setidaknya satu segmen",
+    "no_audio_in_selected": "Segmen yang dipilih belum memiliki audio",
+    "some_selected_unvoiced": "Menggabungkan {{ready}}/{{total}} segmen bersuara",
+    "batch_adjust": "Durasi yang dipilih",
+    "generate_selected": "Hanya buat suara untuk yang dipilih"
   }
 }

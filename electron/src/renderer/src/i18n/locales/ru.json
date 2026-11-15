@@ -4381,6 +4381,18 @@
     "clear": "Очистить",
     "ready_to_export": "Все реплики созданы. Нажмите Собрать полную дорожку для экспорта.",
     "export_srt": "Экспорт .SRT",
-    "duration_label": "Длительность"
+    "duration_label": "Длительность",
+    "generate_missing": "Создать только отсутствующие",
+    "all_cues_have_audio": "Все реплики уже озвучены",
+    "select_cues": "Выбрать реплики",
+    "exit_select": "Готово",
+    "select_all": "Выбрать все",
+    "deselect_all": "Снять выбор",
+    "assemble_selected": "Объединить выбранные ({{count}})",
+    "no_cues_selected": "Выберите хотя бы одну реплику",
+    "no_audio_in_selected": "У выбранных реплик еще нет аудио",
+    "some_selected_unvoiced": "Объединение {{ready}}/{{total}} реплик с аудио",
+    "batch_adjust": "Длительность выбранных",
+    "generate_selected": "Создать голос только для выбранных"
   }
 }

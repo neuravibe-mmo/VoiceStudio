@@ -4349,6 +4349,18 @@
     "clear": "ล้าง",
     "ready_to_export": "สร้างเสียงครบทุกบรรทัดแล้ว คลิก รวมแทร็กเต็ม เพื่อส่งออก",
     "export_srt": "ส่งออก .SRT",
-    "duration_label": "ระยะเวลา"
+    "duration_label": "ระยะเวลา",
+    "generate_missing": "สร้างเฉพาะที่ยังไม่มีเสียง",
+    "all_cues_have_audio": "ทุกประโยคมีเสียงแล้ว",
+    "select_cues": "เลือกท่อนคำบรรยาย",
+    "exit_select": "เสร็จสิ้น",
+    "select_all": "เลือกทั้งหมด",
+    "deselect_all": "ยกเลิกการเลือกทั้งหมด",
+    "assemble_selected": "รวมท่อนที่เลือก ({{count}})",
+    "no_cues_selected": "โปรดเลือกอย่างน้อยหนึ่งท่อน",
+    "no_audio_in_selected": "ท่อนที่เลือกยังไม่มีเสียง",
+    "some_selected_unvoiced": "กำลังรวม {{ready}}/{{total}} ท่อนที่มีเสียง",
+    "batch_adjust": "ระยะเวลาท่อนที่เลือก",
+    "generate_selected": "สร้างเสียงเฉพาะท่อนที่เลือกเท่านั้น"
   }
 }

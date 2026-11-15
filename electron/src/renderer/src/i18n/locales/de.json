@@ -4349,6 +4349,18 @@
     "clear": "Löschen",
     "ready_to_export": "Alle Untertitel generiert. Klicken Sie auf Zusammenfügen zum Exportieren.",
     "export_srt": ".SRT exportieren",
-    "duration_label": "Dauer"
+    "duration_label": "Dauer",
+    "generate_missing": "Nur fehlende generieren",
+    "all_cues_have_audio": "Alle Zeilen haben bereits Audio",
+    "select_cues": "Untertitel auswählen",
+    "exit_select": "Fertig",
+    "select_all": "Alle auswählen",
+    "deselect_all": "Auswahl aufheben",
+    "assemble_selected": "Ausgewählte zusammenfügen ({{count}})",
+    "no_cues_selected": "Bitte wählen Sie mindestens einen Untertitel aus",
+    "no_audio_in_selected": "Ausgewählte Untertitel haben noch kein Audio",
+    "some_selected_unvoiced": "Füge {{ready}}/{{total}} Untertitel mit Audio zusammen",
+    "batch_adjust": "Dauer der Auswahl",
+    "generate_selected": "Stimme nur für ausgewählte generieren"
   }
 }

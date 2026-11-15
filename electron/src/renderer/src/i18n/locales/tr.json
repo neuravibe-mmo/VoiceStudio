@@ -4349,6 +4349,18 @@
     "clear": "Temizle",
     "ready_to_export": "Tüm altyazılar oluşturuldu. Dışa aktarmak için Tüm parçayı birleştir düğmesine tıklayın.",
     "export_srt": ".SRT Dışa Aktar",
-    "duration_label": "Süre"
+    "duration_label": "Süre",
+    "generate_missing": "Yalnızca eksikleri oluştur",
+    "all_cues_have_audio": "Tüm satırların zaten sesi var",
+    "select_cues": "Altyazıları seç",
+    "exit_select": "Tamam",
+    "select_all": "Tümünü seç",
+    "deselect_all": "Tümünün seçimini kaldır",
+    "assemble_selected": "Seçilenleri birleştir ({{count}})",
+    "no_cues_selected": "Lütfen en az bir altyazı seçin",
+    "no_audio_in_selected": "Seçilen altyazılarda henüz ses yok",
+    "some_selected_unvoiced": "Sesli {{ready}}/{{total}} altyazı birleştiriliyor",
+    "batch_adjust": "Seçilenlerin süresi",
+    "generate_selected": "Yalnızca seçilenler için ses oluştur"
   }
 }
