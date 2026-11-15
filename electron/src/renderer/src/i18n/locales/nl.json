@@ -4347,6 +4347,8 @@
     "speed_label": "Snelheid",
     "select_voice": "Stem kiezen...",
     "clear": "Wissen",
-    "ready_to_export": "Alle regels gegenereerd. Klik op Volledig spoor samenvoegen om te exporteren."
+    "ready_to_export": "Alle regels gegenereerd. Klik op Volledig spoor samenvoegen om te exporteren.",
+    "export_srt": ".SRT exporteren",
+    "duration_label": "Duur"
   }
 }

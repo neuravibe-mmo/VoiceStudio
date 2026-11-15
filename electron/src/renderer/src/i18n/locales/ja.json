@@ -4347,6 +4347,8 @@
     "speed_label": "速度",
     "select_voice": "音声を選択...",
     "clear": "クリア",
-    "ready_to_export": "すべての字幕が生成されました。結合をクリックして書き出します。"
+    "ready_to_export": "すべての字幕が生成されました。結合をクリックして書き出します。",
+    "export_srt": ".SRT をエクスポート",
+    "duration_label": "長さ"
   }
 }

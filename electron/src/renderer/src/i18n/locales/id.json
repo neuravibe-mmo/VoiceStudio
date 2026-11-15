@@ -4347,6 +4347,8 @@
     "speed_label": "Kecepatan",
     "select_voice": "Pilih suara...",
     "clear": "Hapus",
-    "ready_to_export": "Semua teks selesai dihasilkan. Klik Gabungkan seluruh trek untuk mengekspor."
+    "ready_to_export": "Semua teks selesai dihasilkan. Klik Gabungkan seluruh trek untuk mengekspor.",
+    "export_srt": "Ekspor .SRT",
+    "duration_label": "Durasi"
   }
 }

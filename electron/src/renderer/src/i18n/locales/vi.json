@@ -4347,6 +4347,8 @@
     "speed_label": "Tốc độ",
     "select_voice": "Chọn giọng đọc...",
     "clear": "Xóa trắng",
-    "ready_to_export": "Đã hoàn thành tạo giọng cho các câu thoại. Bấm Ghép file hoàn chỉnh để kết xuất file âm thanh theo timeline."
+    "ready_to_export": "Đã hoàn thành tạo giọng cho các câu thoại. Bấm Ghép file hoàn chỉnh để kết xuất file âm thanh theo timeline.",
+    "export_srt": "Xuất file .SRT",
+    "duration_label": "Thời lượng"
   }
 }

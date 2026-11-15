@@ -4379,6 +4379,8 @@
     "speed_label": "Prędkość",
     "select_voice": "Wybierz głos...",
     "clear": "Wyczyść",
-    "ready_to_export": "Wszystkie kwestie wygenerowane. Kliknij Złóż pełną ścieżkę, aby wyeksportować."
+    "ready_to_export": "Wszystkie kwestie wygenerowane. Kliknij Złóż pełną ścieżkę, aby wyeksportować.",
+    "export_srt": "Eksportuj .SRT",
+    "duration_label": "Czas trwania"
   }
 }

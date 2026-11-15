@@ -4349,6 +4349,8 @@
     "speed_label": "Velocidade",
     "select_voice": "Selecionar voz...",
     "clear": "Limpar",
-    "ready_to_export": "Todas as legendas geradas. Clique em Montar faixa completa para exportar."
+    "ready_to_export": "Todas as legendas geradas. Clique em Montar faixa completa para exportar.",
+    "export_srt": "Exportar .SRT",
+    "duration_label": "Duração"
   }
 }

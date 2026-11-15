@@ -4347,6 +4347,8 @@
     "speed_label": "속도",
     "select_voice": "음성 선택...",
     "clear": "지우기",
-    "ready_to_export": "모든 자막이 생성되었습니다. 결합을 클릭하여 내보내세요."
+    "ready_to_export": "모든 자막이 생성되었습니다. 결합을 클릭하여 내보내세요.",
+    "export_srt": ".SRT 내보내기",
+    "duration_label": "길이"
   }
 }

@@ -4347,6 +4347,8 @@
     "speed_label": "Speed",
     "select_voice": "Select voice...",
     "clear": "Clear",
-    "ready_to_export": "All cues generated. Click Assemble full track to combine audio along the timeline."
+    "ready_to_export": "All cues generated. Click Assemble full track to combine audio along the timeline.",
+    "export_srt": "Export .SRT",
+    "duration_label": "Duration"
   }
 }

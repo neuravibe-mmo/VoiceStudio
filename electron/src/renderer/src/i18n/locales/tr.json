@@ -4347,6 +4347,8 @@
     "speed_label": "Hız",
     "select_voice": "Ses seçin...",
     "clear": "Temizle",
-    "ready_to_export": "Tüm altyazılar oluşturuldu. Dışa aktarmak için Tüm parçayı birleştir düğmesine tıklayın."
+    "ready_to_export": "Tüm altyazılar oluşturuldu. Dışa aktarmak için Tüm parçayı birleştir düğmesine tıklayın.",
+    "export_srt": ".SRT Dışa Aktar",
+    "duration_label": "Süre"
   }
 }

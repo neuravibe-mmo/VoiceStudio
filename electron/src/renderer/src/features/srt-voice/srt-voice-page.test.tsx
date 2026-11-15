@@ -180,4 +180,39 @@ it('uses consistent voice profile and seed across multiple cues', async () => {
   expect(call1.seed).toBe(call2.seed);
 });
 
+it('adjusts cue duration and shifts subsequent cues ripple-wise', async () => {
+  mock.apiJson.mockResolvedValueOnce({
+    filename: 'test.srt',
+    total_cues: 2,
+    total_duration: 6.0,
+    cues: [
+      { id: 1, start: 0.0, end: 2.0, duration: 2.0, text: 'First line' },
+      { id: 2, start: 3.0, end: 5.0, duration: 2.0, text: 'Second line' },
+    ],
+  });
+
+  const { container } = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <SubtitlesPage />
+    </QueryClientProvider>,
+  );
+
+  const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+  fireEvent.change(fileInput, { target: { files: [new File(['srt'], 'test.srt')] } });
+
+  await waitFor(() => {
+    expect(screen.getByDisplayValue('First line')).toBeInTheDocument();
+  });
+
+  const plusButtons = screen.getAllByRole('button', { name: 'Increase duration 0.5s' });
+  fireEvent.click(plusButtons[0]);
+
+  // Cue 1 duration becomes 2.5s -> end becomes 2.5s (delta = +0.5s)
+  // Cue 2 start should become 3.5s and end should become 5.5s
+  await waitFor(() => {
+    expect(screen.getByText('0:03.50 → 0:05.50')).toBeInTheDocument();
+  });
+});
+
+
 

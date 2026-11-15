@@ -4347,6 +4347,8 @@
     "speed_label": "Geschwindigkeit",
     "select_voice": "Stimme wählen...",
     "clear": "Löschen",
-    "ready_to_export": "Alle Untertitel generiert. Klicken Sie auf Zusammenfügen zum Exportieren."
+    "ready_to_export": "Alle Untertitel generiert. Klicken Sie auf Zusammenfügen zum Exportieren.",
+    "export_srt": ".SRT exportieren",
+    "duration_label": "Dauer"
   }
 }

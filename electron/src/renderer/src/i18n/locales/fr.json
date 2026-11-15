@@ -4349,6 +4349,8 @@
     "speed_label": "Vitesse",
     "select_voice": "Sélectionner une voix...",
     "clear": "Effacer",
-    "ready_to_export": "Toutes les répliques sont générées. Cliquez sur Assembler pour exporter."
+    "ready_to_export": "Toutes les répliques sont générées. Cliquez sur Assembler pour exporter.",
+    "export_srt": "Exporter .SRT",
+    "duration_label": "Durée"
   }
 }

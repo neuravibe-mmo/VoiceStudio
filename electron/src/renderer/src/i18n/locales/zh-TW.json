@@ -4347,6 +4347,8 @@
     "speed_label": "語速",
     "select_voice": "選擇聲音...",
     "clear": "清除",
-    "ready_to_export": "所有字幕已生成。點擊合成完整音訊以按時間軸匯出。"
+    "ready_to_export": "所有字幕已生成。點擊合成完整音訊以按時間軸匯出。",
+    "export_srt": "匯出 .SRT",
+    "duration_label": "時長"
   }
 }

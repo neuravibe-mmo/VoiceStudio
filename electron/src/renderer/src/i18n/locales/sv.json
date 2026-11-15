@@ -4347,6 +4347,8 @@
     "speed_label": "Hastighet",
     "select_voice": "Välj röst...",
     "clear": "Rensa",
-    "ready_to_export": "Alla rader genererade. Klicka på Sätt ihop hela spåret för att exportera."
+    "ready_to_export": "Alla rader genererade. Klicka på Sätt ihop hela spåret för att exportera.",
+    "export_srt": "Exportera .SRT",
+    "duration_label": "Varaktighet"
   }
 }

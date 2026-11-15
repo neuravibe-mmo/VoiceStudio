@@ -4349,6 +4349,8 @@
     "speed_label": "Velocità",
     "select_voice": "Seleziona voce...",
     "clear": "Cancella",
-    "ready_to_export": "Tutte le battute sono state generate. Fai clic su Unisci traccia completa per esportare."
+    "ready_to_export": "Tutte le battute sono state generate. Fai clic su Unisci traccia completa per esportare.",
+    "export_srt": "Esporta .SRT",
+    "duration_label": "Durata"
   }
 }

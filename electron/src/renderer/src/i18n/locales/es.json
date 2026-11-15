@@ -4349,6 +4349,8 @@
     "speed_label": "Velocidad",
     "select_voice": "Seleccionar voz...",
     "clear": "Borrar",
-    "ready_to_export": "Todos los subtítulos generados. Haz clic en Ensamblar pista completa para exportar."
+    "ready_to_export": "Todos los subtítulos generados. Haz clic en Ensamblar pista completa para exportar.",
+    "export_srt": "Exportar .SRT",
+    "duration_label": "Duración"
   }
 }

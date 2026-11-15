@@ -5,7 +5,6 @@ import {
   FileTextIcon,
   DownloadIcon,
   Wand2Icon,
-  ClockIcon,
   RotateCcwIcon,
   Trash2Icon,
   SquareIcon,
@@ -13,6 +12,8 @@ import {
   SubtitlesIcon,
   LayersIcon,
   Loader2Icon,
+  MinusIcon,
+  PlusIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
@@ -63,6 +64,31 @@ function toPlayableUrl(url?: string | null): string {
     return url;
   }
   return apiPath(url);
+}
+
+function formatSrtTimestamp(seconds: number): string {
+  const s = Math.max(0, seconds);
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = Math.floor(s % 60);
+  const millis = Math.round((s % 1) * 1000);
+
+  const hh = String(hrs).padStart(2, '0');
+  const mm = String(mins).padStart(2, '0');
+  const ss = String(secs).padStart(2, '0');
+  const mmm = String(millis).padStart(3, '0');
+
+  return `${hh}:${mm}:${ss},${mmm}`;
+}
+
+function generateSrtContent(cues: SrtCue[]): string {
+  return cues
+    .map((cue, idx) => {
+      const startStr = formatSrtTimestamp(cue.start);
+      const endStr = formatSrtTimestamp(cue.end);
+      return `${idx + 1}\n${startStr} --> ${endStr}\n${cue.text}\n`;
+    })
+    .join('\n');
 }
 
 export function SubtitlesPage() {
@@ -145,6 +171,41 @@ export function SubtitlesPage() {
   const handleCueVoiceChange = (id: number, val: string) => {
     setCues((prev) => prev.map((c) => (c.id === id ? { ...c, voiceId: val } : c)));
   };
+
+  const handleDurationChange = useCallback((cueId: number, nextDuration: number) => {
+    setCues((prev) => {
+      const index = prev.findIndex((c) => c.id === cueId);
+      if (index === -1) return prev;
+      const current = prev[index];
+      const safeDuration = Math.max(0.2, Math.round(nextDuration * 100) / 100);
+      const newEnd = Math.round((current.start + safeDuration) * 100) / 100;
+      const delta = Math.round((newEnd - current.end) * 100) / 100;
+
+      if (delta === 0) return prev;
+
+      const updated = prev.map((c, idx) => {
+        if (idx < index) return c;
+        if (idx === index) {
+          return {
+            ...c,
+            end: newEnd,
+            duration: safeDuration,
+          };
+        }
+        return {
+          ...c,
+          start: Math.max(0, Math.round((c.start + delta) * 100) / 100),
+          end: Math.max(0.1, Math.round((c.end + delta) * 100) / 100),
+        };
+      });
+
+      const lastCue = updated[updated.length - 1];
+      if (lastCue) {
+        setTotalDuration(lastCue.end);
+      }
+      return updated;
+    });
+  }, []);
 
   const generateSingleCue = useCallback(
     async (cue: SrtCue, signal?: AbortSignal) => {
@@ -282,6 +343,19 @@ export function SubtitlesPage() {
     }
   }, [assembledAudioUrl, filename]);
 
+  const handleExportSrt = useCallback(async () => {
+    if (cues.length === 0) return;
+    try {
+      const content = generateSrtContent(cues);
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const base = filename ? filename.replace(/\.[^/.]+$/, '') : 'subtitles';
+      await saveLocalFile(blob, `${base}_adjusted.srt`);
+      toast.success(t('srtVoice.export_srt'));
+    } catch (err) {
+      toast.error(describeError(err));
+    }
+  }, [cues, filename, t]);
+
   const handleClear = () => {
     handleStop();
     setFilename('');
@@ -306,6 +380,15 @@ export function SubtitlesPage() {
 
         {filename && (
           <div className="ms-auto flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleExportSrt}
+              className="text-xs"
+            >
+              <DownloadIcon className="mr-1 size-3.5" />
+              {t('srtVoice.export_srt')}
+            </Button>
             <Button variant="ghost" size="sm" onClick={handleClear} className="text-xs">
               <Trash2Icon className="mr-1 size-3.5" />
               {t('srtVoice.clear')}
@@ -481,17 +564,58 @@ export function SubtitlesPage() {
                     )}
                   >
                     {/* Index & Timing */}
-                    <div className="w-36 shrink-0 space-y-1">
+                    <div className="w-56 shrink-0 space-y-1.5">
                       <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
                         <span>{t('srtVoice.cue_title', { id: cue.id })}</span>
                         {cue.audio_url && (
                           <CheckCircle2Icon className="size-3.5 text-emerald-500" />
                         )}
+                        <span className="ms-auto text-[11px] font-normal tabular-nums text-muted-foreground">
+                          {startTime} → {endTime}
+                        </span>
                       </div>
-                      <div className="flex items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
-                        <ClockIcon className="size-3 shrink-0" />
-                        <span>
-                          {startTime} → {endTime} ({cue.duration.toFixed(1)}s)
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="outline"
+                          size="icon-xs"
+                          onClick={() => handleDurationChange(cue.id, cue.duration - 0.5)}
+                          disabled={cue.duration <= 0.3}
+                          title="-0.5s"
+                          aria-label="Decrease duration 0.5s"
+                          className="size-6 text-xs"
+                        >
+                          <MinusIcon className="size-3" />
+                        </Button>
+                        <div className="relative flex items-center">
+                          <input
+                            type="number"
+                            min="0.2"
+                            step="0.1"
+                            value={cue.duration}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              if (!isNaN(val) && val > 0) {
+                                handleDurationChange(cue.id, val);
+                              }
+                            }}
+                            className="h-6 w-16 rounded border border-input/60 bg-background/50 px-1 text-center font-mono text-[11px] tabular-nums text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          />
+                          <span className="pointer-events-none absolute right-1.5 text-[10px] text-muted-foreground">
+                            s
+                          </span>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="icon-xs"
+                          onClick={() => handleDurationChange(cue.id, cue.duration + 0.5)}
+                          title="+0.5s"
+                          aria-label="Increase duration 0.5s"
+                          className="size-6 text-xs"
+                        >
+                          <PlusIcon className="size-3" />
+                        </Button>
+                        <span className="ms-1 text-[10px] text-muted-foreground">
+                          {t('srtVoice.duration_label')}
                         </span>
                       </div>
                     </div>
