@@ -14,6 +14,10 @@ vi.mock('@/lib/api/client', () => ({
   describeError: (error: unknown) => String(error),
 }));
 vi.mock('@/router', () => ({ router: { navigate: mock.navigate } }));
+vi.mock('@/hooks/use-backend-status', () => ({
+  useBackendStatus: () => ({ stage: 'ready' }),
+  isBackendReachable: () => true,
+}));
 vi.mock('sonner', () => ({ toast: { success: mock.success, error: mock.error } }));
 import { InstallSttButton } from './install-stt-button';
 
@@ -25,7 +29,7 @@ const renderButton = () =>
   );
 
 beforeEach(() => {
-  mock.api.mockResolvedValue({});
+  mock.api.mockResolvedValue({ jobs: [] });
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -40,7 +44,7 @@ it('downloads the first recommended speech-to-text model that is not installed',
               { repo_id: 'asr/wanted', role: 'ASR', installed: false },
             ],
           }
-        : {},
+        : { jobs: [] },
     ),
   );
   renderButton();

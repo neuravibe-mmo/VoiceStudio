@@ -1,6 +1,5 @@
 import { useTranslation } from 'react-i18next';
 import { LanguagesIcon } from 'lucide-react';
-import i18n, { APP_LANGUAGES, setAppLanguage, type AppLocale } from '@/i18n';
 import {
   Select,
   SelectContent,
@@ -9,25 +8,45 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 
-const HEADER_LANGUAGES = [
-  ...APP_LANGUAGES.filter(({ code }) => code === 'vi' || code === 'en'),
-  ...APP_LANGUAGES.filter(({ code }) => code !== 'vi' && code !== 'en'),
+const LOCALES = [
+  { code: 'vi', label: 'Tiếng Việt' },
+  { code: 'en', label: 'English' },
+  { code: 'zh-CN', label: '简体中文' },
+  { code: 'zh-TW', label: '繁體中文' },
+  { code: 'ja', label: '日本語' },
+  { code: 'ko', label: '한국어' },
+  { code: 'es', label: 'Español' },
+  { code: 'fr', label: 'Français' },
+  { code: 'de', label: 'Deutsch' },
+  { code: 'ru', label: 'Русский' },
+  { code: 'pt', label: 'Português' },
+  { code: 'it', label: 'Italiano' },
+  { code: 'hi', label: 'हिन्दी' },
+  { code: 'th', label: 'ไทย' },
+  { code: 'id', label: 'Bahasa Indonesia' },
+  { code: 'nl', label: 'Nederlands' },
+  { code: 'pl', label: 'Polski' },
+  { code: 'sv', label: 'Svenska' },
+  { code: 'tr', label: 'Türkçe' },
+  { code: 'uk', label: 'Українська' },
+  { code: 'ar', label: 'العربية' },
+  { code: 'gl', label: 'Galego' },
 ];
-const HEADER_LANGUAGE_ITEMS = HEADER_LANGUAGES.map(({ code, label }) => ({
-  value: code,
-  label,
-}));
+
+const SELECT_ITEMS = LOCALES.map(({ code, label }) => ({ value: code, label }));
 
 export function SupportShortcut() {
-  const { t } = useTranslation();
-  const currentLanguage = (i18n.resolvedLanguage || i18n.language || 'en') as AppLocale;
+  const { t, i18n } = useTranslation();
+  const currentLang = i18n?.resolvedLanguage || i18n?.language || 'en';
 
   return (
     <div className="flex shrink-0 items-center">
       <Select
-        items={HEADER_LANGUAGE_ITEMS}
-        value={currentLanguage}
-        onValueChange={(value) => void setAppLanguage(value as AppLocale)}
+        items={SELECT_ITEMS}
+        value={currentLang}
+        onValueChange={(val) => {
+          void import('@/i18n').then((m) => m.setAppLanguage(val as Parameters<typeof m.setAppLanguage>[0]));
+        }}
       >
         <SelectTrigger
           size="sm"
@@ -38,7 +57,7 @@ export function SupportShortcut() {
           <SelectValue />
         </SelectTrigger>
         <SelectContent align="end" alignItemWithTrigger={false} className="max-h-72 min-w-36">
-          {HEADER_LANGUAGES.map(({ code, label }) => (
+          {LOCALES.map(({ code, label }) => (
             <SelectItem key={code} value={code} className="text-xs">
               {label}
             </SelectItem>
