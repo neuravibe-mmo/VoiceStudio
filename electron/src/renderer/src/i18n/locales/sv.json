@@ -4319,5 +4319,34 @@
       "failed": "Misslyckades",
       "cancelled": "Avbruten"
     }
+  },
+  "srtVoice": {
+    "title": "Undertexter",
+    "subtitle": "Generera tidsanpassat röstljud från .srt-undertextfiler",
+    "upload_title": "Ladda upp .srt-undertextfil",
+    "upload_desc": "Dra och släpp en .srt-fil här eller klicka för att bläddra",
+    "choose_file": "Välj .srt-fil",
+    "cues_count": "{{count}} rader",
+    "total_duration": "Total längd: {{duration}}",
+    "timing_mode": "Tidsläge",
+    "strict_fit": "Exakt passning (Sträck efter radens längd)",
+    "natural": "Naturligt tempo (Ursprunglig hastighet)",
+    "generate_all": "Generera alla",
+    "generating": "Genererar ({{current}}/{{total}})...",
+    "assemble_track": "Sätt ihop hela spåret",
+    "assembling": "Sätter ihop ljud...",
+    "download_audio": "Ladda ner ljud (.WAV)",
+    "play_all": "Spela hela spåret",
+    "change_file": "Byt .srt-fil",
+    "no_audio_yet": "Inget ljud har genererats ännu",
+    "generate_cue": "Generera denna rad",
+    "cue_generated": "Genererad",
+    "stop": "Stoppa",
+    "cue_title": "Rad #{{id}}",
+    "voice_label": "Röst",
+    "speed_label": "Hastighet",
+    "select_voice": "Välj röst...",
+    "clear": "Rensa",
+    "ready_to_export": "Alla rader genererade. Klicka på Sätt ihop hela spåret för att exportera."
   }
 }

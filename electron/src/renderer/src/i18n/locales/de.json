@@ -4319,5 +4319,34 @@
       "failed": "Fehlgeschlagen",
       "cancelled": "Abgebrochen"
     }
+  },
+  "srtVoice": {
+    "title": "Untertitel",
+    "subtitle": "Zeitlich ausgerichtete Sprachausgabe aus .srt-Dateien generieren",
+    "upload_title": ".srt-Untertiteldatei hochladen",
+    "upload_desc": ".srt-Datei hierher ziehen oder zum Auswählen klicken",
+    "choose_file": ".srt-Datei auswählen",
+    "cues_count": "{{count}} Untertitel",
+    "total_duration": "Gesamtdauer: {{duration}}",
+    "timing_mode": "Timing-Modus",
+    "strict_fit": "Exakte Einpassung (An Dauer anpassen)",
+    "natural": "Natürliches Tempo (Originalgeschwindigkeit)",
+    "generate_all": "Alle generieren",
+    "generating": "Generieren ({{current}}/{{total}})...",
+    "assemble_track": "Gesamte Spur zusammenfügen",
+    "assembling": "Audio wird zusammengefügt...",
+    "download_audio": "Audio herunterladen (.WAV)",
+    "play_all": "Gesamte Spur abspielen",
+    "change_file": ".srt-Datei ändern",
+    "no_audio_yet": "Noch kein Audio generiert",
+    "generate_cue": "Diesen Untertitel generieren",
+    "cue_generated": "Generiert",
+    "stop": "Stopp",
+    "cue_title": "Untertitel #{{id}}",
+    "voice_label": "Stimme",
+    "speed_label": "Geschwindigkeit",
+    "select_voice": "Stimme wählen...",
+    "clear": "Löschen",
+    "ready_to_export": "Alle Untertitel generiert. Klicken Sie auf Zusammenfügen zum Exportieren."
   }
 }

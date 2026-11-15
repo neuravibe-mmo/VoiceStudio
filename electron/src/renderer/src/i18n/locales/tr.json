@@ -4319,5 +4319,34 @@
       "failed": "Başarısız",
       "cancelled": "İptal edildi"
     }
+  },
+  "srtVoice": {
+    "title": "Altyazılar",
+    "subtitle": ".srt altyazı dosyalarından zaman uyumlu ses oluşturun",
+    "upload_title": ".srt altyazı dosyasını yükleyin",
+    "upload_desc": ".srt dosyasını buraya sürükleyip bırakın veya seçmek için tıklayın",
+    "choose_file": ".srt dosyasını seçin",
+    "cues_count": "{{count}} altyazı",
+    "total_duration": "Toplam süre: {{duration}}",
+    "timing_mode": "Zamanlama modu",
+    "strict_fit": "Tam uyum (Altyazı süresine uyarla)",
+    "natural": "Doğal tempo (Orijinal hız)",
+    "generate_all": "Tümünü oluştur",
+    "generating": "Oluşturuluyor ({{current}}/{{total}})...",
+    "assemble_track": "Tüm parçayı birleştir",
+    "assembling": "Ses birleştiriliyor...",
+    "download_audio": "Sesi indir (.WAV)",
+    "play_all": "Tüm parçayı oynat",
+    "change_file": ".srt dosyasını değiştir",
+    "no_audio_yet": "Henüz ses oluşturulmadı",
+    "generate_cue": "Bu satırı oluştur",
+    "cue_generated": "Oluşturuldu",
+    "stop": "Durdur",
+    "cue_title": "Altyazı #{{id}}",
+    "voice_label": "Ses",
+    "speed_label": "Hız",
+    "select_voice": "Ses seçin...",
+    "clear": "Temizle",
+    "ready_to_export": "Tüm altyazılar oluşturuldu. Dışa aktarmak için Tüm parçayı birleştir düğmesine tıklayın."
   }
 }

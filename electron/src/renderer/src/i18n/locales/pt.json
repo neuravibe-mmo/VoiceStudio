@@ -4321,5 +4321,34 @@
       "failed": "Falhou",
       "cancelled": "Cancelado"
     }
+  },
+  "srtVoice": {
+    "title": "Legendas",
+    "subtitle": "Gerar áudio de voz sincronizado a partir de arquivos .srt",
+    "upload_title": "Carregar arquivo de legendas .srt",
+    "upload_desc": "Arraste e solte um arquivo .srt aqui ou clique para selecionar",
+    "choose_file": "Escolher arquivo .srt",
+    "cues_count": "{{count}} legendas",
+    "total_duration": "Duração total: {{duration}}",
+    "timing_mode": "Modo de sincronização",
+    "strict_fit": "Ajuste estrito (Ajustar à duração)",
+    "natural": "Ritmo natural (Velocidade original)",
+    "generate_all": "Gerar tudo",
+    "generating": "Gerando ({{current}}/{{total}})...",
+    "assemble_track": "Montar faixa completa",
+    "assembling": "Montando áudio...",
+    "download_audio": "Baixar áudio (.WAV)",
+    "play_all": "Reproduzir faixa completa",
+    "change_file": "Alterar arquivo .srt",
+    "no_audio_yet": "Nenhum áudio gerado ainda",
+    "generate_cue": "Gerar esta legenda",
+    "cue_generated": "Gerado",
+    "stop": "Parar",
+    "cue_title": "Legenda #{{id}}",
+    "voice_label": "Voz",
+    "speed_label": "Velocidade",
+    "select_voice": "Selecionar voz...",
+    "clear": "Limpar",
+    "ready_to_export": "Todas as legendas geradas. Clique em Montar faixa completa para exportar."
   }
 }

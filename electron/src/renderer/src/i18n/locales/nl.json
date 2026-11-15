@@ -4319,5 +4319,34 @@
       "failed": "Mislukt",
       "cancelled": "Geannuleerd"
     }
+  },
+  "srtVoice": {
+    "title": "Ondertitels",
+    "subtitle": "Genereer tijdgebonden spraakaudio van .srt-ondertitelbestanden",
+    "upload_title": ".srt-ondertitelbestand uploaden",
+    "upload_desc": "Sleep een .srt-bestand hierheen of klik om te bladeren",
+    "choose_file": ".srt-bestand kiezen",
+    "cues_count": "{{count}} regels",
+    "total_duration": "Totale duur: {{duration}}",
+    "timing_mode": "Timingmodus",
+    "strict_fit": "Strikte pasvorm (Rekken naar cueduur)",
+    "natural": "Natuurlijk tempo (Oorspronkelijke snelheid)",
+    "generate_all": "Alles genereren",
+    "generating": "Genereren ({{current}}/{{total}})...",
+    "assemble_track": "Volledig spoor samenvoegen",
+    "assembling": "Audio samenvoegen...",
+    "download_audio": "Audio downloaden (.WAV)",
+    "play_all": "Volledig spoor afspelen",
+    "change_file": ".srt-bestand wijzigen",
+    "no_audio_yet": "Nog geen audio gegenereerd",
+    "generate_cue": "Deze regel genereren",
+    "cue_generated": "Gegenereerd",
+    "stop": "Stoppen",
+    "cue_title": "Regel #{{id}}",
+    "voice_label": "Stem",
+    "speed_label": "Snelheid",
+    "select_voice": "Stem kiezen...",
+    "clear": "Wissen",
+    "ready_to_export": "Alle regels gegenereerd. Klik op Volledig spoor samenvoegen om te exporteren."
   }
 }

@@ -4319,5 +4319,34 @@
       "failed": "Failed",
       "cancelled": "Cancelled"
     }
+  },
+  "srtVoice": {
+    "title": "Subtitles",
+    "subtitle": "Generate time-aligned voice audio from .srt subtitle files",
+    "upload_title": "Upload .srt subtitle file",
+    "upload_desc": "Drag & drop a .srt file here or click to browse",
+    "choose_file": "Choose .srt file",
+    "cues_count": "{{count}} cues",
+    "total_duration": "Total duration: {{duration}}",
+    "timing_mode": "Timing mode",
+    "strict_fit": "Strict fit (Stretch to cue duration)",
+    "natural": "Natural pace (Original speed)",
+    "generate_all": "Generate all",
+    "generating": "Generating ({{current}}/{{total}})...",
+    "assemble_track": "Assemble full track",
+    "assembling": "Assembling audio...",
+    "download_audio": "Download audio (.WAV)",
+    "play_all": "Play full track",
+    "change_file": "Change .srt file",
+    "no_audio_yet": "No audio generated yet",
+    "generate_cue": "Generate cue",
+    "cue_generated": "Generated",
+    "stop": "Stop",
+    "cue_title": "Cue #{{id}}",
+    "voice_label": "Voice",
+    "speed_label": "Speed",
+    "select_voice": "Select voice...",
+    "clear": "Clear",
+    "ready_to_export": "All cues generated. Click Assemble full track to combine audio along the timeline."
   }
 }

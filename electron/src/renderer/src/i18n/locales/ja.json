@@ -4319,5 +4319,34 @@
       "failed": "失敗",
       "cancelled": "キャンセル済み"
     }
+  },
+  "srtVoice": {
+    "title": "字幕",
+    "subtitle": ".srt字幕ファイルから時間同期音声を生成",
+    "upload_title": ".srt字幕ファイルをアップロード",
+    "upload_desc": "ここに.srtファイルをドロップするかクリックして選択",
+    "choose_file": ".srtファイルを選択",
+    "cues_count": "{{count}} 件の字幕",
+    "total_duration": "合計時間: {{duration}}",
+    "timing_mode": "タイミングモード",
+    "strict_fit": "完全一致（長さに合わせて調整）",
+    "natural": "自然な速度（元の速度）",
+    "generate_all": "すべて生成",
+    "generating": "生成中 ({{current}}/{{total}})...",
+    "assemble_track": "トラックを結合",
+    "assembling": "音声を結合中...",
+    "download_audio": "音声ダウンロード (.WAV)",
+    "play_all": "すべて再生",
+    "change_file": "別の.srtファイルを選択",
+    "no_audio_yet": "音声が未生成です",
+    "generate_cue": "この行を生成",
+    "cue_generated": "生成済み",
+    "stop": "停止",
+    "cue_title": "字幕 #{{id}}",
+    "voice_label": "音声",
+    "speed_label": "速度",
+    "select_voice": "音声を選択...",
+    "clear": "クリア",
+    "ready_to_export": "すべての字幕が生成されました。結合をクリックして書き出します。"
   }
 }

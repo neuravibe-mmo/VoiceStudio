@@ -4321,5 +4321,34 @@
       "failed": "Error",
       "cancelled": "Cancelado"
     }
+  },
+  "srtVoice": {
+    "title": "Subtítulos",
+    "subtitle": "Generar audio de voz alineado en el tiempo desde subtítulos .srt",
+    "upload_title": "Subir archivo de subtítulos .srt",
+    "upload_desc": "Arrastra y suelta un archivo .srt aquí o haz clic para buscar",
+    "choose_file": "Elegir archivo .srt",
+    "cues_count": "{{count}} subtítulos",
+    "total_duration": "Duración total: {{duration}}",
+    "timing_mode": "Modo de sincronización",
+    "strict_fit": "Ajuste estricto (Ajustar a la duración)",
+    "natural": "Ritmo natural (Velocidad original)",
+    "generate_all": "Generar todo",
+    "generating": "Generando ({{current}}/{{total}})...",
+    "assemble_track": "Ensamblar pista completa",
+    "assembling": "Ensamblando audio...",
+    "download_audio": "Descargar audio (.WAV)",
+    "play_all": "Reproducir pista completa",
+    "change_file": "Cambiar archivo .srt",
+    "no_audio_yet": "Aún no se ha generado audio",
+    "generate_cue": "Generar este subtítulo",
+    "cue_generated": "Generado",
+    "stop": "Detener",
+    "cue_title": "Subtítulo #{{id}}",
+    "voice_label": "Voz",
+    "speed_label": "Velocidad",
+    "select_voice": "Seleccionar voz...",
+    "clear": "Borrar",
+    "ready_to_export": "Todos los subtítulos generados. Haz clic en Ensamblar pista completa para exportar."
   }
 }

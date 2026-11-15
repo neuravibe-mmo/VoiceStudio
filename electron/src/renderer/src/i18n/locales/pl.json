@@ -4351,5 +4351,34 @@
       "failed": "Niepowodzenie",
       "cancelled": "Anulowano"
     }
+  },
+  "srtVoice": {
+    "title": "Napisy",
+    "subtitle": "Generuj zsynchronizowany dźwięk głosu z plików napisów .srt",
+    "upload_title": "Prześlij plik napisów .srt",
+    "upload_desc": "Przeciągnij i upuść plik .srt tutaj lub kliknij, aby przeglądać",
+    "choose_file": "Wybierz plik .srt",
+    "cues_count": "{{count}} kwestii",
+    "total_duration": "Całkowity czas: {{duration}}",
+    "timing_mode": "Tryb synchronizacji",
+    "strict_fit": "Ścisłe dopasowanie (Dopasuj do czasu kwestii)",
+    "natural": "Naturalne tempo (Pierwotna prędkość)",
+    "generate_all": "Generuj wszystko",
+    "generating": "Generowanie ({{current}}/{{total}})...",
+    "assemble_track": "Złóż pełną ścieżkę",
+    "assembling": "Składanie dźwięku...",
+    "download_audio": "Pobierz dźwięk (.WAV)",
+    "play_all": "Odtwórz pełną ścieżkę",
+    "change_file": "Zmień plik .srt",
+    "no_audio_yet": "Jeszcze nie wygenerowano dźwięku",
+    "generate_cue": "Generuj tę kwestię",
+    "cue_generated": "Wygenerowano",
+    "stop": "Zatrzymaj",
+    "cue_title": "Kwestia #{{id}}",
+    "voice_label": "Głos",
+    "speed_label": "Prędkość",
+    "select_voice": "Wybierz głos...",
+    "clear": "Wyczyść",
+    "ready_to_export": "Wszystkie kwestie wygenerowane. Kliknij Złóż pełną ścieżkę, aby wyeksportować."
   }
 }

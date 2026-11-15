@@ -4321,5 +4321,34 @@
       "failed": "Non riuscito",
       "cancelled": "Annullato"
     }
+  },
+  "srtVoice": {
+    "title": "Sottotitoli",
+    "subtitle": "Genera audio vocale sincronizzato da file di sottotitoli .srt",
+    "upload_title": "Carica file di sottotitoli .srt",
+    "upload_desc": "Trascina e rilascia un file .srt qui o fai clic per sfogliare",
+    "choose_file": "Scegli file .srt",
+    "cues_count": "{{count}} battute",
+    "total_duration": "Durata totale: {{duration}}",
+    "timing_mode": "Modalità di sincronizzazione",
+    "strict_fit": "Adattamento rigoroso (Adatta alla durata)",
+    "natural": "Ritmo naturale (Velocità originale)",
+    "generate_all": "Genera tutto",
+    "generating": "Generazione in corso ({{current}}/{{total}})...",
+    "assemble_track": "Unisci traccia completa",
+    "assembling": "Unione audio in corso...",
+    "download_audio": "Scarica audio (.WAV)",
+    "play_all": "Riproduci traccia completa",
+    "change_file": "Cambia file .srt",
+    "no_audio_yet": "Nessun audio ancora generato",
+    "generate_cue": "Genera questa battuta",
+    "cue_generated": "Generato",
+    "stop": "Ferma",
+    "cue_title": "Battuta #{{id}}",
+    "voice_label": "Voce",
+    "speed_label": "Velocità",
+    "select_voice": "Seleziona voce...",
+    "clear": "Cancella",
+    "ready_to_export": "Tutte le battute sono state generate. Fai clic su Unisci traccia completa per esportare."
   }
 }

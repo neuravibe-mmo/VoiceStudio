@@ -4319,5 +4319,34 @@
       "failed": "ล้มเหลว",
       "cancelled": "ยกเลิกแล้ว"
     }
+  },
+  "srtVoice": {
+    "title": "คำบรรยาย",
+    "subtitle": "สร้างเสียงพูดตรงเวลาจากไฟล์คำบรรยาย .srt",
+    "upload_title": "อัปโหลดไฟล์คำบรรยาย .srt",
+    "upload_desc": "ลากและวางไฟล์ .srt ที่นี่หรือคลิกเพื่อเลือกไฟล์",
+    "choose_file": "เลือกไฟล์ .srt",
+    "cues_count": "{{count}} บรรทัด",
+    "total_duration": "ความยาวรวม: {{duration}}",
+    "timing_mode": "โหมดจับเวลา",
+    "strict_fit": "พอดีเป๊ะ (ยืดตามช่วงเวลา)",
+    "natural": "จังหวะธรรมชาติ (ความเร็วเดิม)",
+    "generate_all": "สร้างทั้งหมด",
+    "generating": "กำลังสร้าง ({{current}}/{{total}})...",
+    "assemble_track": "รวมแทร็กเต็ม",
+    "assembling": "กำลังรวมเสียง...",
+    "download_audio": "ดาวน์โหลดเสียง (.WAV)",
+    "play_all": "เล่นทั้งแทร็ก",
+    "change_file": "เปลี่ยนไฟล์ .srt",
+    "no_audio_yet": "ยังไม่ได้สร้างเสียง",
+    "generate_cue": "สร้างประโยคนี้",
+    "cue_generated": "สร้างแล้ว",
+    "stop": "หยุด",
+    "cue_title": "ข้อความ #{{id}}",
+    "voice_label": "เสียง",
+    "speed_label": "ความเร็ว",
+    "select_voice": "เลือกเสียง...",
+    "clear": "ล้าง",
+    "ready_to_export": "สร้างเสียงครบทุกบรรทัดแล้ว คลิก รวมแทร็กเต็ม เพื่อส่งออก"
   }
 }

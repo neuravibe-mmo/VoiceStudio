@@ -4319,5 +4319,34 @@
       "failed": "विफल",
       "cancelled": "रद्द"
     }
+  },
+  "srtVoice": {
+    "title": "उपशीर्षक",
+    "subtitle": ".srt उपशीर्षक फ़ाइलों से समय-संरेखित आवाज़ उत्पन्न करें",
+    "upload_title": ".srt उपशीर्षक फ़ाइल अपलोड करें",
+    "upload_desc": ".srt फ़ाइल यहाँ खींचें और छोड़ें या चुनने के लिए क्लिक करें",
+    "choose_file": ".srt फ़ाइल चुनें",
+    "cues_count": "{{count}} संवाद",
+    "total_duration": "कुल अवधि: {{duration}}",
+    "timing_mode": "समय मोड",
+    "strict_fit": "सटीक फिट (अवधि के अनुसार समायोजित)",
+    "natural": "प्राकृतिक गति (मूल गति)",
+    "generate_all": "सभी उत्पन्न करें",
+    "generating": "उत्पन्न हो रहा है ({{current}}/{{total}})...",
+    "assemble_track": "पूरा ट्रैक जोड़ें",
+    "assembling": "ऑडियो जोड़ा जा रहा है...",
+    "download_audio": "ऑडियो डाउनलोड करें (.WAV)",
+    "play_all": "पूरा ट्रैक चलाएं",
+    "change_file": ".srt फ़ाइल बदलें",
+    "no_audio_yet": "अभी तक कोई ऑडियो उत्पन्न नहीं हुआ",
+    "generate_cue": "यह संवाद उत्पन्न करें",
+    "cue_generated": "उत्पन्न हुआ",
+    "stop": "रोकें",
+    "cue_title": "संवाद #{{id}}",
+    "voice_label": "आवाज़",
+    "speed_label": "गति",
+    "select_voice": "आवाज़ चुनें...",
+    "clear": "साफ़ करें",
+    "ready_to_export": "सभी संवाद उत्पन्न हो गए हैं। निर्यात करने के लिए पूरा ट्रैक जोड़ें पर क्लिक करें।"
   }
 }

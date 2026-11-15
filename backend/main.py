@@ -825,6 +825,7 @@ def _phase_a_build_inner() -> None:
         auth as auth_router,
         voice_convert,  # Studio Convert: speech-to-speech via ASR → TTS
         sfx,  # Tools > Sound effects (#3577): opt-in MOSS-SoundEffect sidecar
+        srt_voice,
     )
     from api.routers import mcp_bindings as _mcp_bindings_router  # noqa: E402
     from api.routers import telephony_twilio as _telephony_twilio_router  # noqa: E402
@@ -839,6 +840,7 @@ def _phase_a_build_inner() -> None:
         audiobook, longform_jobs, pronunciation, settings_router,
         media_tools_router, auth_router, _mcp_bindings_router,
         _telephony_twilio_router, _calls_router, _cloud_sync_router,
+        srt_voice,
     ])
     # Download-acceleration state, once, for triage-from-logs (FDL-03).
     try:

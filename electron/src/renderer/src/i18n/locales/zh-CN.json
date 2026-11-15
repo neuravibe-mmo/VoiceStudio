@@ -4319,5 +4319,34 @@
       "failed": "失败",
       "cancelled": "已取消"
     }
+  },
+  "srtVoice": {
+    "title": "字幕",
+    "subtitle": "从.srt字幕文件生成时间对齐的语音音频",
+    "upload_title": "上传.srt字幕文件",
+    "upload_desc": "拖放.srt文件到此处或点击浏览",
+    "choose_file": "选择.srt文件",
+    "cues_count": "{{count}} 条字幕",
+    "total_duration": "总时长：{{duration}}",
+    "timing_mode": "对齐模式",
+    "strict_fit": "严格对齐（缩放到字幕时长）",
+    "natural": "自然语速（原始速度）",
+    "generate_all": "全部生成",
+    "generating": "正在生成 ({{current}}/{{total}})...",
+    "assemble_track": "合成完整音频",
+    "assembling": "正在合成音频...",
+    "download_audio": "下载音频 (.WAV)",
+    "play_all": "播放完整音频",
+    "change_file": "更改.srt文件",
+    "no_audio_yet": "尚未生成音频",
+    "generate_cue": "生成该句",
+    "cue_generated": "已生成",
+    "stop": "停止",
+    "cue_title": "字幕 #{{id}}",
+    "voice_label": "声音",
+    "speed_label": "语速",
+    "select_voice": "选择声音...",
+    "clear": "清空",
+    "ready_to_export": "所有字幕已生成。点击合成完整音频以按时间线导出。"
   }
 }

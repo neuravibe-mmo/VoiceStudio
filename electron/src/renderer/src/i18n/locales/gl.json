@@ -4319,5 +4319,34 @@
       "failed": "Fallou",
       "cancelled": "Cancelado"
     }
+  },
+  "srtVoice": {
+    "title": "Subtítulos",
+    "subtitle": "Xerar son de voz aliñado no tempo a partir de subtítulos .srt",
+    "upload_title": "Subir ficheiro de subtítulos .srt",
+    "upload_desc": "Arrastra e solta un ficheiro .srt aquí ou fai clic para escoller",
+    "choose_file": "Escoller ficheiro .srt",
+    "cues_count": "{{count}} subtítulos",
+    "total_duration": "Duración total: {{duration}}",
+    "timing_mode": "Modo de sincronización",
+    "strict_fit": "Axuste estrito (Axustar á duración)",
+    "natural": "Ritmo natural (Velocidade orixinal)",
+    "generate_all": "Xerar todo",
+    "generating": "Xerando ({{current}}/{{total}})...",
+    "assemble_track": "Montar pista completa",
+    "assembling": "Montando son...",
+    "download_audio": "Descargar son (.WAV)",
+    "play_all": "Reproducir pista completa",
+    "change_file": "Cambiar ficheiro .srt",
+    "no_audio_yet": "Aínda non se xerou son",
+    "generate_cue": "Xerar este subtítulo",
+    "cue_generated": "Xerado",
+    "stop": "Deter",
+    "cue_title": "Subtítulo #{{id}}",
+    "voice_label": "Voz",
+    "speed_label": "Velocidade",
+    "select_voice": "Seleccionar voz...",
+    "clear": "Limpar",
+    "ready_to_export": "Todos os subtítulos xerados. Fai clic en Montar pista completa para exportar."
   }
 }

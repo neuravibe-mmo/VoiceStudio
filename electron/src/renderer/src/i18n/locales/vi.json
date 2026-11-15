@@ -4319,5 +4319,34 @@
       "failed": "Thất bại",
       "cancelled": "Đã hủy"
     }
+  },
+  "srtVoice": {
+    "title": "Phụ đề",
+    "subtitle": "Tạo giọng nói khớp thời gian từ tệp phụ đề .srt",
+    "upload_title": "Tải lên tệp phụ đề .srt",
+    "upload_desc": "Kéo thả tệp .srt vào đây hoặc bấm để chọn tệp từ máy tính",
+    "choose_file": "Chọn tệp .srt",
+    "cues_count": "{{count}} câu thoại",
+    "total_duration": "Tổng thời lượng: {{duration}}",
+    "timing_mode": "Khớp thời gian",
+    "strict_fit": "Khớp tuyệt đối (Co giãn theo cue)",
+    "natural": "Tự nhiên (Giữ nguyên tốc độ đọc)",
+    "generate_all": "Tạo tất cả",
+    "generating": "Đang tạo ({{current}}/{{total}})...",
+    "assemble_track": "Ghép file hoàn chỉnh",
+    "assembling": "Đang ghép âm thanh...",
+    "download_audio": "Tải file âm thanh (.WAV)",
+    "play_all": "Nghe toàn bộ",
+    "change_file": "Đổi tệp .srt khác",
+    "no_audio_yet": "Chưa tạo âm thanh",
+    "generate_cue": "Tạo câu này",
+    "cue_generated": "Đã tạo",
+    "stop": "Dừng lại",
+    "cue_title": "Câu #{{id}}",
+    "voice_label": "Giọng đọc",
+    "speed_label": "Tốc độ",
+    "select_voice": "Chọn giọng đọc...",
+    "clear": "Xóa trắng",
+    "ready_to_export": "Đã hoàn thành tạo giọng cho các câu thoại. Bấm Ghép file hoàn chỉnh để kết xuất file âm thanh theo timeline."
   }
 }

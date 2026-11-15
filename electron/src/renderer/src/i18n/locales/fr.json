@@ -4321,5 +4321,34 @@
       "failed": "Échec",
       "cancelled": "Annulé"
     }
+  },
+  "srtVoice": {
+    "title": "Sous-titres",
+    "subtitle": "Générer un audio vocal synchronisé à partir de sous-titres .srt",
+    "upload_title": "Importer un fichier de sous-titres .srt",
+    "upload_desc": "Glissez-déposez un fichier .srt ici ou cliquez pour parcourir",
+    "choose_file": "Choisir le fichier .srt",
+    "cues_count": "{{count}} répliques",
+    "total_duration": "Durée totale : {{duration}}",
+    "timing_mode": "Mode de synchronisation",
+    "strict_fit": "Ajustement strict (Adapter à la durée)",
+    "natural": "Rythme naturel (Vitesse d'origine)",
+    "generate_all": "Tout générer",
+    "generating": "Génération ({{current}}/{{total}})...",
+    "assemble_track": "Assembler la piste complète",
+    "assembling": "Assemblage audio...",
+    "download_audio": "Télécharger l'audio (.WAV)",
+    "play_all": "Lire la piste complète",
+    "change_file": "Changer de fichier .srt",
+    "no_audio_yet": "Aucun audio généré pour l'instant",
+    "generate_cue": "Générer cette réplique",
+    "cue_generated": "Généré",
+    "stop": "Arrêter",
+    "cue_title": "Réplique #{{id}}",
+    "voice_label": "Voix",
+    "speed_label": "Vitesse",
+    "select_voice": "Sélectionner une voix...",
+    "clear": "Effacer",
+    "ready_to_export": "Toutes les répliques sont générées. Cliquez sur Assembler pour exporter."
   }
 }

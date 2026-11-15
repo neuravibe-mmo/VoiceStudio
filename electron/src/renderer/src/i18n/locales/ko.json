@@ -4319,5 +4319,34 @@
       "failed": "실패",
       "cancelled": "취소됨"
     }
+  },
+  "srtVoice": {
+    "title": "자막",
+    "subtitle": ".srt 자막 파일에서 시간 동기화 음성 생성",
+    "upload_title": ".srt 자막 파일 업로드",
+    "upload_desc": ".srt 파일을 여기에 끌어다 놓거나 클릭하여 선택",
+    "choose_file": ".srt 파일 선택",
+    "cues_count": "{{count}}개 자막",
+    "total_duration": "총 소요 시간: {{duration}}",
+    "timing_mode": "타이밍 모드",
+    "strict_fit": "엄격 맞춤 (구간 길이에 맞춤)",
+    "natural": "자연스러운 속도 (원래 속도)",
+    "generate_all": "모두 생성",
+    "generating": "생성 중 ({{current}}/{{total}})...",
+    "assemble_track": "전체 트랙 결합",
+    "assembling": "오디오 결합 중...",
+    "download_audio": "오디오 다운로드 (.WAV)",
+    "play_all": "전체 재생",
+    "change_file": ".srt 파일 변경",
+    "no_audio_yet": "아직 생성된 오디오 없음",
+    "generate_cue": "이 구간 생성",
+    "cue_generated": "생성됨",
+    "stop": "정지",
+    "cue_title": "자막 #{{id}}",
+    "voice_label": "음성",
+    "speed_label": "속도",
+    "select_voice": "음성 선택...",
+    "clear": "지우기",
+    "ready_to_export": "모든 자막이 생성되었습니다. 결합을 클릭하여 내보내세요."
   }
 }

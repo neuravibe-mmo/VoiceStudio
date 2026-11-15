@@ -4319,5 +4319,34 @@
       "failed": "失敗",
       "cancelled": "已取消"
     }
+  },
+  "srtVoice": {
+    "title": "字幕",
+    "subtitle": "從.srt字幕檔案生成時間對齊的語音音訊",
+    "upload_title": "上傳.srt字幕檔案",
+    "upload_desc": "拖放.srt檔案至此處或點擊瀏覽",
+    "choose_file": "選擇.srt檔案",
+    "cues_count": "{{count}} 條字幕",
+    "total_duration": "總時長：{{duration}}",
+    "timing_mode": "對齊模式",
+    "strict_fit": "嚴格對齊（配合字幕時長）",
+    "natural": "自然語速（原始速度）",
+    "generate_all": "全部生成",
+    "generating": "正在生成 ({{current}}/{{total}})...",
+    "assemble_track": "合成完整音訊",
+    "assembling": "正在合成音訊...",
+    "download_audio": "下載音訊 (.WAV)",
+    "play_all": "播放完整音訊",
+    "change_file": "變更.srt檔案",
+    "no_audio_yet": "尚未生成音訊",
+    "generate_cue": "生成此句",
+    "cue_generated": "已生成",
+    "stop": "停止",
+    "cue_title": "字幕 #{{id}}",
+    "voice_label": "聲音",
+    "speed_label": "語速",
+    "select_voice": "選擇聲音...",
+    "clear": "清除",
+    "ready_to_export": "所有字幕已生成。點擊合成完整音訊以按時間軸匯出。"
   }
 }

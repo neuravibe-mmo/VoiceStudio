@@ -4319,5 +4319,34 @@
       "failed": "Gagal",
       "cancelled": "Dibatalkan"
     }
+  },
+  "srtVoice": {
+    "title": "Subtitel",
+    "subtitle": "Hasilkan audio suara selaras waktu dari file subtitel .srt",
+    "upload_title": "Unggah file subtitel .srt",
+    "upload_desc": "Seret & lepas file .srt ke sini atau klik untuk memilih",
+    "choose_file": "Pilih file .srt",
+    "cues_count": "{{count}} teks",
+    "total_duration": "Total durasi: {{duration}}",
+    "timing_mode": "Mode penyesuaian waktu",
+    "strict_fit": "Sangat pas (Rentangkan sesuai durasi cue)",
+    "natural": "Kecepatan alami (Kecepatan asli)",
+    "generate_all": "Hasilkan semua",
+    "generating": "Menghasilkan ({{current}}/{{total}})...",
+    "assemble_track": "Gabungkan seluruh trek",
+    "assembling": "Menggabungkan audio...",
+    "download_audio": "Unduh audio (.WAV)",
+    "play_all": "Putar seluruh trek",
+    "change_file": "Ganti file .srt",
+    "no_audio_yet": "Belum ada audio yang dibuat",
+    "generate_cue": "Hasilkan bagian ini",
+    "cue_generated": "Dihasilkan",
+    "stop": "Berhenti",
+    "cue_title": "Teks #{{id}}",
+    "voice_label": "Suara",
+    "speed_label": "Kecepatan",
+    "select_voice": "Pilih suara...",
+    "clear": "Hapus",
+    "ready_to_export": "Semua teks selesai dihasilkan. Klik Gabungkan seluruh trek untuk mengekspor."
   }
 }

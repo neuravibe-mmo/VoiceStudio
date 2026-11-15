@@ -21,6 +21,10 @@ const StoriesPage = lazyRouteComponent(
   () => import('@/features/longform/longform-page'),
   'StoriesPage',
 );
+const SubtitlesPage = lazyRouteComponent(
+  () => import('@/features/srt-voice/srt-voice-page'),
+  'SubtitlesPage',
+);
 const AudiobookPage = lazyRouteComponent(
   () => import('@/features/longform/longform-page'),
   'AudiobookPage',
@@ -198,6 +202,11 @@ export const audiobookRoute = createRoute({
   path: '/audiobook',
   component: AudiobookPage,
 });
+export const subtitlesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/subtitles',
+  component: SubtitlesPage,
+});
 export const networkRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings/network',
@@ -291,6 +300,7 @@ export const routeTree = rootRoute.addChildren([
   credentialsRoute,
   storiesRoute,
   audiobookRoute,
+  subtitlesRoute,
   projectsRoute,
   indexRoute,
   cloneRoute,

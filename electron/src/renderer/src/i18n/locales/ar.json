@@ -4379,5 +4379,34 @@
       "failed": "فشل",
       "cancelled": "أُلغي"
     }
+  },
+  "srtVoice": {
+    "title": "الترجمة",
+    "subtitle": "إنشاء صوت متزامن زمنياً من ملفات الترجمة .srt",
+    "upload_title": "تحميل ملف ترجمة .srt",
+    "upload_desc": "اسحب وأفلت ملف .srt هنا أو انقر للتصفح",
+    "choose_file": "اختر ملف .srt",
+    "cues_count": "{{count}} نصوص ترجمة",
+    "total_duration": "المدة الإجمالية: {{duration}}",
+    "timing_mode": "وضع التوقيت",
+    "strict_fit": "ملاءمة دقيقة (تمديد لملء مدة السطر)",
+    "natural": "سرعة طبيعية (السرعة الأصلية)",
+    "generate_all": "إنشاء الكل",
+    "generating": "جارٍ الإنشاء ({{current}}/{{total}})...",
+    "assemble_track": "تجميع المسار كاملاً",
+    "assembling": "جارٍ تجميع الصوت...",
+    "download_audio": "تنزيل الصوت (.WAV)",
+    "play_all": "تشغيل المسار بالكامل",
+    "change_file": "تغيير ملف .srt",
+    "no_audio_yet": "لم يتم إنشاء أي صوت بعد",
+    "generate_cue": "إنشاء هذا السطر",
+    "cue_generated": "تم الإنشاء",
+    "stop": "إيقاف",
+    "cue_title": "سطر الترجمة #{{id}}",
+    "voice_label": "الصوت",
+    "speed_label": "السرعة",
+    "select_voice": "اختر صوتاً...",
+    "clear": "مسح",
+    "ready_to_export": "تم إنشاء جميع الأسطر. انقر على تجميع المسار كاملاً للتصدير."
   }
 }

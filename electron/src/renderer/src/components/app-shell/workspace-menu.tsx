@@ -16,6 +16,7 @@ import {
   ChevronRightIcon,
   BlocksIcon,
   WorkflowIcon,
+  SubtitlesIcon,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -28,6 +29,7 @@ type Destination = readonly [
     | '/clone'
     | '/stories'
     | '/audiobook'
+    | '/subtitles'
     | '/projects'
     | '/tools'
     | '/batch'
@@ -54,6 +56,7 @@ const voiceDestinations: Destination[] = [
 const storyDestinations: Destination[] = [
   ['/stories', 'nav.stories', AudioLinesIcon],
   ['/audiobook', 'audiobook.title', BookOpenIcon],
+  ['/subtitles', 'srtVoice.title', SubtitlesIcon],
 ];
 const dubDestinations: Destination[] = [
   ['/dub', 'dubWorkspace.title', FilmIcon],
@@ -79,6 +82,7 @@ const iconMotion: Record<Destination[0], string> = {
   '/gallery': 'lift',
   '/stories': 'wave',
   '/audiobook': 'tilt',
+  '/subtitles': 'pulse',
   '/dub': 'tilt',
   '/batch': 'lift',
   '/transcriptions': 'nudge',
