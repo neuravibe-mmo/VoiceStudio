@@ -37,7 +37,10 @@ const SELECT_ITEMS = LOCALES.map(({ code, label }) => ({ value: code, label }));
 
 export function SupportShortcut() {
   const { t, i18n } = useTranslation();
-  const currentLang = i18n?.resolvedLanguage || i18n?.language || 'en';
+  const rawLang = i18n?.language || i18n?.resolvedLanguage || 'en';
+  const currentLang = LOCALES.some((l) => l.code === rawLang)
+    ? rawLang
+    : (LOCALES.find((l) => l.code === rawLang.split('-')[0])?.code ?? 'en');
 
   return (
     <div className="flex shrink-0 items-center">

@@ -100,7 +100,13 @@ i18next.on('languageChanged', (locale) => {
   if (normalized) void loadLocale(normalized).catch(() => {});
 });
 applyDocumentLanguage(selectedLocale);
-void loadLocale(selectedLocale).catch(() => {});
+void loadLocale(selectedLocale)
+  .then(() => {
+    if (i18next.language === selectedLocale && i18next.resolvedLanguage !== selectedLocale) {
+      void i18next.changeLanguage(selectedLocale);
+    }
+  })
+  .catch(() => {});
 
 export const APP_LANGUAGES = SUPPORTED_LOCALES.map((code) => {
   try {

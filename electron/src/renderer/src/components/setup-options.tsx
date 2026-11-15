@@ -143,7 +143,7 @@ export function SetupOptions({
           <span>{t('settings.language')}</span>
           <Select
             items={APP_LANGUAGE_ITEMS}
-            value={i18n.resolvedLanguage || i18n.language}
+            value={i18n.language || i18n.resolvedLanguage}
             onValueChange={(value) => void setAppLanguage(value as AppLocale)}
           >
             <SelectTrigger className="w-full bg-muted/20" aria-label={t('settings.language')}>
